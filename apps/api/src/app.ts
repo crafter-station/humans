@@ -61,6 +61,16 @@ const errorResponse = z.object({
   error: z.object({ code: z.string(), message: z.string() }),
 });
 
+const profileInput = z.object({
+  name: z.string().trim().min(1),
+  currentCompany: z.string().trim().min(1).nullable(),
+  professionalLinks: z.array(z.url()).min(1),
+  statements: z.record(z.string(), z.union([z.string(), z.array(z.string())])),
+  adultAttestation: z.boolean(),
+  privateCodeAttestation: z.boolean(),
+  searchable: z.boolean(),
+});
+
 const checkHealth = Effect.fn("checkHealth")(function* () {
   const database = yield* Database;
   yield* database.check;
@@ -122,7 +132,12 @@ export const createApp = (
       return context.json({ processed }, 200);
     } catch {
       return context.json(
-        { error: { code: "service_unavailable", message: "Service unavailable" } },
+        {
+          error: {
+            code: "service_unavailable",
+            message: "Service unavailable",
+          },
+        },
         503,
       );
     }
@@ -148,7 +163,12 @@ export const createApp = (
       return context.json(workspace, 200);
     } catch {
       return context.json(
-        { error: { code: "service_unavailable", message: "Service unavailable" } },
+        {
+          error: {
+            code: "service_unavailable",
+            message: "Service unavailable",
+          },
+        },
         503,
       );
     }
@@ -179,9 +199,85 @@ export const createApp = (
         return forbidden(context);
       }
       return context.json(
-        { error: { code: "service_unavailable", message: "Service unavailable" } },
+        {
+          error: {
+            code: "service_unavailable",
+            message: "Service unavailable",
+          },
+        },
         503,
       );
+    }
+  });
+
+  app.get("/v1/profile", async (context) => {
+    const session = await identity.authenticate(context.req.raw, context.env);
+    if (session === null) return unauthorized(context);
+
+    try {
+      const profile = await Effect.runPromise(
+        Effect.gen(function* () {
+          const database = yield* Database;
+          return yield* database.getProfile(session.memberId);
+        }).pipe(Effect.provide(databaseLayer(context.env))),
+      );
+      return context.json({ profile }, 200);
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+
+  app.put("/v1/profile", async (context) => {
+    const session = await identity.authenticate(context.req.raw, context.env);
+    if (session === null) return unauthorized(context);
+    const parsed = profileInput.safeParse(
+      await context.req.json().catch(() => null),
+    );
+    if (!parsed.success) return invalidProfile(context, "invalid_profile");
+
+    try {
+      const github = await identity.verifyGitHub(session.memberId, context.env);
+      const profile = await Effect.runPromise(
+        Effect.gen(function* () {
+          const database = yield* Database;
+          return yield* database.saveProfile(
+            session.memberId,
+            parsed.data,
+            github,
+          );
+        }).pipe(Effect.provide(databaseLayer(context.env))),
+      );
+      return context.json({ profile }, 200);
+    } catch (error) {
+      return taggedReason(error) === null
+        ? serviceUnavailable(context)
+        : invalidProfile(context, taggedReason(error)!);
+    }
+  });
+
+  app.patch("/v1/profile/searchability", async (context) => {
+    const session = await identity.authenticate(context.req.raw, context.env);
+    if (session === null) return unauthorized(context);
+    const parsed = z
+      .object({ searchable: z.boolean() })
+      .safeParse(await context.req.json().catch(() => null));
+    if (!parsed.success) return invalidProfile(context, "invalid_profile");
+
+    try {
+      const profile = await Effect.runPromise(
+        Effect.gen(function* () {
+          const database = yield* Database;
+          return yield* database.setProfileSearchability(
+            session.memberId,
+            parsed.data.searchable,
+          );
+        }).pipe(Effect.provide(databaseLayer(context.env))),
+      );
+      return context.json({ profile }, 200);
+    } catch (error) {
+      return taggedReason(error) === null
+        ? serviceUnavailable(context)
+        : invalidProfile(context, taggedReason(error)!);
     }
   });
 
@@ -219,3 +315,37 @@ const forbidden = (context: {
     { error: { code: "forbidden", message: "Organization access is denied" } },
     403,
   );
+
+const invalidProfile = (
+  context: {
+    json: (body: z.infer<typeof errorResponse>, status: 422) => Response;
+  },
+  reason: string,
+) =>
+  context.json(
+    {
+      error: {
+        code: reason,
+        message: "The Profile does not meet the requirements",
+      },
+    },
+    422,
+  );
+
+const serviceUnavailable = (context: {
+  json: (body: z.infer<typeof errorResponse>, status: 503) => Response;
+}) =>
+  context.json(
+    { error: { code: "service_unavailable", message: "Service unavailable" } },
+    503,
+  );
+
+const taggedReason = (error: unknown) =>
+  typeof error === "object" &&
+  error !== null &&
+  "_tag" in error &&
+  error._tag === "ProfileRejected" &&
+  "reason" in error &&
+  typeof error.reason === "string"
+    ? error.reason
+    : null;

@@ -7,8 +7,11 @@ import {
   clerkWebhookEvents,
   clerkProjectionVersions,
   members,
+  memberStatements,
   organizationMemberships,
   organizations,
+  professionalLinks,
+  profiles,
 } from "./schema";
 
 type DrizzleDatabase =
@@ -62,6 +65,35 @@ export type ProvisionedWorkspace = {
   organization: OrganizationProjection;
 };
 
+export type GitHubVerification = {
+  accountId: string;
+  login: string;
+  accountType: "User" | "Bot" | "Organization";
+  ownsNonForkRepository: boolean;
+  contributedPubliclySince: Date | null;
+  ownershipVerified: boolean;
+  knownMinor: boolean;
+};
+
+export type ProfileInput = {
+  name: string;
+  currentCompany: string | null;
+  professionalLinks: string[];
+  statements: Record<string, string | string[]>;
+  adultAttestation: boolean;
+  privateCodeAttestation: boolean;
+  searchable: boolean;
+};
+
+export type MemberProfile = ProfileInput & {
+  memberId: string;
+  githubAccountId: string;
+  githubLogin: string;
+  eligibilityBasis:
+    "owned_repository" | "public_contribution" | "private_attestation";
+  searchabilityReason: "member_opt_in" | "member_opt_out";
+};
+
 export class DatabaseUnavailable extends Schema.TaggedError<DatabaseUnavailable>()(
   "DatabaseUnavailable",
   {
@@ -72,6 +104,11 @@ export class DatabaseUnavailable extends Schema.TaggedError<DatabaseUnavailable>
 export class WorkspaceForbidden extends Schema.TaggedError<WorkspaceForbidden>()(
   "WorkspaceForbidden",
   {},
+) {}
+
+export class ProfileRejected extends Schema.TaggedError<ProfileRejected>()(
+  "ProfileRejected",
+  { reason: Schema.String },
 ) {}
 
 export class Database extends Context.Service<
@@ -89,6 +126,18 @@ export class Database extends Context.Service<
       memberId: string,
       provision: () => Promise<ProvisionedWorkspace>,
     ) => Effect.Effect<Workspace, DatabaseUnavailable>;
+    readonly getProfile: (
+      memberId: string,
+    ) => Effect.Effect<MemberProfile | null, DatabaseUnavailable>;
+    readonly saveProfile: (
+      memberId: string,
+      input: ProfileInput,
+      github: GitHubVerification,
+    ) => Effect.Effect<MemberProfile, DatabaseUnavailable | ProfileRejected>;
+    readonly setProfileSearchability: (
+      memberId: string,
+      searchable: boolean,
+    ) => Effect.Effect<MemberProfile, DatabaseUnavailable | ProfileRejected>;
   }
 >()("@humans/database/Database") {}
 
@@ -146,7 +195,11 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
             await ensureMember(
               transaction,
               event.member,
-              await projectionIsActive(transaction, "member", event.member.clerkId),
+              await projectionIsActive(
+                transaction,
+                "member",
+                event.member.clerkId,
+              ),
             );
             await ensureOrganization(
               transaction,
@@ -182,7 +235,10 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
               .where(
                 and(
                   eq(organizationMemberships.memberId, event.memberId),
-                  eq(organizationMemberships.organizationId, event.organizationId),
+                  eq(
+                    organizationMemberships.organizationId,
+                    event.organizationId,
+                  ),
                 ),
               );
           }
@@ -268,13 +324,206 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
       catch: (cause) => new DatabaseUnavailable({ cause }),
     }).pipe(Effect.withSpan("Database.provisionWorkspace"));
 
+  const getProfile = (memberId: string) =>
+    Effect.tryPromise({
+      try: async () => {
+        const [profile] = await database
+          .select()
+          .from(profiles)
+          .where(eq(profiles.memberId, memberId))
+          .limit(1);
+        if (profile === undefined) return null;
+
+        const [links, statements] = await Promise.all([
+          database
+            .select({ url: professionalLinks.url })
+            .from(professionalLinks)
+            .where(eq(professionalLinks.profileId, memberId)),
+          database
+            .select({
+              field: memberStatements.field,
+              value: memberStatements.value,
+            })
+            .from(memberStatements)
+            .where(eq(memberStatements.profileId, memberId)),
+        ]);
+
+        return profileResult(profile, links, statements);
+      },
+      catch: (cause) => new DatabaseUnavailable({ cause }),
+    }).pipe(Effect.withSpan("Database.getProfile"));
+
+  const saveProfile = (
+    memberId: string,
+    input: ProfileInput,
+    github: GitHubVerification,
+  ) => {
+    const rejection = profileRejection(input, github);
+    if (rejection !== null)
+      return Effect.fail(new ProfileRejected({ reason: rejection }));
+
+    const eligibilityBasis = github.ownsNonForkRepository
+      ? ("owned_repository" as const)
+      : github.contributedPubliclySince !== null
+        ? ("public_contribution" as const)
+        : ("private_attestation" as const);
+    const searchabilityReason = input.searchable
+      ? ("member_opt_in" as const)
+      : ("member_opt_out" as const);
+
+    return Effect.tryPromise({
+      try: async () => {
+        await database.transaction(async (transaction) => {
+          await transaction
+            .insert(profiles)
+            .values({
+              memberId,
+              name: input.name,
+              currentCompany: input.currentCompany,
+              githubAccountId: github.accountId,
+              githubLogin: github.login,
+              eligibilityBasis,
+              adultAttested: true,
+              searchable: input.searchable,
+              searchabilityReason,
+            })
+            .onConflictDoUpdate({
+              target: profiles.memberId,
+              set: {
+                name: input.name,
+                currentCompany: input.currentCompany,
+                githubAccountId: github.accountId,
+                githubLogin: github.login,
+                eligibilityBasis,
+                adultAttested: true,
+                searchable: input.searchable,
+                searchabilityReason,
+                updatedAt: new Date(),
+              },
+            });
+          await transaction
+            .delete(professionalLinks)
+            .where(eq(professionalLinks.profileId, memberId));
+          await transaction
+            .insert(professionalLinks)
+            .values(
+              input.professionalLinks.map((url) => ({
+                profileId: memberId,
+                url,
+              })),
+            );
+          await transaction
+            .delete(memberStatements)
+            .where(eq(memberStatements.profileId, memberId));
+          const statements = Object.entries(input.statements);
+          if (statements.length > 0) {
+            await transaction
+              .insert(memberStatements)
+              .values(
+                statements.map(([field, value]) => ({
+                  profileId: memberId,
+                  field,
+                  value,
+                })),
+              );
+          }
+        });
+        return {
+          ...input,
+          memberId,
+          githubAccountId: github.accountId,
+          githubLogin: github.login,
+          eligibilityBasis,
+          searchabilityReason,
+        };
+      },
+      catch: (cause) => new DatabaseUnavailable({ cause }),
+    }).pipe(Effect.withSpan("Database.saveProfile"));
+  };
+
+  const setProfileSearchability = (memberId: string, searchable: boolean) =>
+    Effect.gen(function* () {
+      const [updated] = yield* Effect.tryPromise({
+        try: () =>
+          database
+            .update(profiles)
+            .set({
+              searchable,
+              searchabilityReason: searchable
+                ? "member_opt_in"
+                : "member_opt_out",
+              updatedAt: new Date(),
+            })
+            .where(eq(profiles.memberId, memberId))
+            .returning(),
+        catch: (cause) => new DatabaseUnavailable({ cause }),
+      });
+      if (updated === undefined) {
+        return yield* new ProfileRejected({ reason: "profile_not_found" });
+      }
+      const profile = yield* getProfile(memberId);
+      if (profile === null) {
+        return yield* new ProfileRejected({ reason: "profile_not_found" });
+      }
+      return profile;
+    }).pipe(Effect.withSpan("Database.setProfileSearchability"));
+
   return Database.of({
     check,
+    getProfile,
     getWorkspace,
     projectClerkEvent,
     provisionWorkspace,
+    saveProfile,
+    setProfileSearchability,
   });
 };
+
+const profileRejection = (input: ProfileInput, github: GitHubVerification) => {
+  if (input.name.trim() === "" || input.professionalLinks.length === 0) {
+    return "profile_details_required";
+  }
+  if (github.accountType !== "User") return "ineligible_github_account_type";
+  if (!github.ownershipVerified) return "github_ownership_not_verified";
+  if (!input.adultAttestation || github.knownMinor) return "adult_required";
+
+  const contributionCutoff = new Date();
+  contributionCutoff.setUTCFullYear(contributionCutoff.getUTCFullYear() - 1);
+  const hasRecentContribution =
+    github.contributedPubliclySince !== null &&
+    github.contributedPubliclySince >= contributionCutoff;
+  if (
+    !github.ownsNonForkRepository &&
+    !hasRecentContribution &&
+    !input.privateCodeAttestation
+  ) {
+    return "coding_evidence_required";
+  }
+  return null;
+};
+
+const profileResult = (
+  profile: typeof profiles.$inferSelect,
+  links: Array<{ url: string }>,
+  statements: Array<{ field: string; value: unknown }>,
+): MemberProfile => ({
+  memberId: profile.memberId,
+  name: profile.name,
+  currentCompany: profile.currentCompany,
+  professionalLinks: links.map(({ url }) => url),
+  statements: Object.fromEntries(
+    statements.map(({ field, value }) => [field, value]),
+  ) as Record<string, string | string[]>,
+  adultAttestation: profile.adultAttested,
+  privateCodeAttestation: profile.eligibilityBasis === "private_attestation",
+  searchable: profile.searchable,
+  githubAccountId: profile.githubAccountId,
+  githubLogin: profile.githubLogin,
+  eligibilityBasis:
+    profile.eligibilityBasis as MemberProfile["eligibilityBasis"],
+  searchabilityReason:
+    profile.searchabilityReason as MemberProfile["searchabilityReason"],
+});
 
 export const makeDatabaseLayer = (database: DrizzleDatabase) =>
   Layer.succeed(Database, makeDatabaseService(database));
@@ -333,7 +582,11 @@ const ensureOrganization = async (
 
 const projectionVersion = (event: ClerkProjectionEvent) => {
   if (event.type === "member.upsert") {
-    return { active: true, entityId: event.member.clerkId, entityType: "member" };
+    return {
+      active: true,
+      entityId: event.member.clerkId,
+      entityType: "member",
+    };
   }
   if (event.type === "member.delete") {
     return { active: false, entityId: event.memberId, entityType: "member" };

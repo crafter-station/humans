@@ -2,6 +2,7 @@ import { createClerkClient } from "@clerk/backend";
 import { verifyWebhook } from "@clerk/backend/webhooks";
 import type {
   ClerkProjectionEvent,
+  GitHubVerification,
   MemberProjection,
   OrganizationProjection,
   ProvisionedWorkspace,
@@ -28,6 +29,10 @@ export type IdentityBoundary = {
     bindings: Bindings,
     organizationId?: string,
   ): Promise<ProvisionedWorkspace>;
+  verifyGitHub(
+    memberId: string,
+    bindings: Bindings,
+  ): Promise<GitHubVerification>;
 };
 
 const memberProjection = (data: {
@@ -43,8 +48,7 @@ const memberProjection = (data: {
     data.email_addresses?.find(
       (email) => email.id === data.primary_email_address_id,
     )?.email_address ?? null,
-  name:
-    [data.first_name, data.last_name].filter(Boolean).join(" ") || null,
+  name: [data.first_name, data.last_name].filter(Boolean).join(" ") || null,
   imageUrl: data.image_url ?? null,
 });
 
@@ -82,7 +86,8 @@ export const clerkIdentityBoundary: IdentityBoundary = {
         request.headers.get("webhook-timestamp") ??
           request.headers.get("svix-timestamp"),
       ) * 1000;
-    if (!Number.isFinite(deliveredAt)) throw new Error("Missing webhook-timestamp");
+    if (!Number.isFinite(deliveredAt))
+      throw new Error("Missing webhook-timestamp");
 
     const event = await verifyWebhook(request, {
       signingSecret: bindings.CLERK_WEBHOOK_SIGNING_SECRET,
@@ -135,7 +140,9 @@ export const clerkIdentityBoundary: IdentityBoundary = {
         member: {
           clerkId: member.user_id,
           email: member.identifier,
-          name: [member.first_name, member.last_name].filter(Boolean).join(" ") || null,
+          name:
+            [member.first_name, member.last_name].filter(Boolean).join(" ") ||
+            null,
           imageUrl: member.image_url,
         },
         membership: {
@@ -196,7 +203,8 @@ export const clerkIdentityBoundary: IdentityBoundary = {
             )?.emailAddress ?? null,
           imageUrl: member.imageUrl,
           name:
-            [member.firstName, member.lastName].filter(Boolean).join(" ") || null,
+            [member.firstName, member.lastName].filter(Boolean).join(" ") ||
+            null,
         },
         membership: {
           clerkId: `pending:${memberId}:${organization.id}`,
@@ -244,6 +252,65 @@ export const clerkIdentityBoundary: IdentityBoundary = {
         name: membership.organization.name,
         slug: membership.organization.slug,
       },
+    };
+  },
+
+  async verifyGitHub(memberId, bindings) {
+    const clerk = createClerkClient({ secretKey: bindings.CLERK_SECRET_KEY });
+    const tokens = await clerk.users.getUserOauthAccessToken(
+      memberId,
+      "oauth_github",
+    );
+    const token = tokens.data[0]?.token;
+    if (token === undefined)
+      throw new Error("A connected GitHub account is required");
+
+    const headers = {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${token}`,
+      "x-github-api-version": "2022-11-28",
+    };
+    const accountResponse = await fetch("https://api.github.com/user", {
+      headers,
+    });
+    if (!accountResponse.ok)
+      throw new Error("GitHub ownership verification failed");
+    const account = (await accountResponse.json()) as {
+      id: number;
+      login: string;
+      type: "User" | "Bot" | "Organization";
+    };
+
+    const repositoriesResponse = await fetch(
+      "https://api.github.com/user/repos?affiliation=owner&visibility=public&per_page=100",
+      { headers },
+    );
+    if (!repositoriesResponse.ok)
+      throw new Error("GitHub repository verification failed");
+    const repositories = (await repositoriesResponse.json()) as Array<{
+      fork: boolean;
+    }>;
+
+    const cutoff = new Date();
+    cutoff.setUTCFullYear(cutoff.getUTCFullYear() - 1);
+    const commitsResponse = await fetch(
+      `https://api.github.com/search/commits?q=${encodeURIComponent(`author:${account.login} author-date:>=${cutoff.toISOString().slice(0, 10)}`)}&per_page=1`,
+      { headers },
+    );
+    const commits = commitsResponse.ok
+      ? ((await commitsResponse.json()) as { total_count: number })
+      : { total_count: 0 };
+
+    return {
+      accountId: String(account.id),
+      login: account.login,
+      accountType: account.type,
+      ownsNonForkRepository: repositories.some(
+        (repository) => !repository.fork,
+      ),
+      contributedPubliclySince: commits.total_count > 0 ? cutoff : null,
+      ownershipVerified: true,
+      knownMinor: false,
     };
   },
 };

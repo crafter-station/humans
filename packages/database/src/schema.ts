@@ -1,6 +1,7 @@
 import {
   bigint,
   boolean,
+  jsonb,
   pgTable,
   primaryKey,
   text,
@@ -13,7 +14,9 @@ export const members = pgTable("members", {
   name: text("name"),
   imageUrl: text("image_url"),
   active: boolean("active").notNull().default(true),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
 });
 
 export const organizations = pgTable("organizations", {
@@ -21,7 +24,9 @@ export const organizations = pgTable("organizations", {
   name: text("name").notNull(),
   slug: text("slug"),
   active: boolean("active").notNull().default(true),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
 });
 
 export const organizationMemberships = pgTable(
@@ -36,7 +41,9 @@ export const organizationMemberships = pgTable(
       .references(() => organizations.clerkId),
     role: text("role").notNull(),
     active: boolean("active").notNull().default(true),
-    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
   },
   (table) => [primaryKey({ columns: [table.memberId, table.organizationId] })],
 );
@@ -58,4 +65,47 @@ export const clerkProjectionVersions = pgTable(
     sourceUpdatedAt: bigint("source_updated_at", { mode: "number" }).notNull(),
   },
   (table) => [primaryKey({ columns: [table.entityType, table.entityId] })],
+);
+
+export const profiles = pgTable("profiles", {
+  memberId: text("member_id")
+    .primaryKey()
+    .references(() => members.clerkId),
+  name: text("name").notNull(),
+  currentCompany: text("current_company"),
+  githubAccountId: text("github_account_id").notNull().unique(),
+  githubLogin: text("github_login").notNull(),
+  eligibilityBasis: text("eligibility_basis").notNull(),
+  adultAttested: boolean("adult_attested").notNull(),
+  searchable: boolean("searchable").notNull().default(false),
+  searchabilityReason: text("searchability_reason").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+export const professionalLinks = pgTable(
+  "professional_links",
+  {
+    profileId: text("profile_id")
+      .notNull()
+      .references(() => profiles.memberId),
+    url: text("url").notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.profileId, table.url] })],
+);
+
+export const memberStatements = pgTable(
+  "member_statements",
+  {
+    profileId: text("profile_id")
+      .notNull()
+      .references(() => profiles.memberId),
+    field: text("field").notNull(),
+    value: jsonb("value").notNull(),
+    collectedAt: timestamp("collected_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [primaryKey({ columns: [table.profileId, table.field] })],
 );

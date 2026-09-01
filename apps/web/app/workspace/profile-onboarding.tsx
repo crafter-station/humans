@@ -1,0 +1,215 @@
+"use client";
+
+import { useEffect, useState } from "react";
+
+type Profile = {
+  name: string;
+  githubLogin: string;
+  searchable: boolean;
+};
+
+export function ProfileOnboarding() {
+  const [choice, setChoice] = useState<"choose" | "search" | "profile">(
+    "choose",
+  );
+  const [profile, setProfile] = useState<Profile | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetch("/api/profile", { signal: controller.signal })
+      .then((response) => response.json())
+      .then((result: { profile: Profile | null }) => {
+        if (result.profile !== null) {
+          setProfile(result.profile);
+          setChoice("profile");
+        }
+      })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, []);
+
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setMessage(null);
+    const data = new FormData(
+      event.currentTarget,
+      (event.nativeEvent as SubmitEvent).submitter,
+    );
+    const skills = String(data.get("skills") ?? "")
+      .split(",")
+      .map((skill) => skill.trim())
+      .filter(Boolean);
+    const response = await fetch("/api/profile", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: data.get("name"),
+        currentCompany: data.get("currentCompany") || null,
+        professionalLinks: [data.get("professionalLink")],
+        statements: {
+          role: String(data.get("role") ?? ""),
+          location: String(data.get("location") ?? ""),
+          skills,
+        },
+        adultAttestation: data.get("adultAttestation") === "on",
+        privateCodeAttestation: data.get("privateCodeAttestation") === "on",
+        searchable: data.get("searchable") === "true",
+      }),
+    });
+    const result = (await response.json()) as {
+      profile?: Profile;
+      error?: { code: string };
+    };
+    if (!response.ok || result.profile === undefined) {
+      setMessage(profileError(result.error?.code));
+      return;
+    }
+    setProfile(result.profile);
+    setMessage(
+      result.profile.searchable
+        ? "Your Profile now appears in authenticated Humans searches."
+        : "Your private draft is saved and does not appear in searches.",
+    );
+  };
+
+  const disableSearchability = async () => {
+    const response = await fetch("/api/profile", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ searchable: false }),
+    });
+    const result = (await response.json()) as { profile?: Profile };
+    if (response.ok && result.profile !== undefined) {
+      setProfile(result.profile);
+      setMessage("Your Profile was removed from searches immediately.");
+    }
+  };
+
+  if (choice === "choose") {
+    return (
+      <section className="onboarding">
+        <p className="eyebrow">Choose your path</p>
+        <h1>What brings you to Humans?</h1>
+        <div className="choiceGrid">
+          <button className="choice" onClick={() => setChoice("search")}>
+            <strong>Search Humans</strong>
+            <span>
+              Enter your protected workspace without becoming discoverable.
+            </span>
+          </button>
+          <button
+            className="choice accent"
+            onClick={() => setChoice("profile")}
+          >
+            <strong>Appear in searches</strong>
+            <span>Verify your work and explicitly publish a Profile.</span>
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  if (choice === "search") {
+    return (
+      <section className="onboarding">
+        <p className="eyebrow">Protected workspace</p>
+        <h1>You are ready to search.</h1>
+        <p className="lede">
+          You do not have a searchable Profile. Search tools will arrive here
+          next.
+        </p>
+        <button className="textAction" onClick={() => setChoice("profile")}>
+          Create a Profile instead
+        </button>
+      </section>
+    );
+  }
+
+  return (
+    <section className="onboarding profileFlow">
+      <p className="eyebrow">Profile onboarding</p>
+      <h1>
+        {profile === null
+          ? "Show what you build."
+          : `Profile for ${profile.name}`}
+      </h1>
+      {profile?.searchable === true && (
+        <div className="published">
+          Searchable as @{profile.githubLogin}
+          <button onClick={disableSearchability}>
+            Stop appearing in searches
+          </button>
+        </div>
+      )}
+      <form onSubmit={submit}>
+        <label>
+          Name
+          <input name="name" required defaultValue={profile?.name} />
+        </label>
+        <label>
+          Professional link
+          <input
+            name="professionalLink"
+            type="url"
+            required
+            placeholder="https://github.com/you"
+          />
+        </label>
+        <label>
+          Current company <span>optional</span>
+          <input name="currentCompany" />
+        </label>
+        <div className="split">
+          <label>
+            Role
+            <input name="role" />
+          </label>
+          <label>
+            Location
+            <input name="location" />
+          </label>
+        </div>
+        <label>
+          Skills <span>comma separated</span>
+          <input name="skills" />
+        </label>
+        <p className="githubNote">
+          Your connected GitHub account will be verified when you submit. Bot
+          and Organization accounts are not eligible.
+        </p>
+        <label className="check">
+          <input name="privateCodeAttestation" type="checkbox" /> I code
+          primarily in private repositories and attest that I build with code.
+        </label>
+        <label className="check">
+          <input name="adultAttestation" type="checkbox" required /> I attest
+          that I am at least 18 years old.
+        </label>
+        <div className="formActions">
+          <button name="searchable" value="false">
+            Save private draft
+          </button>
+          <button className="publish" name="searchable" value="true">
+            Submit and appear in searches
+          </button>
+        </div>
+        {message !== null && (
+          <p role="status" className="message">
+            {message}
+          </p>
+        )}
+      </form>
+    </section>
+  );
+}
+
+const profileError = (code?: string) => {
+  if (code === "coding_evidence_required")
+    return "No recent public coding evidence was found. Use the private-code attestation if it applies.";
+  if (code === "adult_required")
+    return "Only adults can create searchable Profiles.";
+  if (code === "ineligible_github_account_type")
+    return "GitHub Bot and Organization accounts are not eligible.";
+  return "Profile verification failed. Connect a personal GitHub account and try again.";
+};

@@ -1,6 +1,7 @@
 import { OrganizationSwitcher, UserButton } from "@clerk/nextjs";
 
 import { WorkspaceProvisioner } from "./workspace-provisioner";
+import { ProfileOnboarding } from "./profile-onboarding";
 import styles from "./workspace.module.css";
 
 export default function WorkspacePage() {
@@ -14,14 +15,7 @@ export default function WorkspacePage() {
           <UserButton />
         </div>
       </header>
-      <section className={styles.content}>
-        <p className={styles.eyebrow}>Protected workspace</p>
-        <h1>Welcome to your workspace.</h1>
-        <p>
-          Search and shared workspace tools will arrive here next. Your Member
-          session and Organization boundary are being prepared securely.
-        </p>
-      </section>
+      <ProfileOnboarding />
     </main>
   );
 }

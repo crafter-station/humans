@@ -2,6 +2,7 @@ import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import {
   makeDatabaseLayer,
   type ClerkProjectionEvent,
+  type GitHubVerification,
   type ProvisionedWorkspace,
 } from "@humans/database";
 import * as schema from "@humans/database/schema";
@@ -260,6 +261,116 @@ describe("Humans API", () => {
     });
   });
 
+  it("creates an eligible Profile only after explicit Member opt-in", async () => {
+    identity.sessions.set("profile_session", {
+      memberId: "member_a",
+      organizationId: "organization_a",
+    });
+    identity.github.set("member_a", githubVerification());
+
+    const draft = await putProfile(app, "profile_session", {
+      ...validProfile,
+      searchable: false,
+    });
+    expect(draft.status).toBe(200);
+    await expect(draft.json()).resolves.toMatchObject({
+      profile: {
+        eligibilityBasis: "owned_repository",
+        githubAccountId: "12345",
+        searchable: false,
+        searchabilityReason: "member_opt_out",
+      },
+    });
+
+    const publish = await putProfile(app, "profile_session", {
+      ...validProfile,
+      searchable: true,
+    });
+    expect(publish.status).toBe(200);
+    await expect(publish.json()).resolves.toMatchObject({
+      profile: { searchable: true, searchabilityReason: "member_opt_in" },
+    });
+
+    const disable = await app.request("/v1/profile/searchability", {
+      method: "PATCH",
+      headers: {
+        authorization: "Bearer profile_session",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ searchable: false }),
+    });
+    expect(disable.status).toBe(200);
+    await expect(disable.json()).resolves.toMatchObject({
+      profile: { searchable: false, searchabilityReason: "member_opt_out" },
+    });
+
+    const protectedRead = await app.request("/v1/profile");
+    expect(protectedRead.status).toBe(401);
+  });
+
+  it("accepts recent public contributions and private-account attestation", async () => {
+    identity.github.set("member_a", {
+      ...githubVerification(),
+      accountId: "recent-contributor",
+      ownsNonForkRepository: false,
+      contributedPubliclySince: new Date(),
+    });
+    const contribution = await putProfile(app, "profile_session", validProfile);
+    expect(contribution.status).toBe(200);
+    await expect(contribution.json()).resolves.toMatchObject({
+      profile: { eligibilityBasis: "public_contribution" },
+    });
+
+    identity.github.set("member_a", {
+      ...githubVerification(),
+      accountId: "private-coder",
+      ownsNonForkRepository: false,
+      contributedPubliclySince: null,
+    });
+    const privateAccount = await putProfile(app, "profile_session", {
+      ...validProfile,
+      privateCodeAttestation: true,
+    });
+    expect(privateAccount.status).toBe(200);
+    await expect(privateAccount.json()).resolves.toMatchObject({
+      profile: { eligibilityBasis: "private_attestation" },
+    });
+  });
+
+  it("rejects ineligible GitHub account types, missing evidence, and minors", async () => {
+    const rejected = async (
+      github: GitHubVerification,
+      profile = validProfile,
+    ) => {
+      identity.github.set("member_a", github);
+      const response = await putProfile(app, "profile_session", profile);
+      expect(response.status).toBe(422);
+      return response.json();
+    };
+
+    await expect(
+      rejected({ ...githubVerification(), accountType: "Bot" }),
+    ).resolves.toMatchObject({
+      error: { code: "ineligible_github_account_type" },
+    });
+    await expect(
+      rejected({
+        ...githubVerification(),
+        ownsNonForkRepository: false,
+        contributedPubliclySince: new Date("2020-01-01"),
+      }),
+    ).resolves.toMatchObject({ error: { code: "coding_evidence_required" } });
+    await expect(
+      rejected({ ...githubVerification(), knownMinor: true }),
+    ).resolves.toMatchObject({ error: { code: "adult_required" } });
+    await expect(
+      rejected(githubVerification(), {
+        ...validProfile,
+        adultAttestation: false,
+      }),
+    ).resolves.toMatchObject({ error: { code: "adult_required" } });
+  });
+
   it("verifies and translates signed Clerk webhooks", async () => {
     const secret = `whsec_${Buffer.alloc(32, 7).toString("base64")}`;
     const timestamp = new Date();
@@ -275,7 +386,9 @@ describe("Humans API", () => {
         primary_email_address_id: "email_signed",
         updated_at: 42,
       },
-      event_attributes: { http_request: { client_ip: "127.0.0.1", user_agent: "test" } },
+      event_attributes: {
+        http_request: { client_ip: "127.0.0.1", user_agent: "test" },
+      },
       object: "event",
       type: "user.created",
     });
@@ -350,6 +463,7 @@ const invitedProjection: ProvisionedWorkspace = {
 };
 
 class FakeIdentity implements IdentityBoundary {
+  readonly github = new Map<string, GitHubVerification>();
   readonly sessions = new Map<string, SessionIdentity>();
   readonly organizations = new Map<string, ProvisionedWorkspace>();
   personalOrganizationsCreated = 0;
@@ -390,4 +504,48 @@ class FakeIdentity implements IdentityBoundary {
     this.organizations.set(memberId, projection);
     return projection;
   }
+
+  async verifyGitHub(memberId: string) {
+    const verification = this.github.get(memberId);
+    if (verification === undefined) throw new Error("GitHub is not connected");
+    return verification;
+  }
 }
+
+const validProfile = {
+  name: "Member A",
+  currentCompany: null,
+  professionalLinks: ["https://github.com/member-a"],
+  statements: {
+    location: "Medellin, Colombia",
+    role: "Software engineer",
+    skills: ["TypeScript", "PostgreSQL"],
+  },
+  adultAttestation: true,
+  privateCodeAttestation: false,
+  searchable: false,
+};
+
+const githubVerification = (): GitHubVerification => ({
+  accountId: "12345",
+  login: "member-a",
+  accountType: "User",
+  ownsNonForkRepository: true,
+  contributedPubliclySince: null,
+  ownershipVerified: true,
+  knownMinor: false,
+});
+
+const putProfile = (
+  app: ReturnType<typeof createApp>,
+  session: string,
+  profile: typeof validProfile,
+) =>
+  app.request("/v1/profile", {
+    method: "PUT",
+    headers: {
+      authorization: `Bearer ${session}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(profile),
+  });

@@ -53,6 +53,156 @@
   line-height: 1.6;
 }
 
+:global(.onboarding) {
+  max-width: 900px;
+  padding-top: clamp(70px, 12vh, 140px);
+}
+
+:global(.onboarding h1) {
+  max-width: 820px;
+  margin-bottom: 32px;
+  font-size: clamp(3rem, 7vw, 6rem);
+  font-weight: 560;
+  letter-spacing: -0.065em;
+  line-height: 0.94;
+}
+
+:global(.eyebrow) {
+  margin-bottom: 20px;
+  color: #ef7050;
+  font: 650 0.73rem/1 var(--font-geist-mono);
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+:global(.choiceGrid) {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+:global(.choice) {
+  min-height: 180px;
+  padding: 28px;
+  color: inherit;
+  text-align: left;
+  background: #213026;
+  border: 1px solid #405247;
+  border-radius: 4px;
+  cursor: pointer;
+}
+:global(.choice.accent) {
+  background: #ef7050;
+  border-color: #ef7050;
+  color: #17221b;
+}
+:global(.choice strong) {
+  display: block;
+  margin-bottom: 48px;
+  font-size: 1.5rem;
+}
+:global(.choice span),
+:global(.lede) {
+  color: #b9c1b8;
+  line-height: 1.5;
+}
+:global(.choice.accent span) {
+  color: #29372e;
+}
+:global(.textAction) {
+  margin-top: 26px;
+  padding: 0;
+  color: #ef7050;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+:global(.profileFlow) {
+  max-width: 760px;
+  padding-bottom: 80px;
+}
+:global(.profileFlow h1) {
+  font-size: clamp(2.8rem, 6vw, 5rem);
+}
+:global(.profileFlow form) {
+  display: grid;
+  gap: 18px;
+  padding: 28px;
+  background: #213026;
+  border: 1px solid #405247;
+}
+:global(.profileFlow label) {
+  display: grid;
+  gap: 8px;
+  color: #d7d8ce;
+  font-size: 0.86rem;
+}
+:global(.profileFlow label span) {
+  color: #849087;
+}
+:global(.profileFlow input) {
+  width: 100%;
+  padding: 13px 14px;
+  color: #f4f1e6;
+  background: #17221b;
+  border: 1px solid #536258;
+  border-radius: 2px;
+  font: inherit;
+}
+:global(.split) {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+:global(.profileFlow .check) {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  align-items: start;
+  line-height: 1.4;
+}
+:global(.profileFlow .check input) {
+  margin-top: 2px;
+}
+:global(.githubNote) {
+  color: #9ba59d;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+:global(.formActions) {
+  display: flex;
+  gap: 12px;
+  margin-top: 8px;
+}
+:global(.formActions button),
+:global(.published button) {
+  padding: 12px 16px;
+  color: #e9e6d8;
+  background: transparent;
+  border: 1px solid #708078;
+  cursor: pointer;
+}
+:global(.formActions .publish) {
+  color: #17221b;
+  background: #ef7050;
+  border-color: #ef7050;
+}
+:global(.published) {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 22px;
+  padding: 14px 16px;
+  color: #17221b;
+  background: #b8dc79;
+}
+:global(.published button) {
+  color: #17221b;
+  border-color: #526736;
+}
+:global(.message) {
+  color: #b8dc79;
+  line-height: 1.4;
+}
+
 @media (max-width: 650px) {
   .page {
     padding: 20px;
@@ -60,5 +210,15 @@
 
   .account {
     gap: 8px;
+  }
+
+  :global(.choiceGrid),
+  :global(.split) {
+    grid-template-columns: 1fr;
+  }
+  :global(.formActions),
+  :global(.published) {
+    align-items: stretch;
+    flex-direction: column;
   }
 }
