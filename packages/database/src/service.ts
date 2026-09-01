@@ -400,7 +400,7 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
       return yield* Effect.tryPromise({
         try: async () => {
           await database.transaction(async (transaction) => {
-            await transaction
+            const [storedProfile] = await transaction
               .insert(profiles)
               .values({
                 memberId,
@@ -418,7 +418,6 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
                 set: {
                   name: input.name,
                   currentCompany: input.currentCompany,
-                  githubAccountId: github.accountId,
                   githubLogin: github.login,
                   eligibilityBasis,
                   adultAttested: true,
@@ -426,7 +425,13 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
                   searchabilityReason,
                   updatedAt: new Date(),
                 },
+              })
+              .returning({ githubAccountId: profiles.githubAccountId });
+            if (storedProfile?.githubAccountId !== github.accountId) {
+              throw new ProfileRejected({
+                reason: "github_identity_change_requires_review",
               });
+            }
             await transaction
               .delete(professionalLinks)
               .where(eq(professionalLinks.profileId, memberId));
@@ -460,7 +465,10 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
             searchabilityReason,
           };
         },
-        catch: (cause) => new DatabaseUnavailable({ cause }),
+        catch: (cause) =>
+          cause instanceof ProfileRejected
+            ? cause
+            : new DatabaseUnavailable({ cause }),
       });
     }).pipe(Effect.withSpan("Database.saveProfile"));
   };

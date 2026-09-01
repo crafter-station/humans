@@ -300,57 +300,51 @@ export const clerkIdentityBoundary: IdentityBoundary = {
 
     const cutoff = new Date();
     cutoff.setUTCFullYear(cutoff.getUTCFullYear() - 1);
-    const cutoffDate = cutoff.toISOString().slice(0, 10);
-    const findPublicCommitDate = async () => {
-      for (let page = 1; page <= 10; page += 1) {
-        const response = await fetch(
-          `https://api.github.com/search/commits?q=${encodeURIComponent(`author:${account.login} author-date:>=${cutoffDate}`)}&per_page=100&page=${page}`,
-          { headers },
-        );
-        if (!response.ok) return null;
-        const result = (await response.json()) as {
-          total_count: number;
-          items: Array<{
-            commit: { author: { date: string } | null };
-            repository: { private: boolean };
-          }>;
-        };
-        const publicCommit = result.items.find(
-          (commit) => !commit.repository.private,
-        );
-        if (publicCommit !== undefined) {
-          return publicCommit.commit.author?.date ?? cutoff.toISOString();
-        }
-        if (page * 100 >= result.total_count) return null;
-      }
-      return null;
-    };
-    const [publicCommitDate, pullRequestsResponse] = await Promise.all([
-      findPublicCommitDate(),
-      fetch(
-        `https://api.github.com/search/issues?q=${encodeURIComponent(`author:${account.login} type:pr is:public created:>=${cutoffDate}`)}&per_page=1`,
-        { headers },
-      ),
-    ]);
-    const pullRequests = pullRequestsResponse.ok
-      ? ((await pullRequestsResponse.json()) as {
-          items: Array<{ created_at: string }>;
-        })
-      : { items: [] };
-    const contributionDates = [
-      ...(publicCommitDate === null ? [] : [publicCommitDate]),
-      ...pullRequests.items.map((pullRequest) => pullRequest.created_at),
-    ];
+    cutoff.setUTCHours(0, 0, 0, 0);
+    const contributionsResponse = await fetch(
+      "https://api.github.com/graphql",
+      {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({
+          query: `query($from: DateTime!) {
+          viewer {
+            contributionsCollection(from: $from) {
+              totalCommitContributions
+              totalPullRequestContributions
+            }
+          }
+        }`,
+          variables: { from: cutoff.toISOString() },
+        }),
+      },
+    );
+    const contributions = contributionsResponse.ok
+      ? (
+          (await contributionsResponse.json()) as {
+            data?: {
+              viewer: {
+                contributionsCollection: {
+                  totalCommitContributions: number;
+                  totalPullRequestContributions: number;
+                };
+              };
+            };
+          }
+        ).data?.viewer.contributionsCollection
+      : undefined;
+    const hasPublicContribution =
+      contributions !== undefined &&
+      contributions.totalCommitContributions +
+        contributions.totalPullRequestContributions >
+        0;
 
     return {
       accountId: String(account.id),
       login: account.login,
       accountType: account.type,
       ownsNonForkRepository,
-      contributedPubliclySince:
-        contributionDates.length > 0
-          ? new Date(contributionDates.sort().at(-1)!)
-          : null,
+      contributedPubliclySince: hasPublicContribution ? cutoff : null,
       ownershipVerified: true,
       knownMinor: member.privateMetadata.knownMinor === true,
     };
