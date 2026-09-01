@@ -304,6 +304,16 @@ describe("Humans API", () => {
       profile: { searchable: false, searchabilityReason: "member_opt_out" },
     });
 
+    const unsafeReenable = await app.request("/v1/profile/searchability", {
+      method: "PATCH",
+      headers: {
+        authorization: "Bearer profile_session",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ searchable: true }),
+    });
+    expect(unsafeReenable.status).toBe(422);
+
     const protectedRead = await app.request("/v1/profile");
     expect(protectedRead.status).toBe(401);
   });
@@ -311,7 +321,6 @@ describe("Humans API", () => {
   it("accepts recent public contributions and private-account attestation", async () => {
     identity.github.set("member_a", {
       ...githubVerification(),
-      accountId: "recent-contributor",
       ownsNonForkRepository: false,
       contributedPubliclySince: new Date(),
     });
@@ -323,7 +332,6 @@ describe("Humans API", () => {
 
     identity.github.set("member_a", {
       ...githubVerification(),
-      accountId: "private-coder",
       ownsNonForkRepository: false,
       contributedPubliclySince: null,
     });
@@ -354,6 +362,11 @@ describe("Humans API", () => {
       error: { code: "ineligible_github_account_type" },
     });
     await expect(
+      rejected({ ...githubVerification(), accountType: "Organization" }),
+    ).resolves.toMatchObject({
+      error: { code: "ineligible_github_account_type" },
+    });
+    await expect(
       rejected({
         ...githubVerification(),
         ownsNonForkRepository: false,
@@ -363,12 +376,26 @@ describe("Humans API", () => {
     await expect(
       rejected({ ...githubVerification(), knownMinor: true }),
     ).resolves.toMatchObject({ error: { code: "adult_required" } });
+    const suppressedProfile = await app.request("/v1/profile", {
+      headers: { authorization: "Bearer profile_session" },
+    });
+    await expect(suppressedProfile.json()).resolves.toMatchObject({
+      profile: {
+        searchable: false,
+        searchabilityReason: "operator_suppression",
+      },
+    });
     await expect(
       rejected(githubVerification(), {
         ...validProfile,
         adultAttestation: false,
       }),
     ).resolves.toMatchObject({ error: { code: "adult_required" } });
+    await expect(
+      rejected({ ...githubVerification(), accountId: "different-account" }),
+    ).resolves.toMatchObject({
+      error: { code: "github_identity_change_requires_review" },
+    });
   });
 
   it("verifies and translates signed Clerk webhooks", async () => {

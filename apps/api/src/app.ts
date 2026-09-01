@@ -259,7 +259,7 @@ export const createApp = (
     const session = await identity.authenticate(context.req.raw, context.env);
     if (session === null) return unauthorized(context);
     const parsed = z
-      .object({ searchable: z.boolean() })
+      .object({ searchable: z.literal(false) })
       .safeParse(await context.req.json().catch(() => null));
     if (!parsed.success) return invalidProfile(context, "invalid_profile");
 
@@ -267,10 +267,7 @@ export const createApp = (
       const profile = await Effect.runPromise(
         Effect.gen(function* () {
           const database = yield* Database;
-          return yield* database.setProfileSearchability(
-            session.memberId,
-            parsed.data.searchable,
-          );
+          return yield* database.disableProfileSearchability(session.memberId);
         }).pipe(Effect.provide(databaseLayer(context.env))),
       );
       return context.json({ profile }, 200);

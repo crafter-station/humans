@@ -4,6 +4,7 @@ import {
   jsonb,
   pgTable,
   primaryKey,
+  real,
   text,
   timestamp,
 } from "drizzle-orm/pg-core";
@@ -95,17 +96,17 @@ export const professionalLinks = pgTable(
   (table) => [primaryKey({ columns: [table.profileId, table.url] })],
 );
 
-export const memberStatements = pgTable(
-  "member_statements",
-  {
-    profileId: text("profile_id")
-      .notNull()
-      .references(() => profiles.memberId),
-    field: text("field").notNull(),
-    value: jsonb("value").notNull(),
-    collectedAt: timestamp("collected_at", { withTimezone: true })
-      .notNull()
-      .defaultNow(),
-  },
-  (table) => [primaryKey({ columns: [table.profileId, table.field] })],
-);
+export const memberStatements = pgTable("member_statements", {
+  id: text("id").primaryKey(),
+  profileId: text("profile_id")
+    .notNull()
+    .references(() => profiles.memberId),
+  field: text("field").notNull(),
+  value: jsonb("value").notNull(),
+  source: text("source").notNull(),
+  pipelineVersion: text("pipeline_version").notNull(),
+  confidence: real("confidence").notNull(),
+  collectedAt: timestamp("collected_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});

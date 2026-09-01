@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import type { NeonDatabase } from "drizzle-orm/neon-serverless";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Context, Effect, Layer, Schema } from "effect";
@@ -91,7 +91,8 @@ export type MemberProfile = ProfileInput & {
   githubLogin: string;
   eligibilityBasis:
     "owned_repository" | "public_contribution" | "private_attestation";
-  searchabilityReason: "member_opt_in" | "member_opt_out";
+  searchabilityReason:
+    "member_opt_in" | "member_opt_out" | "operator_suppression";
 };
 
 export class DatabaseUnavailable extends Schema.TaggedError<DatabaseUnavailable>()(
@@ -134,9 +135,8 @@ export class Database extends Context.Service<
       input: ProfileInput,
       github: GitHubVerification,
     ) => Effect.Effect<MemberProfile, DatabaseUnavailable | ProfileRejected>;
-    readonly setProfileSearchability: (
+    readonly disableProfileSearchability: (
       memberId: string,
-      searchable: boolean,
     ) => Effect.Effect<MemberProfile, DatabaseUnavailable | ProfileRejected>;
   }
 >()("@humans/database/Database") {}
@@ -345,7 +345,8 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
               value: memberStatements.value,
             })
             .from(memberStatements)
-            .where(eq(memberStatements.profileId, memberId)),
+            .where(eq(memberStatements.profileId, memberId))
+            .orderBy(desc(memberStatements.collectedAt)),
         ]);
 
         return profileResult(profile, links, statements);
@@ -359,8 +360,25 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
     github: GitHubVerification,
   ) => {
     const rejection = profileRejection(input, github);
-    if (rejection !== null)
-      return Effect.fail(new ProfileRejected({ reason: rejection }));
+    if (rejection !== null) {
+      return Effect.gen(function* () {
+        if (github.knownMinor) {
+          yield* Effect.tryPromise({
+            try: () =>
+              database
+                .update(profiles)
+                .set({
+                  searchable: false,
+                  searchabilityReason: "operator_suppression",
+                  updatedAt: new Date(),
+                })
+                .where(eq(profiles.memberId, memberId)),
+            catch: (cause) => new DatabaseUnavailable({ cause }),
+          });
+        }
+        return yield* new ProfileRejected({ reason: rejection });
+      });
+    }
 
     const eligibilityBasis = github.ownsNonForkRepository
       ? ("owned_repository" as const)
@@ -371,25 +389,21 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
       ? ("member_opt_in" as const)
       : ("member_opt_out" as const);
 
-    return Effect.tryPromise({
-      try: async () => {
-        await database.transaction(async (transaction) => {
-          await transaction
-            .insert(profiles)
-            .values({
-              memberId,
-              name: input.name,
-              currentCompany: input.currentCompany,
-              githubAccountId: github.accountId,
-              githubLogin: github.login,
-              eligibilityBasis,
-              adultAttested: true,
-              searchable: input.searchable,
-              searchabilityReason,
-            })
-            .onConflictDoUpdate({
-              target: profiles.memberId,
-              set: {
+    return Effect.gen(function* () {
+      const existing = yield* getProfile(memberId);
+      if (existing !== null && existing.githubAccountId !== github.accountId) {
+        return yield* new ProfileRejected({
+          reason: "github_identity_change_requires_review",
+        });
+      }
+
+      return yield* Effect.tryPromise({
+        try: async () => {
+          await database.transaction(async (transaction) => {
+            await transaction
+              .insert(profiles)
+              .values({
+                memberId,
                 name: input.name,
                 currentCompany: input.currentCompany,
                 githubAccountId: github.accountId,
@@ -398,60 +412,68 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
                 adultAttested: true,
                 searchable: input.searchable,
                 searchabilityReason,
-                updatedAt: new Date(),
-              },
-            });
-          await transaction
-            .delete(professionalLinks)
-            .where(eq(professionalLinks.profileId, memberId));
-          await transaction
-            .insert(professionalLinks)
-            .values(
+              })
+              .onConflictDoUpdate({
+                target: profiles.memberId,
+                set: {
+                  name: input.name,
+                  currentCompany: input.currentCompany,
+                  githubAccountId: github.accountId,
+                  githubLogin: github.login,
+                  eligibilityBasis,
+                  adultAttested: true,
+                  searchable: input.searchable,
+                  searchabilityReason,
+                  updatedAt: new Date(),
+                },
+              });
+            await transaction
+              .delete(professionalLinks)
+              .where(eq(professionalLinks.profileId, memberId));
+            await transaction.insert(professionalLinks).values(
               input.professionalLinks.map((url) => ({
                 profileId: memberId,
                 url,
               })),
             );
-          await transaction
-            .delete(memberStatements)
-            .where(eq(memberStatements.profileId, memberId));
-          const statements = Object.entries(input.statements);
-          if (statements.length > 0) {
-            await transaction
-              .insert(memberStatements)
-              .values(
+            const statements = Object.entries(input.statements);
+            if (statements.length > 0) {
+              await transaction.insert(memberStatements).values(
                 statements.map(([field, value]) => ({
+                  id: crypto.randomUUID(),
                   profileId: memberId,
                   field,
                   value,
+                  source: "member",
+                  pipelineVersion: "member-v1",
+                  confidence: 1,
                 })),
               );
-          }
-        });
-        return {
-          ...input,
-          memberId,
-          githubAccountId: github.accountId,
-          githubLogin: github.login,
-          eligibilityBasis,
-          searchabilityReason,
-        };
-      },
-      catch: (cause) => new DatabaseUnavailable({ cause }),
+            }
+          });
+          return {
+            ...input,
+            memberId,
+            githubAccountId: github.accountId,
+            githubLogin: github.login,
+            eligibilityBasis,
+            searchabilityReason,
+          };
+        },
+        catch: (cause) => new DatabaseUnavailable({ cause }),
+      });
     }).pipe(Effect.withSpan("Database.saveProfile"));
   };
 
-  const setProfileSearchability = (memberId: string, searchable: boolean) =>
+  const disableProfileSearchability = (memberId: string) =>
     Effect.gen(function* () {
       const [updated] = yield* Effect.tryPromise({
         try: () =>
           database
             .update(profiles)
             .set({
-              searchable,
-              searchabilityReason: searchable
-                ? "member_opt_in"
-                : "member_opt_out",
+              searchable: false,
+              searchabilityReason: "member_opt_out",
               updatedAt: new Date(),
             })
             .where(eq(profiles.memberId, memberId))
@@ -466,16 +488,16 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
         return yield* new ProfileRejected({ reason: "profile_not_found" });
       }
       return profile;
-    }).pipe(Effect.withSpan("Database.setProfileSearchability"));
+    }).pipe(Effect.withSpan("Database.disableProfileSearchability"));
 
   return Database.of({
     check,
+    disableProfileSearchability,
     getProfile,
     getWorkspace,
     projectClerkEvent,
     provisionWorkspace,
     saveProfile,
-    setProfileSearchability,
   });
 };
 
@@ -489,6 +511,7 @@ const profileRejection = (input: ProfileInput, github: GitHubVerification) => {
 
   const contributionCutoff = new Date();
   contributionCutoff.setUTCFullYear(contributionCutoff.getUTCFullYear() - 1);
+  contributionCutoff.setUTCHours(0, 0, 0, 0);
   const hasRecentContribution =
     github.contributedPubliclySince !== null &&
     github.contributedPubliclySince >= contributionCutoff;
@@ -511,9 +534,13 @@ const profileResult = (
   name: profile.name,
   currentCompany: profile.currentCompany,
   professionalLinks: links.map(({ url }) => url),
-  statements: Object.fromEntries(
-    statements.map(({ field, value }) => [field, value]),
-  ) as Record<string, string | string[]>,
+  statements: statements.reduce<Record<string, string | string[]>>(
+    (latest, { field, value }) => {
+      if (!(field in latest)) latest[field] = value as string | string[];
+      return latest;
+    },
+    {},
+  ),
   adultAttestation: profile.adultAttested,
   privateCodeAttestation: profile.eligibilityBasis === "private_attestation",
   searchable: profile.searchable,

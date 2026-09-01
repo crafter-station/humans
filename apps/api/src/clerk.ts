@@ -257,10 +257,10 @@ export const clerkIdentityBoundary: IdentityBoundary = {
 
   async verifyGitHub(memberId, bindings) {
     const clerk = createClerkClient({ secretKey: bindings.CLERK_SECRET_KEY });
-    const tokens = await clerk.users.getUserOauthAccessToken(
-      memberId,
-      "oauth_github",
-    );
+    const [tokens, member] = await Promise.all([
+      clerk.users.getUserOauthAccessToken(memberId, "oauth_github"),
+      clerk.users.getUser(memberId),
+    ]);
     const token = tokens.data[0]?.token;
     if (token === undefined)
       throw new Error("A connected GitHub account is required");
@@ -281,36 +281,78 @@ export const clerkIdentityBoundary: IdentityBoundary = {
       type: "User" | "Bot" | "Organization";
     };
 
-    const repositoriesResponse = await fetch(
-      "https://api.github.com/user/repos?affiliation=owner&visibility=public&per_page=100",
-      { headers },
-    );
-    if (!repositoriesResponse.ok)
-      throw new Error("GitHub repository verification failed");
-    const repositories = (await repositoriesResponse.json()) as Array<{
-      fork: boolean;
-    }>;
+    let ownsNonForkRepository = false;
+    for (let page = 1; !ownsNonForkRepository; page += 1) {
+      const repositoriesResponse = await fetch(
+        `https://api.github.com/user/repos?affiliation=owner&visibility=public&per_page=100&page=${page}`,
+        { headers },
+      );
+      if (!repositoriesResponse.ok)
+        throw new Error("GitHub repository verification failed");
+      const repositories = (await repositoriesResponse.json()) as Array<{
+        fork: boolean;
+      }>;
+      ownsNonForkRepository = repositories.some(
+        (repository) => !repository.fork,
+      );
+      if (repositories.length < 100) break;
+    }
 
     const cutoff = new Date();
     cutoff.setUTCFullYear(cutoff.getUTCFullYear() - 1);
-    const commitsResponse = await fetch(
-      `https://api.github.com/search/commits?q=${encodeURIComponent(`author:${account.login} author-date:>=${cutoff.toISOString().slice(0, 10)}`)}&per_page=1`,
-      { headers },
-    );
-    const commits = commitsResponse.ok
-      ? ((await commitsResponse.json()) as { total_count: number })
-      : { total_count: 0 };
+    const cutoffDate = cutoff.toISOString().slice(0, 10);
+    const findPublicCommitDate = async () => {
+      for (let page = 1; page <= 10; page += 1) {
+        const response = await fetch(
+          `https://api.github.com/search/commits?q=${encodeURIComponent(`author:${account.login} author-date:>=${cutoffDate}`)}&per_page=100&page=${page}`,
+          { headers },
+        );
+        if (!response.ok) return null;
+        const result = (await response.json()) as {
+          total_count: number;
+          items: Array<{
+            commit: { author: { date: string } | null };
+            repository: { private: boolean };
+          }>;
+        };
+        const publicCommit = result.items.find(
+          (commit) => !commit.repository.private,
+        );
+        if (publicCommit !== undefined) {
+          return publicCommit.commit.author?.date ?? cutoff.toISOString();
+        }
+        if (page * 100 >= result.total_count) return null;
+      }
+      return null;
+    };
+    const [publicCommitDate, pullRequestsResponse] = await Promise.all([
+      findPublicCommitDate(),
+      fetch(
+        `https://api.github.com/search/issues?q=${encodeURIComponent(`author:${account.login} type:pr is:public created:>=${cutoffDate}`)}&per_page=1`,
+        { headers },
+      ),
+    ]);
+    const pullRequests = pullRequestsResponse.ok
+      ? ((await pullRequestsResponse.json()) as {
+          items: Array<{ created_at: string }>;
+        })
+      : { items: [] };
+    const contributionDates = [
+      ...(publicCommitDate === null ? [] : [publicCommitDate]),
+      ...pullRequests.items.map((pullRequest) => pullRequest.created_at),
+    ];
 
     return {
       accountId: String(account.id),
       login: account.login,
       accountType: account.type,
-      ownsNonForkRepository: repositories.some(
-        (repository) => !repository.fork,
-      ),
-      contributedPubliclySince: commits.total_count > 0 ? cutoff : null,
+      ownsNonForkRepository,
+      contributedPubliclySince:
+        contributionDates.length > 0
+          ? new Date(contributionDates.sort().at(-1)!)
+          : null,
       ownershipVerified: true,
-      knownMinor: false,
+      knownMinor: member.privateMetadata.knownMinor === true,
     };
   },
 };

@@ -40,17 +40,22 @@ export function ProfileOnboarding() {
       .split(",")
       .map((skill) => skill.trim())
       .filter(Boolean);
+    const currentCompany = String(data.get("currentCompany") ?? "").trim();
     const response = await fetch("/api/profile", {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         name: data.get("name"),
-        currentCompany: data.get("currentCompany") || null,
+        currentCompany: currentCompany || null,
         professionalLinks: [data.get("professionalLink")],
         statements: {
           role: String(data.get("role") ?? ""),
           location: String(data.get("location") ?? ""),
           skills,
+          ...(currentCompany === "" ? {} : { currentCompany }),
+          opportunityStatus: String(
+            data.get("opportunityStatus") ?? "unspecified",
+          ),
         },
         adultAttestation: data.get("adultAttestation") === "on",
         privateCodeAttestation: data.get("privateCodeAttestation") === "on",
@@ -173,6 +178,14 @@ export function ProfileOnboarding() {
         <label>
           Skills <span>comma separated</span>
           <input name="skills" />
+        </label>
+        <label>
+          Opportunity status
+          <select name="opportunityStatus" defaultValue="unspecified">
+            <option value="unspecified">Unspecified</option>
+            <option value="open">Open to opportunities</option>
+            <option value="not_open">Not open</option>
+          </select>
         </label>
         <p className="githubNote">
           Your connected GitHub account will be verified when you submit. Bot

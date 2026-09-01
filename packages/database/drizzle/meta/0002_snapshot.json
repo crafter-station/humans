@@ -1,5 +1,5 @@
 {
-  "id": "f3c11cfd-ea03-4101-84ad-ac9ff57f7b57",
+  "id": "b0cf31e0-f6ce-4ca9-907e-b5f7c90c4250",
   "prevId": "b099c35c-c008-4cb9-8d41-0ca92d148d0c",
   "version": "7",
   "dialect": "postgresql",
@@ -85,6 +85,12 @@
       "name": "member_statements",
       "schema": "",
       "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
         "profile_id": {
           "name": "profile_id",
           "type": "text",
@@ -100,6 +106,24 @@
         "value": {
           "name": "value",
           "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source": {
+          "name": "source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "pipeline_version": {
+          "name": "pipeline_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "confidence": {
+          "name": "confidence",
+          "type": "real",
           "primaryKey": false,
           "notNull": true
         },
@@ -127,15 +151,7 @@
           "onUpdate": "no action"
         }
       },
-      "compositePrimaryKeys": {
-        "member_statements_profile_id_field_pk": {
-          "name": "member_statements_profile_id_field_pk",
-          "columns": [
-            "profile_id",
-            "field"
-          ]
-        }
-      },
+      "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},

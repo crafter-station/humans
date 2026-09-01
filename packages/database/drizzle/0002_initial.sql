@@ -1,9 +1,12 @@
 CREATE TABLE "member_statements" (
+	"id" text PRIMARY KEY NOT NULL,
 	"profile_id" text NOT NULL,
 	"field" text NOT NULL,
 	"value" jsonb NOT NULL,
-	"collected_at" timestamp with time zone DEFAULT now() NOT NULL,
-	CONSTRAINT "member_statements_profile_id_field_pk" PRIMARY KEY("profile_id","field")
+	"source" text NOT NULL,
+	"pipeline_version" text NOT NULL,
+	"confidence" real NOT NULL,
+	"collected_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
 CREATE TABLE "professional_links" (

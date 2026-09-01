@@ -138,7 +138,8 @@
 :global(.profileFlow label span) {
   color: #849087;
 }
-:global(.profileFlow input) {
+:global(.profileFlow input),
+:global(.profileFlow select) {
   width: 100%;
   padding: 13px 14px;
   color: #f4f1e6;
