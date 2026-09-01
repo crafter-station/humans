@@ -1,0 +1,64 @@
+.page {
+  min-height: 100svh;
+  padding: 24px 5vw;
+  color: #e9e6d8;
+  background: #17221b;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 22px;
+  border-bottom: 1px solid rgba(233, 230, 216, 0.25);
+}
+
+.wordmark {
+  font-size: 1.35rem;
+  font-weight: 750;
+  letter-spacing: -0.05em;
+}
+
+.account {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+}
+
+.content {
+  max-width: 730px;
+  padding-top: clamp(100px, 19vh, 210px);
+}
+
+.eyebrow {
+  margin-bottom: 24px;
+  color: #ef7050;
+  font: 650 0.73rem/1 var(--font-geist-mono);
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.content h1 {
+  margin-bottom: 30px;
+  font-size: clamp(3.4rem, 8vw, 7rem);
+  font-weight: 560;
+  letter-spacing: -0.07em;
+  line-height: 0.9;
+}
+
+.content > p:last-child {
+  max-width: 560px;
+  color: #b9c1b8;
+  font-size: 1.1rem;
+  line-height: 1.6;
+}
+
+@media (max-width: 650px) {
+  .page {
+    padding: 20px;
+  }
+
+  .account {
+    gap: 8px;
+  }
+}

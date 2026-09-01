@@ -24,9 +24,10 @@ Start the Next.js web application at <http://localhost:3000>:
 bun run dev:web
 ```
 
-Create `apps/api/.dev.vars` from `apps/api/.dev.vars.example`, set its
-`DATABASE_URL` to a pgvector-capable database, apply the migrations, and start
-the Cloudflare Worker at <http://localhost:8787>:
+Create `apps/api/.dev.vars` from `apps/api/.dev.vars.example`. Set its
+`DATABASE_URL` to a pgvector-capable database and add the Clerk keys and webhook
+signing secret for the environment. Apply the migrations, then start the
+Cloudflare Worker at <http://localhost:8787>:
 
 ```sh
 bun run --cwd packages/database --env-file=../../apps/api/.dev.vars db:migrate
@@ -54,14 +55,16 @@ bun run --cwd packages/database --env-file=../../apps/api/.dev.vars db:migrate
 extension list because Drizzle has no extension schema primitive. Migration SQL
 is generated and should not be edited by hand.
 
-Production database access uses Drizzle's Neon serverless adapter behind an
-Effect service. The integration test supplies Drizzle's Node PostgreSQL adapter
-to the same service boundary.
+Production database access uses Drizzle's transactional Neon serverless adapter
+behind an Effect service. The integration test supplies Drizzle's Node
+PostgreSQL adapter to the same service boundary.
 
 ## Configuration
 
-No secrets are committed. `DATABASE_URL` is the only required configuration
-value for this seam.
+No secrets are committed. The API requires `DATABASE_URL`, `CLERK_SECRET_KEY`,
+`CLERK_PUBLISHABLE_KEY`, and `CLERK_WEBHOOK_SIGNING_SECRET`. The web application
+requires `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` and `CLERK_SECRET_KEY`; set
+`HUMANS_API_URL` when the API is not available at `http://localhost:8787`.
 
 | Environment | Cloudflare environment | Worker name             | Secret source                    |
 | ----------- | ---------------------- | ----------------------- | -------------------------------- |
@@ -77,7 +80,8 @@ bunx wrangler secret put DATABASE_URL --env production
 ```
 
 Use separate Neon databases or branches for local, preview, and production.
-The web application has no required runtime configuration at this seam.
+Configure Clerk to deliver Member, Organization, and Organization membership
+events to `/webhooks/clerk` in each environment.
 
 ## Verification
 

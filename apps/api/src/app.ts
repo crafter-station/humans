@@ -3,7 +3,12 @@ import { Database, makeDatabaseLayer } from "@humans/database";
 import { Scalar } from "@scalar/hono-api-reference";
 import { Effect } from "effect";
 
+import { clerkIdentityBoundary, type IdentityBoundary } from "./clerk";
+
 export type Bindings = {
+  CLERK_PUBLISHABLE_KEY: string;
+  CLERK_SECRET_KEY: string;
+  CLERK_WEBHOOK_SIGNING_SECRET: string;
   DATABASE_URL: string;
 };
 
@@ -52,6 +57,10 @@ const healthRoute = createRoute({
   },
 });
 
+const errorResponse = z.object({
+  error: z.object({ code: z.string(), message: z.string() }),
+});
+
 const checkHealth = Effect.fn("checkHealth")(function* () {
   const database = yield* Database;
   yield* database.check;
@@ -65,7 +74,10 @@ const checkHealth = Effect.fn("checkHealth")(function* () {
   } as const;
 });
 
-export const createApp = (databaseLayer: DatabaseLayerFactory) => {
+export const createApp = (
+  databaseLayer: DatabaseLayerFactory,
+  identity: IdentityBoundary = clerkIdentityBoundary,
+) => {
   const app = new OpenAPIHono<{ Bindings: Bindings }>();
 
   app.openapi(healthRoute, async (context) => {
@@ -77,6 +89,97 @@ export const createApp = (databaseLayer: DatabaseLayerFactory) => {
     } catch {
       return context.json(
         { message: "Service unavailable", status: "error" } as const,
+        503,
+      );
+    }
+  });
+
+  app.post("/webhooks/clerk", async (context) => {
+    let event;
+    try {
+      event = await identity.verifyWebhook(context.req.raw, context.env);
+    } catch {
+      return context.json(
+        {
+          error: {
+            code: "invalid_webhook_signature",
+            message: "The webhook signature is invalid",
+          },
+        },
+        400,
+      );
+    }
+
+    if (event === null) return context.json({ processed: false }, 200);
+
+    try {
+      const processed = await Effect.runPromise(
+        Effect.gen(function* () {
+          const database = yield* Database;
+          return yield* database.projectClerkEvent(event);
+        }).pipe(Effect.provide(databaseLayer(context.env))),
+      );
+      return context.json({ processed }, 200);
+    } catch {
+      return context.json(
+        { error: { code: "service_unavailable", message: "Service unavailable" } },
+        503,
+      );
+    }
+  });
+
+  app.post("/v1/workspace", async (context) => {
+    const session = await identity.authenticate(context.req.raw, context.env);
+    if (session === null) return unauthorized(context);
+
+    try {
+      const workspace = await Effect.runPromise(
+        Effect.gen(function* () {
+          const database = yield* Database;
+          return yield* database.provisionWorkspace(session.memberId, () =>
+            identity.provisionPersonalOrganization(
+              session.memberId,
+              context.env,
+              session.organizationId ?? undefined,
+            ),
+          );
+        }).pipe(Effect.provide(databaseLayer(context.env))),
+      );
+      return context.json(workspace, 200);
+    } catch {
+      return context.json(
+        { error: { code: "service_unavailable", message: "Service unavailable" } },
+        503,
+      );
+    }
+  });
+
+  app.get("/v1/organizations/:organizationId/workspace", async (context) => {
+    const session = await identity.authenticate(context.req.raw, context.env);
+    if (session === null) return unauthorized(context);
+
+    const organizationId = context.req.param("organizationId");
+    if (session.organizationId !== organizationId) return forbidden(context);
+
+    try {
+      const workspace = await Effect.runPromise(
+        Effect.gen(function* () {
+          const database = yield* Database;
+          return yield* database.getWorkspace(session.memberId, organizationId);
+        }).pipe(Effect.provide(databaseLayer(context.env))),
+      );
+      return context.json(workspace, 200);
+    } catch (error) {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "_tag" in error &&
+        error._tag === "WorkspaceForbidden"
+      ) {
+        return forbidden(context);
+      }
+      return context.json(
+        { error: { code: "service_unavailable", message: "Service unavailable" } },
         503,
       );
     }
@@ -100,3 +203,19 @@ export const createApp = (databaseLayer: DatabaseLayerFactory) => {
 
   return app;
 };
+
+const unauthorized = (context: {
+  json: (body: z.infer<typeof errorResponse>, status: 401) => Response;
+}) =>
+  context.json(
+    { error: { code: "unauthorized", message: "Authentication is required" } },
+    401,
+  );
+
+const forbidden = (context: {
+  json: (body: z.infer<typeof errorResponse>, status: 403) => Response;
+}) =>
+  context.json(
+    { error: { code: "forbidden", message: "Organization access is denied" } },
+    403,
+  );

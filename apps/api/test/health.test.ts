@@ -1,12 +1,23 @@
 import { PostgreSqlContainer } from "@testcontainers/postgresql";
-import { makeDatabaseLayer } from "@humans/database";
+import {
+  makeDatabaseLayer,
+  type ClerkProjectionEvent,
+  type ProvisionedWorkspace,
+} from "@humans/database";
+import * as schema from "@humans/database/schema";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
+import { Webhook } from "standardwebhooks";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createApp } from "../src/app";
+import {
+  clerkIdentityBoundary,
+  type IdentityBoundary,
+  type SessionIdentity,
+} from "../src/clerk";
 
 describe("Humans API", () => {
   const resources: {
@@ -14,6 +25,7 @@ describe("Humans API", () => {
     pool?: Pool;
   } = {};
   let app: ReturnType<typeof createApp>;
+  let identity: FakeIdentity;
 
   beforeAll(async () => {
     resources.container = await new PostgreSqlContainer(
@@ -23,13 +35,14 @@ describe("Humans API", () => {
       connectionString: resources.container.getConnectionUri(),
     });
 
-    const database = drizzle(resources.pool);
+    const database = drizzle(resources.pool, { schema });
     await migrate(database, {
       migrationsFolder: fileURLToPath(
         new URL("../../../packages/database/drizzle", import.meta.url),
       ),
     });
-    app = createApp(() => makeDatabaseLayer(database));
+    identity = new FakeIdentity();
+    app = createApp(() => makeDatabaseLayer(database), identity);
   });
 
   afterAll(async () => {
@@ -63,4 +76,318 @@ describe("Humans API", () => {
       "Humans API Reference",
     );
   });
+
+  it("projects Clerk events once and isolates Organization workspaces", async () => {
+    const memberEvent: ClerkProjectionEvent = {
+      id: "evt_member_a",
+      sourceUpdatedAt: 1,
+      type: "member.upsert",
+      member: {
+        clerkId: "member_a",
+        email: "a@example.com",
+        imageUrl: null,
+        name: "Member A",
+      },
+    };
+    const membershipEvent: ClerkProjectionEvent = {
+      id: "evt_membership_a",
+      sourceUpdatedAt: 2,
+      type: "membership.upsert",
+      member: memberEvent.member,
+      membership: {
+        clerkId: "membership_a",
+        memberId: "member_a",
+        organizationId: "organization_a",
+        role: "org:admin",
+      },
+      organization: {
+        clerkId: "organization_a",
+        name: "Organization A",
+        slug: "organization-a",
+      },
+    };
+
+    await expect(postWebhook(app, memberEvent)).resolves.toMatchObject({
+      processed: true,
+    });
+    await expect(postWebhook(app, membershipEvent)).resolves.toMatchObject({
+      processed: true,
+    });
+    await expect(postWebhook(app, membershipEvent)).resolves.toMatchObject({
+      processed: false,
+    });
+
+    identity.sessions.set("session_a", {
+      memberId: "member_a",
+      organizationId: "organization_a",
+    });
+    const ownWorkspace = await app.request(
+      "/v1/organizations/organization_a/workspace",
+      { headers: { authorization: "Bearer session_a" } },
+    );
+    expect(ownWorkspace.status).toBe(200);
+    await expect(ownWorkspace.json()).resolves.toMatchObject({
+      memberId: "member_a",
+      organizationId: "organization_a",
+    });
+
+    const otherWorkspace = await app.request(
+      "/v1/organizations/organization_b/workspace",
+      { headers: { authorization: "Bearer session_a" } },
+    );
+    expect(otherWorkspace.status).toBe(403);
+    await expect(otherWorkspace.json()).resolves.toEqual({
+      error: {
+        code: "forbidden",
+        message: "Organization access is denied",
+      },
+    });
+
+    await expect(
+      postWebhook(app, {
+        id: "evt_membership_deleted",
+        sourceUpdatedAt: 4,
+        type: "membership.delete",
+        memberId: "member_a",
+        organizationId: "organization_a",
+      }),
+    ).resolves.toMatchObject({ processed: true });
+    await expect(
+      postWebhook(app, {
+        ...membershipEvent,
+        id: "evt_membership_delayed",
+        sourceUpdatedAt: 3,
+      }),
+    ).resolves.toMatchObject({ processed: true });
+
+    const removedWorkspace = await app.request(
+      "/v1/organizations/organization_a/workspace",
+      { headers: { authorization: "Bearer session_a" } },
+    );
+    expect(removedWorkspace.status).toBe(403);
+
+    identity.sessions.set("delete_first_session", {
+      memberId: "delete_first_member",
+      organizationId: "delete_first_organization",
+    });
+    const deleteFirstMembership: ClerkProjectionEvent = {
+      id: "evt_delete_first",
+      sourceUpdatedAt: 10,
+      type: "membership.delete",
+      memberId: "delete_first_member",
+      organizationId: "delete_first_organization",
+    };
+    await postWebhook(app, deleteFirstMembership);
+    await postWebhook(app, {
+      id: "evt_delayed_create",
+      sourceUpdatedAt: 9,
+      type: "membership.upsert",
+      member: {
+        clerkId: "delete_first_member",
+        email: null,
+        imageUrl: null,
+        name: "Removed Member",
+      },
+      membership: {
+        clerkId: "delete_first_membership",
+        memberId: "delete_first_member",
+        organizationId: "delete_first_organization",
+        role: "org:member",
+      },
+      organization: {
+        clerkId: "delete_first_organization",
+        name: "Removed Organization",
+        slug: "removed-organization",
+      },
+    });
+    const deleteFirstWorkspace = await app.request(
+      "/v1/organizations/delete_first_organization/workspace",
+      { headers: { authorization: "Bearer delete_first_session" } },
+    );
+    expect(deleteFirstWorkspace.status).toBe(403);
+  });
+
+  it("provisions one personal Organization and preserves invitation membership", async () => {
+    identity.sessions.set("new_session", {
+      memberId: "new_member",
+      organizationId: null,
+    });
+
+    const first = await app.request("/v1/workspace", {
+      method: "POST",
+      headers: { authorization: "Bearer new_session" },
+    });
+    const retry = await app.request("/v1/workspace", {
+      method: "POST",
+      headers: { authorization: "Bearer new_session" },
+    });
+    expect(first.status).toBe(200);
+    expect(retry.status).toBe(200);
+    await expect(first.json()).resolves.toMatchObject({
+      organizationId: "personal_new_member",
+    });
+    await expect(retry.json()).resolves.toMatchObject({
+      organizationId: "personal_new_member",
+    });
+    expect(identity.personalOrganizationsCreated).toBe(1);
+
+    identity.sessions.set("invited_session", {
+      memberId: "invited_member",
+      organizationId: "inviting_organization",
+    });
+    identity.organizations.set("invited_member", invitedProjection);
+    const invited = await app.request("/v1/workspace", {
+      method: "POST",
+      headers: { authorization: "Bearer invited_session" },
+    });
+    expect(invited.status).toBe(200);
+    await expect(invited.json()).resolves.toMatchObject({
+      organizationId: "inviting_organization",
+    });
+    expect(identity.personalOrganizationsCreated).toBe(1);
+  });
+
+  it("returns a structured unauthorized response", async () => {
+    const response = await app.request(
+      "/v1/organizations/organization_a/workspace",
+    );
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "unauthorized",
+        message: "Authentication is required",
+      },
+    });
+  });
+
+  it("verifies and translates signed Clerk webhooks", async () => {
+    const secret = `whsec_${Buffer.alloc(32, 7).toString("base64")}`;
+    const timestamp = new Date();
+    const payload = JSON.stringify({
+      data: {
+        email_addresses: [
+          { email_address: "signed@example.com", id: "email_signed" },
+        ],
+        first_name: "Signed",
+        id: "member_signed",
+        image_url: "https://example.com/member.png",
+        last_name: "Member",
+        primary_email_address_id: "email_signed",
+        updated_at: 42,
+      },
+      event_attributes: { http_request: { client_ip: "127.0.0.1", user_agent: "test" } },
+      object: "event",
+      type: "user.created",
+    });
+    const webhook = new Webhook(secret);
+    const eventId = "evt_signed";
+    const signature = webhook.sign(eventId, timestamp, payload);
+    const event = await clerkIdentityBoundary.verifyWebhook(
+      new Request("http://localhost/webhooks/clerk", {
+        method: "POST",
+        body: payload,
+        headers: {
+          "svix-id": eventId,
+          "svix-signature": signature,
+          "svix-timestamp": String(Math.floor(timestamp.getTime() / 1000)),
+          "webhook-id": eventId,
+          "webhook-signature": signature,
+          "webhook-timestamp": String(Math.floor(timestamp.getTime() / 1000)),
+        },
+      }),
+      {
+        CLERK_PUBLISHABLE_KEY: "pk_test_unused",
+        CLERK_SECRET_KEY: "sk_test_unused",
+        CLERK_WEBHOOK_SIGNING_SECRET: secret,
+        DATABASE_URL: "postgresql://unused",
+      },
+    );
+
+    expect(event).toEqual({
+      id: eventId,
+      sourceUpdatedAt: 42,
+      type: "member.upsert",
+      member: {
+        clerkId: "member_signed",
+        email: "signed@example.com",
+        imageUrl: "https://example.com/member.png",
+        name: "Signed Member",
+      },
+    });
+  });
 });
+
+const postWebhook = async (
+  app: ReturnType<typeof createApp>,
+  event: ClerkProjectionEvent,
+) => {
+  const response = await app.request("/webhooks/clerk", {
+    method: "POST",
+    body: JSON.stringify(event),
+  });
+  expect(response.status).toBe(200);
+  return response.json();
+};
+
+const invitedProjection: ProvisionedWorkspace = {
+  member: {
+    clerkId: "invited_member",
+    email: "invited@example.com",
+    imageUrl: null,
+    name: "Invited Member",
+  },
+  membership: {
+    clerkId: "invited_membership",
+    memberId: "invited_member",
+    organizationId: "inviting_organization",
+    role: "org:member",
+  },
+  organization: {
+    clerkId: "inviting_organization",
+    name: "Inviting Organization",
+    slug: "inviting-organization",
+  },
+};
+
+class FakeIdentity implements IdentityBoundary {
+  readonly sessions = new Map<string, SessionIdentity>();
+  readonly organizations = new Map<string, ProvisionedWorkspace>();
+  personalOrganizationsCreated = 0;
+
+  async authenticate(request: Request) {
+    const token = request.headers.get("authorization")?.replace("Bearer ", "");
+    return token === undefined ? null : (this.sessions.get(token) ?? null);
+  }
+
+  async verifyWebhook(request: Request) {
+    return (await request.json()) as ClerkProjectionEvent;
+  }
+
+  async provisionPersonalOrganization(memberId: string) {
+    const existing = this.organizations.get(memberId);
+    if (existing !== undefined) return existing;
+
+    this.personalOrganizationsCreated += 1;
+    const projection: ProvisionedWorkspace = {
+      member: {
+        clerkId: memberId,
+        email: `${memberId}@example.com`,
+        imageUrl: null,
+        name: "New Member",
+      },
+      membership: {
+        clerkId: `membership_${memberId}`,
+        memberId,
+        organizationId: `personal_${memberId}`,
+        role: "org:admin",
+      },
+      organization: {
+        clerkId: `personal_${memberId}`,
+        name: "Personal Organization",
+        slug: `personal-${memberId}`,
+      },
+    };
+    this.organizations.set(memberId, projection);
+    return projection;
+  }
+}

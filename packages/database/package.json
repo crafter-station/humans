@@ -5,7 +5,8 @@
   "private": true,
   "exports": {
     ".": "./src/service.ts",
-    "./neon": "./src/neon.ts"
+    "./neon": "./src/neon.ts",
+    "./schema": "./src/schema.ts"
   },
   "scripts": {
     "db:generate": "node ./scripts/generate-migrations.mjs",
