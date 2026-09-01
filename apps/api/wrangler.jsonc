@@ -1,0 +1,14 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "humans-api-local",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-31",
+  "env": {
+    "preview": {
+      "name": "humans-api-preview",
+    },
+    "production": {
+      "name": "humans-api-production",
+    },
+  },
+}
