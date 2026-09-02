@@ -1,0 +1,24 @@
+{
+  "name": "@humans/tasks",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev:trigger": "trigger dev",
+    "deploy:trigger": "trigger deploy",
+    "deploy:trigger:dry-run": "trigger deploy --dry-run",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
+    "check-types": "node ../../node_modules/@typescript/native/bin/tsc --noEmit"
+  },
+  "dependencies": {
+    "@trigger.dev/sdk": "4.5.15"
+  },
+  "devDependencies": {
+    "@repo/typescript-config": "*",
+    "@types/node": "26.3.0",
+    "@typescript/native": "npm:typescript@7.0.2",
+    "trigger.dev": "4.5.15",
+    "typescript": "6.0.2"
+  }
+}

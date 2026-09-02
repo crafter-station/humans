@@ -18,6 +18,9 @@ coverage
 # Turbo
 .turbo
 
+# Trigger.dev
+.trigger
+
 # Vercel
 .vercel
 
