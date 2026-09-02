@@ -338,14 +338,14 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
           database
             .select({ url: professionalLinks.url })
             .from(professionalLinks)
-            .where(eq(professionalLinks.profileId, memberId)),
+            .where(eq(professionalLinks.profileId, profile.profileId)),
           database
             .select({
               field: memberStatements.field,
               value: memberStatements.value,
             })
             .from(memberStatements)
-            .where(eq(memberStatements.profileId, memberId))
+            .where(eq(memberStatements.profileId, profile.profileId))
             .orderBy(desc(memberStatements.collectedAt)),
         ]);
 
@@ -426,7 +426,10 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
                   updatedAt: new Date(),
                 },
               })
-              .returning({ githubAccountId: profiles.githubAccountId });
+              .returning({
+                githubAccountId: profiles.githubAccountId,
+                profileId: profiles.profileId,
+              });
             if (storedProfile?.githubAccountId !== github.accountId) {
               throw new ProfileRejected({
                 reason: "github_identity_change_requires_review",
@@ -434,10 +437,10 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
             }
             await transaction
               .delete(professionalLinks)
-              .where(eq(professionalLinks.profileId, memberId));
+              .where(eq(professionalLinks.profileId, storedProfile.profileId));
             await transaction.insert(professionalLinks).values(
               input.professionalLinks.map((url) => ({
-                profileId: memberId,
+                profileId: storedProfile.profileId,
                 url,
               })),
             );
@@ -446,7 +449,7 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
               await transaction.insert(memberStatements).values(
                 statements.map(([field, value]) => ({
                   id: crypto.randomUUID(),
-                  profileId: memberId,
+                  profileId: storedProfile.profileId,
                   field,
                   value,
                   source: "member",
@@ -538,7 +541,7 @@ const profileResult = (
   links: Array<{ url: string }>,
   statements: Array<{ field: string; value: unknown }>,
 ): MemberProfile => ({
-  memberId: profile.memberId,
+  memberId: profile.memberId!,
   name: profile.name,
   currentCompany: profile.currentCompany,
   professionalLinks: links.map(({ url }) => url),

@@ -3,6 +3,8 @@
   "ui": "tui",
   "globalEnv": [
     "CLERK_SECRET_KEY",
+    "DATABASE_URL",
+    "HUMANS_ENV",
     "HUMANS_API_URL",
     "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY"
   ],
@@ -10,12 +12,7 @@
     "build": {
       "dependsOn": ["^build"],
       "inputs": ["$TURBO_DEFAULT$", ".env*"],
-      "outputs": [
-        ".next/**",
-        "!.next/cache/**",
-        "!.next/dev/**",
-        "dist/**"
-      ]
+      "outputs": [".next/**", "!.next/cache/**", "!.next/dev/**", "dist/**"]
     },
     "lint": {
       "dependsOn": ["^lint"]

@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   bigint,
   boolean,
@@ -7,6 +8,7 @@ import {
   real,
   text,
   timestamp,
+  unique,
 } from "drizzle-orm/pg-core";
 
 export const members = pgTable("members", {
@@ -69,8 +71,11 @@ export const clerkProjectionVersions = pgTable(
 );
 
 export const profiles = pgTable("profiles", {
-  memberId: text("member_id")
+  profileId: text("profile_id")
     .primaryKey()
+    .default(sql`gen_random_uuid()::text`),
+  memberId: text("member_id")
+    .unique()
     .references(() => members.clerkId),
   name: text("name").notNull(),
   currentCompany: text("current_company"),
@@ -85,12 +90,29 @@ export const profiles = pgTable("profiles", {
     .defaultNow(),
 });
 
+export const suppressionRecords = pgTable(
+  "suppression_records",
+  {
+    canonicalProvider: text("canonical_provider").notNull(),
+    canonicalProviderId: text("canonical_provider_id").notNull(),
+    reason: text("reason").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.canonicalProvider, table.canonicalProviderId],
+    }),
+  ],
+);
+
 export const professionalLinks = pgTable(
   "professional_links",
   {
     profileId: text("profile_id")
       .notNull()
-      .references(() => profiles.memberId),
+      .references(() => profiles.profileId),
     url: text("url").notNull(),
   },
   (table) => [primaryKey({ columns: [table.profileId, table.url] })],
@@ -100,7 +122,7 @@ export const memberStatements = pgTable("member_statements", {
   id: text("id").primaryKey(),
   profileId: text("profile_id")
     .notNull()
-    .references(() => profiles.memberId),
+    .references(() => profiles.profileId),
   field: text("field").notNull(),
   value: jsonb("value").notNull(),
   source: text("source").notNull(),
@@ -110,3 +132,31 @@ export const memberStatements = pgTable("member_statements", {
     .notNull()
     .defaultNow(),
 });
+
+export const profileObservations = pgTable(
+  "profile_observations",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    profileId: text("profile_id")
+      .notNull()
+      .references(() => profiles.profileId),
+    field: text("field").notNull(),
+    value: jsonb("value").notNull(),
+    source: text("source").notNull(),
+    sourceRecordId: text("source_record_id").notNull(),
+    pipelineVersion: text("pipeline_version").notNull(),
+    confidence: real("confidence").notNull(),
+    collectedAt: timestamp("collected_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique("profile_observations_source_record_field_unique").on(
+      table.source,
+      table.sourceRecordId,
+      table.field,
+    ),
+  ],
+);

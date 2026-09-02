@@ -83,6 +83,23 @@ Use separate Neon databases or branches for local, preview, and production.
 Configure Clerk to deliver Member, Organization, and Organization membership
 events to `/webhooks/clerk` in each environment.
 
+## Profile Imports
+
+Validate the fixed `humans-profiles-v1` CSV contract without writing:
+
+```sh
+bun run --cwd packages/database --env-file=../../apps/api/.dev.vars profiles:import -- \
+  --file fixtures/imported-profiles-v1.csv \
+  --contract humans-profiles-v1 \
+  --environment local
+```
+
+Add `--apply` to execute the reported plan. Every valid row commits independently,
+so rerunning the same command safely resumes an interrupted import. Invalid rows
+are reported and skipped. Production requires `HUMANS_ENV=production`,
+`--environment production`, `--apply`, and the command's interactive
+confirmation phrase.
+
 ## Verification
 
 ```sh

@@ -5,14 +5,17 @@
   "private": true,
   "exports": {
     ".": "./src/service.ts",
+    "./import-profiles": "./src/import-profiles.ts",
     "./neon": "./src/neon.ts",
     "./schema": "./src/schema.ts"
   },
   "scripts": {
     "db:generate": "node ./scripts/generate-migrations.mjs",
     "db:migrate": "drizzle-kit migrate",
+    "profiles:import": "bun ./src/import-profiles-cli.ts",
     "lint": "eslint . --max-warnings 0",
-    "check-types": "node ../../node_modules/@typescript/native/bin/tsc --noEmit"
+    "check-types": "node ../../node_modules/@typescript/native/bin/tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@neondatabase/serverless": "1.1.0",
@@ -22,10 +25,14 @@
   "devDependencies": {
     "@repo/eslint-config": "*",
     "@repo/typescript-config": "*",
+    "@testcontainers/postgresql": "12.1.0",
     "@types/node": "26.3.0",
+    "@types/pg": "8.23.1",
     "@typescript/native": "npm:typescript@7.0.2",
     "drizzle-kit": "0.31.10",
     "eslint": "10.9.1",
-    "typescript": "6.0.2"
+    "pg": "8.23.0",
+    "typescript": "6.0.2",
+    "vitest": "4.1.11"
   }
 }

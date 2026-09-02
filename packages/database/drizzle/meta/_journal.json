@@ -22,6 +22,13 @@
       "when": 1788306717602,
       "tag": "0002_initial",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1788312829734,
+      "tag": "0003_initial",
+      "breakpoints": true
     }
   ]
 }

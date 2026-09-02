@@ -1,0 +1,3 @@
+contract_version,source,source_record_id,name,current_company,github_account_id,github_login,qualifying_evidence,adult_confirmed,professional_links
+humans-profiles-v1,approved-partner,person-001,Ana Example,Example Labs,10001,ana-example,owned_repository,true,https://github.com/ana-example;https://www.linkedin.com/in/ana-example
+humans-profiles-v1,approved-partner,person-002,Bruno Example,,10002,bruno-example,public_contribution,true,https://github.com/bruno-example
