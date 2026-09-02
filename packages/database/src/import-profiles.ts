@@ -159,19 +159,19 @@ export const importProfiles = async (
   const plannedSourceKeys = new Set(existingSourceKeys);
   for (const row of parsed.valid) {
     const sourceKey = `${row.source}\0${row.sourceRecordId}`;
-    const willCreate = !plannedIdentities.has(row.githubAccountId);
-    const willObserve = !plannedSourceKeys.has(sourceKey);
+    const suppressed = suppressedIds.has(row.githubAccountId);
+    const willCreate =
+      !suppressed && !plannedIdentities.has(row.githubAccountId);
+    const willObserve = !suppressed && !plannedSourceKeys.has(sourceKey);
     if (willCreate) {
       plannedChanges.createProfiles += 1;
       plannedIdentities.add(row.githubAccountId);
-      if (suppressedIds.has(row.githubAccountId)) {
-        plannedChanges.suppressedProfiles += 1;
-      }
     }
     if (willObserve) {
       plannedChanges.addObservations += 1;
       plannedSourceKeys.add(sourceKey);
     }
+    if (suppressed) plannedChanges.suppressedProfiles += 1;
     if (!willCreate && !willObserve) plannedChanges.noops += 1;
     plannedRows.push({
       row: row.row,
@@ -204,7 +204,7 @@ export const importProfiles = async (
     const result = await applyRow(database, row);
     if (result.created) appliedChanges.createProfiles += 1;
     if (result.observed) appliedChanges.addObservations += 1;
-    if (result.created && !result.searchable) {
+    if (result.suppressed) {
       appliedChanges.suppressedProfiles += 1;
     }
     if (!result.created && !result.observed) appliedChanges.noops += 1;
@@ -258,6 +258,14 @@ const applyRow = (database: ImportDatabase, row: ImportRow) =>
         ),
       )
       .limit(1);
+    if (suppression !== undefined) {
+      return {
+        created: false,
+        observed: false,
+        searchable: false,
+        suppressed: true,
+      };
+    }
     const searchable = suppression === undefined;
     const [created] = await transaction
       .insert(profiles)
@@ -312,6 +320,7 @@ const applyRow = (database: ImportDatabase, row: ImportRow) =>
       created: created !== undefined,
       observed: observations.length > 0,
       searchable: profile.searchable,
+      suppressed: false,
     };
   });
 

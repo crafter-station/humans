@@ -107,6 +107,48 @@ export const suppressionRecords = pgTable(
   ],
 );
 
+export const profileClaims = pgTable(
+  "profile_claims",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    profileId: text("profile_id")
+      .notNull()
+      .references(() => profiles.profileId),
+    memberId: text("member_id")
+      .notNull()
+      .references(() => members.clerkId),
+    githubAccountId: text("github_account_id").notNull(),
+    status: text("status").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+  },
+  (table) => [
+    unique("profile_claims_profile_unique").on(table.profileId),
+    unique("profile_claims_member_unique").on(table.memberId),
+  ],
+);
+
+export const profileRequests = pgTable("profile_requests", {
+  id: text("id")
+    .primaryKey()
+    .default(sql`gen_random_uuid()::text`),
+  profileId: text("profile_id")
+    .notNull()
+    .references(() => profiles.profileId),
+  kind: text("kind").notNull(),
+  requesterEmail: text("requester_email").notNull(),
+  details: text("details").notNull(),
+  status: text("status").notNull().default("pending"),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+});
+
 export const professionalLinks = pgTable(
   "professional_links",
   {
