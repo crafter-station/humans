@@ -241,6 +241,60 @@
   padding: 1px;
   background: #405247;
 }
+:global(.naturalSearch) {
+  display: flex;
+  gap: 1px;
+  margin-bottom: 14px;
+  padding: 1px;
+  background: #405247;
+}
+:global(.naturalSearch label) {
+  display: grid;
+  flex: 1;
+  gap: 8px;
+  padding: 14px;
+  color: #9ba59d;
+  background: #213026;
+  font: 600 0.68rem/1 var(--font-geist-mono);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+:global(.naturalSearch input) {
+  color: #f4f1e6;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  font: 400 1rem/1.4 var(--font-geist-sans);
+}
+:global(.naturalSearch button) {
+  padding: 0 24px;
+  color: #17221b;
+  background: #ef7050;
+  border: 0;
+  cursor: pointer;
+}
+:global(.naturalSearch button:disabled) {
+  opacity: 0.65;
+}
+:global(.interpretationError) {
+  margin: -4px 0 14px;
+  color: #ff9d85;
+}
+:global(.interpretedFilters) {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 14px;
+  color: #b9c1b8;
+  font-size: 0.78rem;
+}
+:global(.interpretedFilters span:not(:last-child)) {
+  padding: 6px 9px;
+  color: #17221b;
+  background: #b8dc79;
+  border-radius: 999px;
+}
 :global(.searchFilters label) {
   display: grid;
   gap: 8px;

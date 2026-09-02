@@ -9,6 +9,7 @@ import {
   text,
   timestamp,
   unique,
+  integer,
 } from "drizzle-orm/pg-core";
 
 export const members = pgTable("members", {
@@ -31,6 +32,41 @@ export const organizations = pgTable("organizations", {
     .notNull()
     .defaultNow(),
 });
+
+export const creditAccounts = pgTable("credit_accounts", {
+  organizationId: text("organization_id")
+    .primaryKey()
+    .references(() => organizations.clerkId),
+  balance: integer("balance").notNull().default(0),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+export const creditLedgerEntries = pgTable(
+  "credit_ledger_entries",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.clerkId),
+    idempotencyKey: text("idempotency_key").notNull(),
+    kind: text("kind").notNull(),
+    amount: integer("amount").notNull(),
+    referenceId: text("reference_id"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique("credit_ledger_organization_idempotency_unique").on(
+      table.organizationId,
+      table.idempotencyKey,
+    ),
+  ],
+);
 
 export const organizationMemberships = pgTable(
   "organization_memberships",
@@ -142,6 +178,10 @@ export const profileRequests = pgTable("profile_requests", {
   kind: text("kind").notNull(),
   requesterEmail: text("requester_email").notNull(),
   details: text("details").notNull(),
+  previousSearchable: boolean("previous_searchable").notNull().default(false),
+  previousSearchabilityReason: text("previous_searchability_reason")
+    .notNull()
+    .default("approved_import"),
   status: text("status").notNull().default("pending"),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
