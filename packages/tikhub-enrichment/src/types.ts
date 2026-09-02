@@ -59,6 +59,8 @@ export type TikHubObservation = {
   pipelineVersion: typeof TIKHUB_PIPELINE_VERSION;
 };
 
+export type PublicTikHubObservation = Omit<TikHubObservation, "sourceIdentity">;
+
 export type TikHubStage = "fetch" | "normalization" | "persistence";
 export type TikHubRun = {
   id: string;
@@ -108,6 +110,7 @@ export interface TikHubStore {
     value: T,
     options?: { expiresAt?: string },
   ): Promise<void>;
+  /** Atomically persists an idempotent run result keyed by runId. */
   persistObservations(
     runId: string,
     observations: TikHubObservation[],

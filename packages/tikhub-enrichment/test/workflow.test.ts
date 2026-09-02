@@ -7,7 +7,9 @@ import {
   TikHubProviderError,
   createTikHubEnrichmentStages,
   createTikHubEnrichmentWorkflow,
+  parseTikHubProfile,
   retryOptionsForTikHubError,
+  toPublicTikHubObservation,
   type TikHubObservation,
   type TikHubRun,
   type TikHubStage,
@@ -110,6 +112,32 @@ describe("TikHub LinkedIn enrichment", () => {
       ).toISOString(),
     );
     expect(store.expirations.has("run-1:normalization")).toBe(false);
+    expect(parseTikHubProfile(fixture).contacts).toHaveLength(2);
+
+    const publicObservation = toPublicTikHubObservation(store.observations[0]!);
+    expect(publicObservation).toMatchObject({
+      sourceCategory: "professional-network",
+    });
+    expect(publicObservation).not.toHaveProperty("sourceIdentity");
+  });
+
+  it("retains the complete raw provider snapshot for bounded debugging", async () => {
+    const store = new MemoryStore();
+    const rawPayload = {
+      ...fixture,
+      providerMetadata: { requestId: "sanitized-request-id" },
+    };
+    await createTikHubEnrichmentStages({
+      provider: { getLinkedInProfile: vi.fn(async () => rawPayload) },
+      store,
+      now: fixedNow,
+    }).fetch(input);
+
+    expect(store.checkpoints.get("run-1:fetch")).toMatchObject({
+      value: {
+        providerMetadata: { requestId: "sanitized-request-id" },
+      },
+    });
   });
 
   it("rejects malformed provider payloads at the provider boundary", async () => {

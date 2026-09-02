@@ -6,6 +6,7 @@ import {
   type CareerEntry,
   type Collected,
   type ProviderContactCandidate,
+  type PublicTikHubObservation,
   type TikHubEnrichmentInput,
   type TikHubEvidence,
   type TikHubObservation,
@@ -54,10 +55,15 @@ const careerEntries = (value: unknown, field: string): CareerEntry[] => {
   });
 };
 
+const isSupportedContact = (contact: ProviderContactCandidate) =>
+  contact.category === "professional" &&
+  contact.verification === "provider-verified" &&
+  (contact.type === "email" || contact.direct === true);
+
 const contacts = (value: unknown): ProviderContactCandidate[] => {
   if (!Array.isArray(value))
     throw new InvalidTikHubPayloadError("Invalid contacts");
-  return value.map((item) => {
+  return value.flatMap((item) => {
     if (
       !isRecord(item) ||
       typeof item.sourceRecordId !== "string" ||
@@ -72,7 +78,8 @@ const contacts = (value: unknown): ProviderContactCandidate[] => {
       (item.direct !== undefined && typeof item.direct !== "boolean")
     )
       throw new InvalidTikHubPayloadError("Invalid contact entry");
-    return item as ProviderContactCandidate;
+    const contact = item as ProviderContactCandidate;
+    return isSupportedContact(contact) ? [contact] : [];
   });
 };
 
@@ -106,12 +113,7 @@ export const normalizeTikHubEvidence = (
   education: profile.education,
   skills: profile.skills,
   contactDetails: profile.contacts.flatMap((contact) => {
-    if (
-      contact.category !== "professional" ||
-      contact.verification !== "provider-verified"
-    )
-      return [];
-    if (contact.type === "phone" && contact.direct !== true) return [];
+    if (!isSupportedContact(contact)) return [];
     return [
       {
         sourceRecordId: contact.sourceRecordId,
@@ -124,6 +126,14 @@ export const normalizeTikHubEvidence = (
     ];
   }),
 });
+
+export const toPublicTikHubObservation = (
+  observation: TikHubObservation,
+): PublicTikHubObservation => {
+  const { sourceIdentity, ...publicObservation } = observation;
+  void sourceIdentity;
+  return publicObservation;
+};
 
 export const classifyTikHubError = (error: unknown) => {
   if (error instanceof InvalidTikHubPayloadError) return "fatal" as const;
@@ -224,16 +234,18 @@ export const createTikHubEnrichmentStages = (dependencies: {
     if (run.status === "succeeded") return run;
     try {
       let snapshot = await dependencies.store.loadCheckpoint<
-        Collected<TikHubProfile>
+        Collected<unknown>
       >(run.id, "fetch");
       if (!snapshot) {
-        const value = parseTikHubProfile(
-          await dependencies.provider.getLinkedInProfile(input.linkedInUrl),
+        const value = await dependencies.provider.getLinkedInProfile(
+          input.linkedInUrl,
         );
-        snapshot = { value, collectedAt: now().toISOString() };
-        await dependencies.store.saveCheckpoint(run.id, "fetch", snapshot, {
+        parseTikHubProfile(value);
+        const collected = { value, collectedAt: now().toISOString() };
+        snapshot = collected;
+        await dependencies.store.saveCheckpoint(run.id, "fetch", collected, {
           expiresAt: new Date(
-            new Date(snapshot.collectedAt).getTime() +
+            new Date(collected.collectedAt).getTime() +
               TIKHUB_SNAPSHOT_RETENTION_DAYS * 86_400_000,
           ).toISOString(),
         });
@@ -250,7 +262,7 @@ export const createTikHubEnrichmentStages = (dependencies: {
     if (run.status === "succeeded") return run;
     try {
       const snapshot = await dependencies.store.loadCheckpoint<
-        Collected<TikHubProfile>
+        Collected<unknown>
       >(run.id, "fetch");
       if (!snapshot)
         throw new InvalidTikHubPayloadError("Fetch stage must complete first");
@@ -259,7 +271,7 @@ export const createTikHubEnrichmentStages = (dependencies: {
       >(run.id, "normalization");
       if (!normalized) {
         normalized = {
-          value: normalizeTikHubEvidence(snapshot.value),
+          value: normalizeTikHubEvidence(parseTikHubProfile(snapshot.value)),
           collectedAt: snapshot.collectedAt,
         };
         await dependencies.store.saveCheckpoint(
