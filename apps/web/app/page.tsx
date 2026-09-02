@@ -11,10 +11,14 @@ export default function Home() {
         <div className={styles.actions}>
           <Show when="signed-out">
             <SignInButton>
-              <button className={styles.textButton}>Sign in</button>
+              <button className={styles.textButton} type="button">
+                Sign in
+              </button>
             </SignInButton>
             <SignUpButton>
-              <button className={styles.primaryButton}>Join Humans</button>
+              <button className={styles.primaryButton} type="button">
+                Join Humans
+              </button>
             </SignUpButton>
           </Show>
           <Show when="signed-in">
@@ -35,7 +39,9 @@ export default function Home() {
         </p>
         <Show when="signed-out">
           <SignUpButton>
-            <button className={styles.heroButton}>Create your workspace</button>
+            <button className={styles.heroButton} type="button">
+              Create your workspace
+            </button>
           </SignUpButton>
         </Show>
         <Show when="signed-in">

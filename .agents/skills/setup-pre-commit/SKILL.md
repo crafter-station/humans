@@ -1,6 +1,6 @@
 ---
 name: setup-pre-commit
-description: Set up Husky pre-commit hooks with lint-staged (Prettier), type checking, and tests in the current repo. Use when user wants to add pre-commit hooks, set up Husky, configure lint-staged, or add commit-time formatting/typechecking/testing.
+description: Set up Husky pre-commit hooks with lint-staged (Biome), type checking, and tests in the current repo. Use when user wants to add pre-commit hooks, set up Husky, configure lint-staged, or add commit-time formatting/typechecking/testing.
 ---
 
 # Setup Pre-Commit Hooks
@@ -8,8 +8,8 @@ description: Set up Husky pre-commit hooks with lint-staged (Prettier), type che
 ## What This Sets Up
 
 - **Husky** pre-commit hook
-- **lint-staged** running Prettier on all staged files
-- **Prettier** config (if missing)
+- **lint-staged** running Biome on all staged files
+- **Biome** config (if missing)
 - **typecheck** and **test** scripts in the pre-commit hook
 
 ## Steps
@@ -23,7 +23,7 @@ Check for `package-lock.json` (npm), `pnpm-lock.yaml` (pnpm), `yarn.lock` (yarn)
 Install as devDependencies:
 
 ```
-husky lint-staged prettier
+husky lint-staged @biomejs/biome
 ```
 
 ### 3. Initialize Husky
@@ -50,24 +50,16 @@ npm run test
 
 ```json
 {
-  "*": "prettier --ignore-unknown --write"
+  "*": "biome format --write --no-errors-on-unmatched"
 }
 ```
 
-### 6. Create `.prettierrc` (if missing)
+### 6. Create `biome.json` (if missing)
 
-Only create if no Prettier config exists. Use these defaults:
+Only create if no Biome config exists. Run:
 
-```json
-{
-  "useTabs": false,
-  "tabWidth": 2,
-  "printWidth": 80,
-  "singleQuote": false,
-  "trailingComma": "es5",
-  "semi": true,
-  "arrowParens": "always"
-}
+```bash
+npx biome init
 ```
 
 ### 7. Verify
@@ -75,17 +67,17 @@ Only create if no Prettier config exists. Use these defaults:
 - [ ] `.husky/pre-commit` exists and is executable
 - [ ] `.lintstagedrc` exists
 - [ ] `prepare` script in package.json is `"husky"`
-- [ ] `prettier` config exists
+- [ ] Biome config exists
 - [ ] Run `npx lint-staged` to verify it works
 
 ### 8. Commit
 
-Stage all changed/created files and commit with message: `Add pre-commit hooks (husky + lint-staged + prettier)`
+Stage all changed/created files and commit with message: `Add pre-commit hooks (husky + lint-staged + biome)`
 
 This will run through the new pre-commit hooks: a good smoke test that everything works.
 
 ## Notes
 
 - Husky v9+ doesn't need shebangs in hook files
-- `prettier --ignore-unknown` skips files Prettier can't parse (images, etc.)
+- Set `files.ignoreUnknown` in `biome.json` so unsupported staged files are skipped
 - The pre-commit runs lint-staged first (fast, staged-only), then full typecheck and tests

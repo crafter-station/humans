@@ -1,5 +1,7 @@
 import { auth } from "@clerk/nextjs/server";
 
+import { env } from "@/env";
+
 export async function POST(request: Request) {
   const session = await auth();
   const token = await session.getToken();
@@ -12,7 +14,7 @@ export async function POST(request: Request) {
     );
 
   const response = await fetch(
-    `${process.env.HUMANS_API_URL ?? "http://localhost:8787"}/v1/profiles/search/interpret`,
+    `${env.HUMANS_API_URL}/v1/profiles/search/interpret`,
     {
       method: "POST",
       headers: {

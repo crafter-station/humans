@@ -139,7 +139,11 @@ export function ProfileOnboarding() {
         <p className="eyebrow">Choose your path</p>
         <h1>What brings you to Humans?</h1>
         <div className="choiceGrid">
-          <button className="choice" onClick={() => setChoice("search")}>
+          <button
+            className="choice"
+            type="button"
+            onClick={() => setChoice("search")}
+          >
             <strong>Search Humans</strong>
             <span>
               Enter your protected workspace without becoming discoverable.
@@ -147,6 +151,7 @@ export function ProfileOnboarding() {
           </button>
           <button
             className="choice accent"
+            type="button"
             onClick={() => setChoice("profile")}
           >
             <strong>Appear in searches</strong>
@@ -164,7 +169,11 @@ export function ProfileOnboarding() {
   return (
     <section className="onboarding profileFlow">
       <p className="eyebrow">Profile onboarding</p>
-      <button className="profileLink" onClick={() => setChoice("search")}>
+      <button
+        className="profileLink"
+        type="button"
+        onClick={() => setChoice("search")}
+      >
         Search the directory
       </button>
       <h1>
@@ -175,7 +184,7 @@ export function ProfileOnboarding() {
       {profile?.searchable === true && (
         <div className="published">
           Searchable as @{profile.githubLogin}
-          <button onClick={disableSearchability}>
+          <button type="button" onClick={disableSearchability}>
             Stop appearing in searches
           </button>
         </div>
@@ -193,6 +202,7 @@ export function ProfileOnboarding() {
           {(["email", "phone"] as const).map((type) => (
             <button
               key={type}
+              type="button"
               onClick={() => void toggleContactSuppression(type)}
             >
               {contactSuppressions[type] ? "Allow" : "Suppress"} {type} reveals
@@ -253,10 +263,15 @@ export function ProfileOnboarding() {
           that I am at least 18 years old.
         </label>
         <div className="formActions">
-          <button name="searchable" value="false">
+          <button type="submit" name="searchable" value="false">
             Save private draft
           </button>
-          <button className="publish" name="searchable" value="true">
+          <button
+            className="publish"
+            type="submit"
+            name="searchable"
+            value="true"
+          >
             Submit and appear in searches
           </button>
         </div>

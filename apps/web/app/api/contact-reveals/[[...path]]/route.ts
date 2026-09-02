@@ -1,5 +1,7 @@
 import { auth } from "@clerk/nextjs/server";
 
+import { env } from "@/env";
+
 const proxy = async (
   request: Request,
   context: { params: Promise<{ path?: string[] }> },
@@ -14,16 +16,15 @@ const proxy = async (
       { status: 401 },
     );
   const { path = [] } = await context.params;
+  const idempotencyKey = request.headers.get("Idempotency-Key");
   const response = await fetch(
-    `${process.env.HUMANS_API_URL ?? "http://localhost:8787"}/v1/${path.map(encodeURIComponent).join("/")}`,
+    `${env.HUMANS_API_URL}/v1/${path.map(encodeURIComponent).join("/")}`,
     {
       method: request.method,
       headers: {
         authorization: `Bearer ${token}`,
         "content-type": "application/json",
-        ...(request.headers.get("Idempotency-Key")
-          ? { "Idempotency-Key": request.headers.get("Idempotency-Key")! }
-          : {}),
+        ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
       },
       body: request.method === "GET" ? undefined : await request.text(),
       cache: "no-store",

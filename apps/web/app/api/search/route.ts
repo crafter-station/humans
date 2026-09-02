@@ -1,5 +1,7 @@
 import { auth } from "@clerk/nextjs/server";
 
+import { env } from "@/env";
+
 export async function GET(request: Request) {
   const session = await auth();
   const token = await session.getToken();
@@ -14,7 +16,7 @@ export async function GET(request: Request) {
 
   const url = new URL(request.url);
   const response = await fetch(
-    `${process.env.HUMANS_API_URL ?? "http://localhost:8787"}/v1/profiles/search?${url.searchParams}`,
+    `${env.HUMANS_API_URL}/v1/profiles/search?${url.searchParams}`,
     { headers: { authorization: `Bearer ${token}` }, cache: "no-store" },
   );
   return new Response(response.body, {

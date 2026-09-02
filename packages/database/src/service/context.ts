@@ -1,8 +1,8 @@
 import { Context, type Effect } from "effect";
 
-import { runChargedProfileSearch } from "../charged-search";
-import {
-  type ContactDetailType,
+import type { runChargedProfileSearch } from "../charged-search";
+import type {
+  ContactDetailType,
   getOrganizationContactRevealPolicy,
   listContactDetails,
   purchaseContactReveal,
@@ -10,18 +10,18 @@ import {
   setContactDetailSuppression,
   setOrganizationContactRevealPolicy,
 } from "../contact-reveals";
-import {
+import type {
   getSearchableProfile,
   listProfileSearchFacets,
   searchProfiles,
-  type ProfileSearchFilters,
+  ProfileSearchFilters,
 } from "../search-profiles";
-import {
+import type {
   createSavedList,
   listSavedLists,
   renameSavedList,
 } from "../saved-lists";
-import {
+import type {
   ContactRevealRejected,
   DatabaseUnavailable,
   ProfileRejected,

@@ -5,18 +5,18 @@
     "build": "turbo run build",
     "dev": "turbo run dev",
     "dev:api": "turbo run dev --filter=@humans/api",
-    "dev:trigger": "bun run --cwd packages/tasks dev:trigger",
+    "dev:trigger": "bun run --cwd packages/tasks dev",
     "dev:web": "turbo run dev --filter=web",
     "deploy:trigger": "bun run --cwd packages/tasks deploy:trigger",
     "deploy:trigger:dry-run": "bun run --cwd packages/tasks deploy:trigger:dry-run",
-    "lint": "turbo run lint",
-    "format": "prettier --write \"**/*.{ts,tsx,md}\"",
+    "lint": "biome lint .",
+    "format": "biome format --write .",
     "check-types": "turbo run check-types",
     "test": "turbo run test"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.11",
     "@typescript/native": "npm:typescript@7.0.2",
-    "prettier": "3.9.6",
     "turbo": "^2.10.12",
     "typescript": "6.0.2"
   },

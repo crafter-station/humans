@@ -7,25 +7,26 @@
     "dev": "next dev --port 3000",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint --max-warnings 0",
-    "check-types": "next typegen && node ../../node_modules/@typescript/native/bin/tsc --noEmit"
+    "format": "biome format --write .",
+    "lint": "biome lint .",
+    "check-types": "SKIP_ENV_VALIDATION=1 next typegen && node ../../node_modules/@typescript/native/bin/tsc --noEmit"
   },
   "dependencies": {
     "@clerk/nextjs": "7.8.4",
     "@repo/ui": "*",
+    "@t3-oss/env-nextjs": "0.13.11",
     "next": "16.3.2",
     "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "react-dom": "19.2.8",
+    "zod": "4.5.4"
   },
   "devDependencies": {
-    "@repo/eslint-config": "*",
     "@repo/typescript-config": "*",
     "@typescript/native": "npm:typescript@7.0.2",
     "@tailwindcss/postcss": "^4.3.3",
     "@types/node": "26.3.0",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.5",
-    "eslint": "10.9.1",
     "tailwindcss": "^4.3.3",
     "typescript": "6.0.2"
   }

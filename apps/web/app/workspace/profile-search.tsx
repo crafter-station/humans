@@ -69,7 +69,9 @@ export function ProfileSearch({
       .then((data: { lists: SavedList[] }) => setLists(data.lists));
 
   useEffect(() => {
-    void refreshLists();
+    void fetch("/api/saved-lists", { cache: "no-store" })
+      .then((response) => response.json())
+      .then((data: { lists: SavedList[] }) => setLists(data.lists));
   }, []);
 
   useEffect(() => {
@@ -255,14 +257,18 @@ export function ProfileSearch({
           <p className="eyebrow">Protected directory</p>
           <h1>Find builders, not keywords.</h1>
         </div>
-        <button className="profileLink" onClick={onCreateProfile}>
+        <button className="profileLink" type="button" onClick={onCreateProfile}>
           Manage my Profile
         </button>
-        <button className="profileLink" onClick={createList}>
+        <button className="profileLink" type="button" onClick={createList}>
           New Saved List
         </button>
         {orgRole === "org:admin" && (
-          <button className="profileLink" onClick={toggleRevealPolicy}>
+          <button
+            className="profileLink"
+            type="button"
+            onClick={toggleRevealPolicy}
+          >
             {membersCanReveal
               ? "Restrict reveals to admins"
               : "Allow all Members to reveal"}
@@ -281,7 +287,7 @@ export function ProfileSearch({
             placeholder="Senior TypeScript engineers in Colombia"
           />
         </label>
-        <button disabled={interpreting}>
+        <button type="submit" disabled={interpreting}>
           {interpreting ? "Interpreting…" : "Interpret query"}
         </button>
       </form>
@@ -291,7 +297,7 @@ export function ProfileSearch({
         </p>
       )}
       {searchParams.get("interpreted") === "true" && (
-        <div className="interpretedFilters" aria-label="Inferred filters">
+        <div className="interpretedFilters">
           <strong>Inferred filters</strong>
           {[
             "q",
@@ -423,7 +429,9 @@ export function ProfileSearch({
                 onClick={() => updateParameters({ profile: result.profileId })}
               >
                 <td>
-                  <button className="rowName">{result.name}</button>
+                  <button className="rowName" type="button">
+                    {result.name}
+                  </button>
                 </td>
                 <td>{result.headline ?? "Not stated"}</td>
                 <td>{result.currentResidence ?? "Not stated"}</td>
@@ -449,6 +457,7 @@ export function ProfileSearch({
                 <td>
                   <button
                     className="saveButton"
+                    type="button"
                     onClick={(event) => {
                       event.stopPropagation();
                       void toggleSaved(result.profileId);
@@ -470,10 +479,13 @@ export function ProfileSearch({
       </div>
       <div className="pagination">
         {searchParams.has("cursor") && (
-          <button onClick={() => router.back()}>Previous page</button>
+          <button type="button" onClick={() => router.back()}>
+            Previous page
+          </button>
         )}
         {nextCursor !== null && (
           <button
+            type="button"
             onClick={() =>
               updateParameters({ cursor: nextCursor, profile: null }, true)
             }
@@ -486,15 +498,20 @@ export function ProfileSearch({
       {selectedProfileId !== null && (
         <div
           className="panelBackdrop"
-          onClick={() => updateParameters({ profile: null })}
+          role="dialog"
+          aria-label="Profile detail"
+          onClick={(event) => {
+            if (event.target === event.currentTarget)
+              updateParameters({ profile: null });
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") updateParameters({ profile: null });
+          }}
         >
-          <aside
-            className="profilePanel"
-            onClick={(event) => event.stopPropagation()}
-            aria-label="Profile detail"
-          >
+          <aside className="profilePanel">
             <button
               className="panelClose"
+              type="button"
               onClick={() => updateParameters({ profile: null })}
             >
               Close
@@ -631,6 +648,7 @@ function ProfilePanel({
       </p>
       <button
         className="saveButton"
+        type="button"
         onClick={() => void onToggle(profile.profileId)}
       >
         {entry === undefined ? "+ Save to list" : "Remove from list"}
@@ -722,6 +740,7 @@ function ProfilePanel({
               {detail.value ? (
                 <button
                   className="contactReport"
+                  type="button"
                   disabled={pendingContact === detail.observationId}
                   onClick={() => void reportInvalid(detail)}
                 >
@@ -732,6 +751,7 @@ function ProfilePanel({
               ) : (
                 <button
                   className="contactReveal"
+                  type="button"
                   disabled={pendingContact === detail.observationId}
                   onClick={() => void reveal(detail)}
                 >

@@ -1,7 +1,7 @@
 import { createRoute, OpenAPIHono, z } from "@hono/zod-openapi";
 import {
   Database,
-  makeDatabaseLayer,
+  type makeDatabaseLayer,
   type makeDatabaseService,
 } from "@humans/database";
 import { Scalar } from "@scalar/hono-api-reference";

@@ -21,6 +21,7 @@ bun install
 Start the Next.js web application at <http://localhost:3000>:
 
 ```sh
+cp apps/web/.env.example apps/web/.env.local
 bun run dev:web
 ```
 
@@ -109,5 +110,4 @@ bun run test
 bun run build
 ```
 
-Type checks run on TypeScript 7. Compiler-API tools such as typescript-eslint
-resolve TypeScript 6 until TypeScript 7 provides the required stable API.
+Type checks run on TypeScript 7.

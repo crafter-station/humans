@@ -1,5 +1,7 @@
 import { auth } from "@clerk/nextjs/server";
 
+import { env } from "@/env";
+
 const proxy = async (
   request: Request,
   context: { params: Promise<{ path?: string[] }> },
@@ -15,7 +17,7 @@ const proxy = async (
     );
   const { path = [] } = await context.params;
   const response = await fetch(
-    `${process.env.HUMANS_API_URL ?? "http://localhost:8787"}/v1/saved-lists/${path.map(encodeURIComponent).join("/")}`.replace(
+    `${env.HUMANS_API_URL}/v1/saved-lists/${path.map(encodeURIComponent).join("/")}`.replace(
       /\/$/,
       "",
     ),

@@ -100,10 +100,11 @@ class MemoryStore implements EnrichmentStore {
     if (this.persistedRunIds.has(runId)) return;
     this.persistedRunIds.add(runId);
     this.observations = observations;
-    this.immutableId = (
-      observations.find(({ kind }) => kind === "github-account")
-        ?.value as typeof user
-    ).id;
+    const account = observations.find(
+      ({ kind }) => kind === "github-account",
+    )?.value as typeof user | undefined;
+    if (account === undefined) throw new Error("GitHub account is required");
+    this.immutableId = account.id;
   }
   async markGitHubObservationsStale(_profileId: string, at: string) {
     this.observationsStaleAt = at;

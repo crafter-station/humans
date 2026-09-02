@@ -7,15 +7,14 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "lint": "eslint . --max-warnings 0",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
     "check-types": "node ../../node_modules/@typescript/native/bin/tsc --noEmit",
     "test": "vitest run"
   },
   "devDependencies": {
-    "@repo/eslint-config": "*",
     "@repo/typescript-config": "*",
     "@typescript/native": "npm:typescript@7.0.2",
-    "eslint": "10.9.1",
     "typescript": "6.0.2",
     "vitest": "4.1.11"
   },

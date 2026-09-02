@@ -1,5 +1,7 @@
 import { auth } from "@clerk/nextjs/server";
 
+import { env } from "@/env";
+
 export async function GET(
   _request: Request,
   { params }: { params: Promise<{ profileId: string }> },
@@ -16,7 +18,7 @@ export async function GET(
   }
   const { profileId } = await params;
   const response = await fetch(
-    `${process.env.HUMANS_API_URL ?? "http://localhost:8787"}/v1/profiles/${encodeURIComponent(profileId)}`,
+    `${env.HUMANS_API_URL}/v1/profiles/${encodeURIComponent(profileId)}`,
     { headers: { authorization: `Bearer ${token}` }, cache: "no-store" },
   );
   return new Response(response.body, {
