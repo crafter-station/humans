@@ -23,7 +23,8 @@ type Database =
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 export type ContactDetailType =
-  "professional-email" | "direct-professional-phone";
+  | "professional-email"
+  | "direct-professional-phone";
 
 export type VerifiedContactDetailInput = {
   profileId: string;
@@ -62,7 +63,7 @@ export class ContactRevealError extends Error {
   }
 }
 
-const prices: Record<ContactDetailType, 5 | 10> = {
+export const contactRevealPrices: Record<ContactDetailType, 5 | 10> = {
   "professional-email": 5,
   "direct-professional-phone": 10,
 };
@@ -276,7 +277,7 @@ export const listContactDetails = async (
         sourceCategory: sourceCategory(observation.source),
         collectedAt: observation.collectedAt.toISOString(),
         confidence: observation.confidence,
-        price: prices[detail.type],
+        price: contactRevealPrices[detail.type],
         previouslyPurchased: purchased,
       },
     ];
@@ -406,7 +407,7 @@ export const purchaseContactReveal = async (
         observationId: observation.id,
         type: input.type,
         purchasedBy: input.memberId,
-        price: prices[input.type],
+        price: contactRevealPrices[input.type],
         idempotencyKey: input.idempotencyKey,
       })
       .onConflictDoNothing()

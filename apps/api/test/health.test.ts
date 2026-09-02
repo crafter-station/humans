@@ -305,6 +305,20 @@ describe("Humans API", () => {
     expect(search.status).toBe(401);
     const detail = await app.request("/v1/profiles/any-profile");
     expect(detail.status).toBe(401);
+    const mcp = await app.request("/mcp", {
+      method: "POST",
+      headers: {
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/list",
+        params: {},
+      }),
+    });
+    expect(mcp.status).toBe(401);
   });
 
   it("lets only Organization admins create, list, and revoke scoped API keys", async () => {
@@ -748,6 +762,42 @@ describe("Humans API", () => {
       scopes: [],
     });
 
+    const mcpInitialization = await app.request("/mcp", {
+      method: "POST",
+      headers: {
+        accept: "application/json, text/event-stream",
+        authorization: "Bearer read_key",
+        "content-type": "application/json",
+        "mcp-protocol-version": "2025-06-18",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "Humans contract test", version: "1.0.0" },
+        },
+      }),
+    });
+    expect(mcpInitialization.status).toBe(200);
+    await expect(mcpInitialization.json()).resolves.toMatchObject({
+      result: { serverInfo: { name: "Humans", version: "1.0.0" } },
+    });
+
+    const mcpTools = await callMcpTool(app, "read_key", "tools/list", {});
+    expect(mcpTools.status).toBe(200);
+    expect(mcpTools.headers.get("cache-control")).toBe("private, no-store");
+    await expect(mcpTools.json()).resolves.toMatchObject({
+      result: {
+        tools: expect.arrayContaining([
+          expect.objectContaining({ name: "search_profiles" }),
+          expect.objectContaining({ name: "reveal_profile_email" }),
+        ]),
+      },
+    });
+
     const unscoped = await app.request("/v1/profiles?q=External", {
       headers: {
         authorization: "Bearer unscoped_key",
@@ -799,6 +849,23 @@ describe("Humans API", () => {
     });
     expect(replay.status).toBe(200);
     expect(await getCreditBalance(database, "external_organization")).toBe(19);
+    const mcpSearch = await callMcpTool(app, "read_key", "tools/call", {
+      name: "search_profiles",
+      arguments: {
+        filters: { query: "External" },
+        idempotencyKey: "mcp:external:search",
+      },
+    });
+    await expect(mcpSearch.json()).resolves.toMatchObject({
+      result: {
+        isError: false,
+        structuredContent: {
+          results: [{ profileId: "external_profile" }],
+          rateLimit: { limit: "60" },
+        },
+      },
+    });
+    expect(await getCreditBalance(database, "external_organization")).toBe(18);
     const conflict = await app.request("/v1/profiles?q=Profile", {
       headers: {
         authorization: "Bearer read_key",
@@ -817,12 +884,31 @@ describe("Humans API", () => {
       headers: { authorization: "Bearer read_key" },
     });
     expect(facets.status).toBe(200);
-    expect(await getCreditBalance(database, "external_organization")).toBe(19);
+    const mcpFacets = await callMcpTool(app, "read_key", "tools/call", {
+      name: "list_search_facets",
+      arguments: {},
+    });
+    await expect(mcpFacets.json()).resolves.toMatchObject({
+      result: { isError: false, structuredContent: { facets: {} } },
+    });
+    expect(await getCreditBalance(database, "external_organization")).toBe(18);
 
     const detail = await app.request("/v1/profiles/external_profile", {
       headers: { authorization: "Bearer read_key" },
     });
     expect(detail.status).toBe(200);
+    const mcpDetail = await callMcpTool(app, "read_key", "tools/call", {
+      name: "get_profile",
+      arguments: { profileId: "external_profile" },
+    });
+    await expect(mcpDetail.json()).resolves.toMatchObject({
+      result: {
+        isError: false,
+        structuredContent: {
+          profile: { profileId: "external_profile" },
+        },
+      },
+    });
     const missingDetail = await app.request("/v1/profiles/missing_profile", {
       headers: { authorization: "Bearer read_key" },
     });
@@ -890,7 +976,7 @@ describe("Humans API", () => {
     await expect(reveal.json()).resolves.toMatchObject({
       reveal: { value: "external@company.example", price: 5 },
     });
-    expect(await getCreditBalance(database, "external_organization")).toBe(14);
+    expect(await getCreditBalance(database, "external_organization")).toBe(13);
     const reopenedReveal = await app.request(
       "/v1/profiles/external_profile/reveal-email",
       {
@@ -903,6 +989,21 @@ describe("Humans API", () => {
     );
     await expect(reopenedReveal.json()).resolves.toMatchObject({
       reveal: { value: "external@company.example", price: 0 },
+    });
+    const mcpEmail = await callMcpTool(app, "reveal_key", "tools/call", {
+      name: "reveal_profile_email",
+      arguments: {
+        profileId: "external_profile",
+        idempotencyKey: "mcp:external:email",
+      },
+    });
+    await expect(mcpEmail.json()).resolves.toMatchObject({
+      result: {
+        isError: false,
+        structuredContent: {
+          reveal: { value: "external@company.example", price: 0 },
+        },
+      },
     });
     const phoneReveal = await app.request(
       "/v1/profiles/external_profile/reveal-phone",
@@ -917,6 +1018,21 @@ describe("Humans API", () => {
     expect(phoneReveal.status).toBe(200);
     await expect(phoneReveal.json()).resolves.toMatchObject({
       reveal: { value: "+57 300 555 0199", price: 10 },
+    });
+    const mcpPhone = await callMcpTool(app, "reveal_key", "tools/call", {
+      name: "reveal_profile_phone",
+      arguments: {
+        profileId: "external_profile",
+        idempotencyKey: "mcp:external:phone",
+      },
+    });
+    await expect(mcpPhone.json()).resolves.toMatchObject({
+      result: {
+        isError: false,
+        structuredContent: {
+          reveal: { value: "+57 300 555 0199", price: 0 },
+        },
+      },
     });
     await applyCreditEntry(database, {
       organizationId: "external_organization",
@@ -994,6 +1110,23 @@ const postWebhook = async (
   expect(response.status).toBe(200);
   return response.json();
 };
+
+const callMcpTool = (
+  app: ReturnType<typeof createApp>,
+  apiKey: string,
+  method: string,
+  params: Record<string, unknown>,
+) =>
+  app.request("/mcp", {
+    method: "POST",
+    headers: {
+      accept: "application/json, text/event-stream",
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+      "mcp-protocol-version": "2025-06-18",
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
 
 const invitedProjection: ProvisionedWorkspace = {
   member: {

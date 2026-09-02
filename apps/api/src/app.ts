@@ -24,6 +24,7 @@ import {
   NaturalSearchInterpreter,
   type NaturalSearchDecoder,
 } from "./natural-search";
+import { handleMcpRequest } from "./mcp";
 
 export type Bindings = {
   CLERK_PUBLISHABLE_KEY: string;
@@ -480,6 +481,38 @@ export const createApp = (
         503,
       );
     }
+  });
+
+  app.all("/mcp", async (context) => {
+    const authorization = context.req.header("Authorization");
+    if (authorization === undefined) return unauthorized(context);
+    const actor = await identity.authenticateApiKey(
+      context.req.raw,
+      context.env,
+    );
+    if (actor === null) return unauthorized(context);
+
+    const origin = new URL(context.req.url).origin;
+    const response = await handleMcpRequest(
+      context.req.raw,
+      async (path, init) => {
+        const headers = new Headers(init?.headers);
+        headers.set("Authorization", authorization);
+        return await app.request(
+          `${origin}${path}`,
+          { ...init, headers },
+          context.env,
+        );
+      },
+    );
+    const headers = new Headers(response.headers);
+    headers.set("Cache-Control", "private, no-store");
+    headers.set("X-Robots-Tag", "noindex, nofollow");
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
   });
 
   app.post("/v1/workspace", async (context) => {
