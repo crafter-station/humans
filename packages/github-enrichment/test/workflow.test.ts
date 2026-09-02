@@ -119,9 +119,14 @@ class MemoryStore implements EnrichmentStore {
 
 const makeProvider = (): GitHubProvider => ({
   getUser: vi.fn(async () => user),
-  getPinnedRepositories: vi.fn(async () => [
-    { ...repository(1), pinned: true },
-  ]),
+  getPinnedRepositories: vi.fn(async (_login, cursor) =>
+    cursor
+      ? { repositories: [{ ...repository(4), pinned: true }] }
+      : {
+          repositories: [{ ...repository(1), pinned: true }],
+          nextCursor: "pinned-page-2",
+        },
+  ),
   getRecentlyActiveRepositories: vi.fn(async (_login, cursor) =>
     cursor
       ? { repositories: [repository(3)] }
@@ -185,9 +190,10 @@ describe("GitHub enrichment workflow", () => {
     });
     expect(provider.getRecentlyActiveRepositories).toHaveBeenCalledTimes(2);
     expect(provider.getContributions).toHaveBeenCalledTimes(2);
+    expect(provider.getPinnedRepositories).toHaveBeenCalledTimes(2);
     expect(
       store.observations.filter(({ kind }) => kind === "github-repository"),
-    ).toHaveLength(3);
+    ).toHaveLength(4);
     expect(
       store.observations.find(
         ({ kind, value }) =>
@@ -218,11 +224,12 @@ describe("GitHub enrichment workflow", () => {
     const store = new MemoryStore();
     store.failPersistenceOnce = true;
     const provider = makeProvider();
+    let currentTime = fixedNow();
     const workflow = createGitHubEnrichmentWorkflow({
       provider,
       normalizer,
       store,
-      now: fixedNow,
+      now: () => currentTime,
     });
     const input = {
       profileId: "profile-1",
@@ -231,12 +238,19 @@ describe("GitHub enrichment workflow", () => {
     };
 
     await expect(workflow(input)).rejects.toThrow("database unavailable");
+    currentTime = new Date("2026-09-02T00:00:00.000Z");
     await expect(workflow(input)).resolves.toMatchObject({
       status: "succeeded",
+      finishedAt: "2026-09-02T00:00:00.000Z",
     });
     expect(provider.getUser).toHaveBeenCalledTimes(1);
-    expect(provider.getPinnedRepositories).toHaveBeenCalledTimes(1);
+    expect(provider.getPinnedRepositories).toHaveBeenCalledTimes(2);
     expect(normalizer.normalize).toHaveBeenCalledTimes(1);
+    expect(
+      store.observations.every(
+        ({ collectedAt }) => collectedAt === "2026-09-01T00:00:00.000Z",
+      ),
+    ).toBe(true);
   });
 
   it("rejects immutable identity changes and unsupported AI evidence", async () => {
@@ -342,6 +356,9 @@ describe("GitHub enrichment workflow", () => {
     ).toEqual({ skipRetrying: true });
     expect(
       retryOptionsForGitHubError(new GitHubProviderError("busy", 503)),
+    ).toBeUndefined();
+    expect(
+      retryOptionsForGitHubError(new Error("socket reset")),
     ).toBeUndefined();
     expect(
       retryOptionsForGitHubError(

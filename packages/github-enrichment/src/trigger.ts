@@ -2,9 +2,9 @@ import { idempotencyKeys, task } from "@trigger.dev/sdk";
 
 import {
   GITHUB_CONCURRENCY_LIMIT,
+  GitHubProviderError,
   type EnrichmentRun,
   type GitHubEnrichmentInput,
-  type GitHubProviderError,
   PermanentEnrichmentError,
 } from "./types.js";
 import { classifyGitHubError } from "./workflow.js";
@@ -18,6 +18,9 @@ const retry = {
 } as const;
 
 export const retryOptionsForGitHubError = (error: unknown) => {
+  if (error instanceof PermanentEnrichmentError)
+    return { skipRetrying: true } as const;
+  if (!(error instanceof GitHubProviderError)) return undefined;
   const classification = classifyGitHubError(error);
   if (classification === "rate-limit")
     return { retryAt: (error as GitHubProviderError).retryAfter };

@@ -45,6 +45,11 @@ export type GitHubEvidence = {
   contributions: Contribution[];
 };
 
+export type Collected<T> = {
+  value: T;
+  collectedAt: string;
+};
+
 export type NormalizedEvidence = {
   roles: string[];
   skills: string[];
@@ -103,7 +108,10 @@ export class PermanentEnrichmentError extends Error {
 
 export interface GitHubProvider {
   getUser(login: string): Promise<GitHubUser>;
-  getPinnedRepositories(login: string): Promise<Repository[]>;
+  getPinnedRepositories(
+    login: string,
+    cursor?: string,
+  ): Promise<{ repositories: Repository[]; nextCursor?: string }>;
   getRecentlyActiveRepositories(
     login: string,
     cursor?: string,

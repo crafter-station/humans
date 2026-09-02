@@ -4,6 +4,7 @@ import {
   PIPELINE_VERSION,
   PROVIDER_SNAPSHOT_RETENTION_DAYS,
   PermanentEnrichmentError,
+  type Collected,
   type EnrichmentRun,
   type EnrichmentStore,
   type EvidenceNormalizer,
@@ -43,34 +44,38 @@ const pageAll = async <T>(
 const observationsFor = (
   runId: string,
   profileId: string,
-  evidence: GitHubEvidence,
-  normalized: NormalizedEvidence,
-  collectedAt: string,
+  account: Collected<GitHubUser>,
+  repositories: Collected<{
+    repositories: Repository[];
+    contributions: GitHubEvidence["contributions"];
+  }>,
+  normalization: Collected<NormalizedEvidence>,
 ): Observation[] => {
-  const base = {
-    profileId,
-    collectedAt,
-    pipelineVersion: PIPELINE_VERSION,
-  } as const;
+  const base = (collectedAt: string) =>
+    ({
+      profileId,
+      collectedAt,
+      pipelineVersion: PIPELINE_VERSION,
+    }) as const;
   return [
     {
-      ...base,
-      sourceRecordId: `${runId}:account:${evidence.user.id}`,
+      ...base(account.collectedAt),
+      sourceRecordId: `${runId}:account:${account.value.id}`,
       kind: "github-account",
       source: "github",
       confidence: 1,
-      value: evidence.user,
+      value: account.value,
     },
-    ...evidence.repositories.map((value) => ({
-      ...base,
+    ...repositories.value.repositories.map((value) => ({
+      ...base(repositories.collectedAt),
       sourceRecordId: `${runId}:repository:${value.id}`,
       kind: "github-repository" as const,
       source: "github" as const,
       confidence: 1,
       value,
     })),
-    ...evidence.contributions.map((value) => ({
-      ...base,
+    ...repositories.value.contributions.map((value) => ({
+      ...base(repositories.collectedAt),
       sourceRecordId: `${runId}:contribution:${value.repositoryId}:${value.kind}:${value.occurredAt}`,
       kind: "github-contribution" as const,
       source: "github" as const,
@@ -78,12 +83,12 @@ const observationsFor = (
       value,
     })),
     {
-      ...base,
+      ...base(normalization.collectedAt),
       sourceRecordId: `${runId}:normalization`,
       kind: "github-normalization",
       source: "github-ai-normalization",
       confidence: 0.8,
-      value: normalized,
+      value: normalization.value,
     },
   ];
 };
@@ -172,14 +177,13 @@ export const createGitHubEnrichmentStages = (
   const account = async (input: GitHubEnrichmentInput) => {
     let run = await getRun(input, "account");
     try {
-      let user = await dependencies.store.loadCheckpoint<GitHubUser>(
-        run.id,
-        "account",
-      );
+      let accountEvidence = await dependencies.store.loadCheckpoint<
+        Collected<GitHubUser>
+      >(run.id, "account");
       let fetched = false;
-      if (!user) {
+      if (!accountEvidence) {
         fetched = true;
-        user = await dependencies.provider.getUser(input.githubLogin);
+        const user = await dependencies.provider.getUser(input.githubLogin);
         const immutableId = await dependencies.store.getImmutableGitHubUserId(
           input.profileId,
         );
@@ -187,12 +191,18 @@ export const createGitHubEnrichmentStages = (
           throw new PermanentEnrichmentError(
             "GitHub login resolves to a different immutable user ID",
           );
+        accountEvidence = { value: user, collectedAt: now().toISOString() };
       }
       await dependencies.store.clearGitHubInaccessible(input.profileId);
       if (fetched)
-        await dependencies.store.saveCheckpoint(run.id, "account", user, {
-          expiresAt: snapshotExpiresAt(now()),
-        });
+        await dependencies.store.saveCheckpoint(
+          run.id,
+          "account",
+          accountEvidence,
+          {
+            expiresAt: snapshotExpiresAt(new Date(accountEvidence.collectedAt)),
+          },
+        );
       run = complete(run, "account");
       await dependencies.store.saveRun(run);
       return run;
@@ -204,22 +214,30 @@ export const createGitHubEnrichmentStages = (
   const repositories = async (input: GitHubEnrichmentInput) => {
     let run = await getRun(input, "repositories");
     try {
-      const user = await dependencies.store.loadCheckpoint<GitHubUser>(
-        run.id,
-        "account",
-      );
-      if (!user)
+      const accountEvidence = await dependencies.store.loadCheckpoint<
+        Collected<GitHubUser>
+      >(run.id, "account");
+      if (!accountEvidence)
         throw new PermanentEnrichmentError("Account stage must complete first");
-      let repositoryEvidence = await dependencies.store.loadCheckpoint<{
-        repositories: Repository[];
-        contributions: GitHubEvidence["contributions"];
-      }>(run.id, "repositories");
+      const user = accountEvidence.value;
+      let repositoryEvidence = await dependencies.store.loadCheckpoint<
+        Collected<{
+          repositories: Repository[];
+          contributions: GitHubEvidence["contributions"];
+        }>
+      >(run.id, "repositories");
       if (!repositoryEvidence) {
         const since = new Date(
           now().getTime() - 365 * 24 * 60 * 60 * 1000,
         ).toISOString();
         const [pinned, recent, contributions] = await Promise.all([
-          dependencies.provider.getPinnedRepositories(user.login),
+          pageAll(async (cursor) => {
+            const page = await dependencies.provider.getPinnedRepositories(
+              user.login,
+              cursor,
+            );
+            return { items: page.repositories, nextCursor: page.nextCursor };
+          }),
           pageAll(async (cursor) => {
             const page =
               await dependencies.provider.getRecentlyActiveRepositories(
@@ -248,14 +266,21 @@ export const createGitHubEnrichmentStages = (
           });
         }
         repositoryEvidence = {
-          repositories: [...byId.values()],
-          contributions,
+          value: {
+            repositories: [...byId.values()],
+            contributions,
+          },
+          collectedAt: now().toISOString(),
         };
         await dependencies.store.saveCheckpoint(
           run.id,
           "repositories",
           repositoryEvidence,
-          { expiresAt: snapshotExpiresAt(now()) },
+          {
+            expiresAt: snapshotExpiresAt(
+              new Date(repositoryEvidence.collectedAt),
+            ),
+          },
         );
       }
       run = complete(run, "repositories");
@@ -269,33 +294,34 @@ export const createGitHubEnrichmentStages = (
   const normalization = async (input: GitHubEnrichmentInput) => {
     let run = await getRun(input, "normalization");
     try {
-      const user = await dependencies.store.loadCheckpoint<GitHubUser>(
-        run.id,
-        "account",
-      );
-      const repositoryEvidence = await dependencies.store.loadCheckpoint<{
-        repositories: Repository[];
-        contributions: GitHubEvidence["contributions"];
-      }>(run.id, "repositories");
-      if (!user || !repositoryEvidence)
+      const accountEvidence = await dependencies.store.loadCheckpoint<
+        Collected<GitHubUser>
+      >(run.id, "account");
+      const repositoryEvidence = await dependencies.store.loadCheckpoint<
+        Collected<{
+          repositories: Repository[];
+          contributions: GitHubEvidence["contributions"];
+        }>
+      >(run.id, "repositories");
+      if (!accountEvidence || !repositoryEvidence)
         throw new PermanentEnrichmentError(
           "Repository stage must complete first",
         );
-      let normalized =
-        await dependencies.store.loadCheckpoint<NormalizedEvidence>(
-          run.id,
-          "normalization",
-        );
+      let normalized = await dependencies.store.loadCheckpoint<
+        Collected<NormalizedEvidence>
+      >(run.id, "normalization");
       if (!normalized) {
-        const evidence: GitHubEvidence = { user, ...repositoryEvidence };
-        normalized = await dependencies.normalizer.normalize(evidence);
+        const evidence: GitHubEvidence = {
+          user: accountEvidence.value,
+          ...repositoryEvidence.value,
+        };
+        const value = await dependencies.normalizer.normalize(evidence);
         const supportedIds = new Set(evidence.repositories.map(({ id }) => id));
-        if (
-          normalized.evidenceRepositoryIds.some((id) => !supportedIds.has(id))
-        )
+        if (value.evidenceRepositoryIds.some((id) => !supportedIds.has(id)))
           throw new PermanentEnrichmentError(
             "AI normalization cited unsupported repository evidence",
           );
+        normalized = { value, collectedAt: now().toISOString() };
         await dependencies.store.saveCheckpoint(
           run.id,
           "normalization",
@@ -318,20 +344,19 @@ export const createGitHubEnrichmentStages = (
         "persistence",
       );
       if (!persisted) {
-        const user = await dependencies.store.loadCheckpoint<GitHubUser>(
-          run.id,
-          "account",
-        );
-        const repositoryEvidence = await dependencies.store.loadCheckpoint<{
-          repositories: Repository[];
-          contributions: GitHubEvidence["contributions"];
-        }>(run.id, "repositories");
-        const normalized =
-          await dependencies.store.loadCheckpoint<NormalizedEvidence>(
-            run.id,
-            "normalization",
-          );
-        if (!user || !repositoryEvidence || !normalized)
+        const accountEvidence = await dependencies.store.loadCheckpoint<
+          Collected<GitHubUser>
+        >(run.id, "account");
+        const repositoryEvidence = await dependencies.store.loadCheckpoint<
+          Collected<{
+            repositories: Repository[];
+            contributions: GitHubEvidence["contributions"];
+          }>
+        >(run.id, "repositories");
+        const normalized = await dependencies.store.loadCheckpoint<
+          Collected<NormalizedEvidence>
+        >(run.id, "normalization");
+        if (!accountEvidence || !repositoryEvidence || !normalized)
           throw new PermanentEnrichmentError(
             "Normalization stage must complete first",
           );
@@ -340,9 +365,9 @@ export const createGitHubEnrichmentStages = (
           observationsFor(
             run.id,
             input.profileId,
-            { user, ...repositoryEvidence },
+            accountEvidence,
+            repositoryEvidence,
             normalized,
-            now().toISOString(),
           ),
         );
         await dependencies.store.saveCheckpoint(run.id, "persistence", true);
