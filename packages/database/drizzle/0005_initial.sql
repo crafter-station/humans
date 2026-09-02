@@ -1,0 +1,2 @@
+ALTER TABLE "profile_requests" ADD COLUMN "previous_searchable" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+ALTER TABLE "profile_requests" ADD COLUMN "previous_searchability_reason" text DEFAULT 'approved_import' NOT NULL;
