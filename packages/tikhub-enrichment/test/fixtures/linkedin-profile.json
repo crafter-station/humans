@@ -1,0 +1,69 @@
+{
+  "sourceRecordId": "linkedin:ada-lovelace",
+  "headline": "Staff Software Engineer",
+  "currentCompany": "Analytical Engines",
+  "experience": [
+    {
+      "sourceRecordId": "experience:1",
+      "organization": "Analytical Engines",
+      "title": "Staff Software Engineer",
+      "startedAt": "2022-01"
+    }
+  ],
+  "education": [
+    {
+      "sourceRecordId": "education:1",
+      "organization": "Universidad Nacional",
+      "field": "Computer Science",
+      "endedAt": "2021"
+    }
+  ],
+  "skills": ["TypeScript", "Distributed Systems"],
+  "contacts": [
+    {
+      "sourceRecordId": "contact:work",
+      "type": "email",
+      "value": "ada@analytical.example",
+      "category": "professional",
+      "verification": "provider-verified"
+    },
+    {
+      "sourceRecordId": "contact:personal",
+      "type": "email",
+      "value": "ada@example.net",
+      "category": "personal",
+      "verification": "provider-verified"
+    },
+    {
+      "sourceRecordId": "contact:inferred",
+      "type": "email",
+      "value": "a.lovelace@analytical.example",
+      "category": "professional",
+      "verification": "inferred"
+    },
+    {
+      "sourceRecordId": "contact:direct",
+      "type": "phone",
+      "value": "+51 999 555 111",
+      "category": "professional",
+      "verification": "provider-verified",
+      "direct": true
+    },
+    {
+      "sourceRecordId": "contact:switchboard",
+      "type": "phone",
+      "value": "+51 1 555 1000",
+      "category": "professional",
+      "verification": "provider-verified",
+      "direct": false
+    },
+    {
+      "sourceRecordId": "contact:unverified",
+      "type": "phone",
+      "value": "+51 999 555 222",
+      "category": "professional",
+      "verification": "unverified",
+      "direct": true
+    }
+  ]
+}
