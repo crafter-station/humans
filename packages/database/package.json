@@ -10,6 +10,7 @@
     "./credits": "./src/credits.ts",
     "./neon": "./src/neon.ts",
     "./search-profiles": "./src/search-profiles.ts",
+    "./saved-lists": "./src/saved-lists.ts",
     "./schema": "./src/schema.ts"
   },
   "scripts": {
