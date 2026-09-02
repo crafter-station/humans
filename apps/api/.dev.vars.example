@@ -2,9 +2,16 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/humans
 CLERK_PUBLISHABLE_KEY=pk_test_replace_me
 CLERK_SECRET_KEY=sk_test_replace_me
 CLERK_WEBHOOK_SIGNING_SECRET=whsec_replace_me
+# Must match an enabled Clerk Dashboard Rules > Bot sign-up protection setting.
+CLERK_BOT_PROTECTION_ENABLED=true
 
 # Optional. Enables natural-language search.
 # OPENAI_API_KEY=sk-replace_me
 
 # Optional. Falls back to CLERK_SECRET_KEY when omitted.
 # SEARCH_CURSOR_SECRET=replace-with-a-dedicated-random-secret
+
+# Optional locally; required with a deployed web proxy to preserve client IP isolation.
+WEB_PROXY_SECRET=replace-with-the-web-shared-random-secret
+# OPERATOR_SECRET=replace-with-a-dedicated-operator-secret
+# POLAR_WEBHOOK_SECRET=replace-with-the-polar-webhook-secret

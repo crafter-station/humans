@@ -1,4 +1,15 @@
-import { and, desc, eq, inArray, isNull, notExists, sql } from "drizzle-orm";
+import {
+  and,
+  count,
+  desc,
+  eq,
+  gte,
+  inArray,
+  isNull,
+  notExists,
+  or,
+  sql,
+} from "drizzle-orm";
 import type { NeonDatabase } from "drizzle-orm/neon-serverless";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
@@ -9,11 +20,15 @@ import {
   contactReveals,
   creditAccounts,
   creditLedgerEntries,
+  members,
+  organizationEntitlements,
   organizationMemberships,
   organizations,
   profileObservations,
+  principalSuspensions,
   profiles,
   reenrichmentOutbox,
+  securityAuditEvents,
   suppressionRecords,
 } from "./schema";
 
@@ -57,7 +72,9 @@ export class ContactRevealError extends Error {
       | "not_found"
       | "insufficient_credits"
       | "idempotency_conflict"
-      | "invalid_contact_detail",
+      | "invalid_contact_detail"
+      | "daily_limit"
+      | "credits_unavailable",
   ) {
     super(code);
   }
@@ -173,12 +190,34 @@ const requireMembership = async (
       organizations,
       eq(organizations.clerkId, organizationMemberships.organizationId),
     )
+    .innerJoin(members, eq(members.clerkId, organizationMemberships.memberId))
     .where(
       and(
         eq(organizationMemberships.memberId, memberId),
         eq(organizationMemberships.organizationId, organizationId),
         eq(organizationMemberships.active, true),
+        eq(members.active, true),
         eq(organizations.active, true),
+        notExists(
+          database
+            .select({ id: principalSuspensions.id })
+            .from(principalSuspensions)
+            .where(
+              and(
+                isNull(principalSuspensions.revokedAt),
+                or(
+                  and(
+                    eq(principalSuspensions.principalType, "member"),
+                    eq(principalSuspensions.principalId, memberId),
+                  ),
+                  and(
+                    eq(principalSuspensions.principalType, "organization"),
+                    eq(principalSuspensions.principalId, organizationId),
+                  ),
+                ),
+              ),
+            ),
+        ),
       ),
     )
     .limit(1);
@@ -293,41 +332,106 @@ export const purchaseContactReveal = async (
     type: ContactDetailType;
     idempotencyKey: string;
     observationId?: string;
+    apiKeyId?: string;
+    source?: "web" | "api" | "mcp";
+    correlationId?: string;
   },
 ) => {
-  const reserved = await database.transaction(async (tx) => {
-    await tx.execute(
-      sql`select pg_advisory_xact_lock(hashtext(${input.profileId}))`,
-    );
-    await requireRevealPermission(tx, input.memberId, input.organizationId);
-    const [suppression] = await tx
-      .select({ type: contactDetailSuppressions.type })
-      .from(contactDetailSuppressions)
-      .where(
-        and(
-          eq(contactDetailSuppressions.profileId, input.profileId),
-          eq(contactDetailSuppressions.type, input.type),
-        ),
-      )
-      .limit(1);
-    if (suppression) throw new ContactRevealError("not_found");
+  const [audit] = await database
+    .insert(securityAuditEvents)
+    .values({
+      eventType: "contact_reveal",
+      actorMemberId: input.memberId,
+      organizationId: input.organizationId,
+      apiKeyId: input.apiKeyId,
+      profileId: input.profileId,
+      source: input.source ?? "web",
+      correlationId: input.correlationId ?? input.idempotencyKey,
+      result: "attempted",
+    })
+    .returning({ id: securityAuditEvents.id });
+  if (!audit) throw new Error("security_audit_insert_failed");
+  try {
+    const reserved = await database.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtext(${input.profileId}))`,
+      );
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtext(${input.organizationId}))`,
+      );
+      await requireRevealPermission(tx, input.memberId, input.organizationId);
+      const [suppression] = await tx
+        .select({ type: contactDetailSuppressions.type })
+        .from(contactDetailSuppressions)
+        .where(
+          and(
+            eq(contactDetailSuppressions.profileId, input.profileId),
+            eq(contactDetailSuppressions.type, input.type),
+          ),
+        )
+        .limit(1);
+      if (suppression) throw new ContactRevealError("not_found");
 
-    const [replay] = await tx
-      .select()
-      .from(contactRevealRequests)
-      .where(
-        and(
-          eq(contactRevealRequests.organizationId, input.organizationId),
-          eq(contactRevealRequests.idempotencyKey, input.idempotencyKey),
-        ),
-      )
-      .limit(1);
-    if (replay) {
-      if (replay.profileId !== input.profileId || replay.type !== input.type)
-        throw new ContactRevealError("idempotency_conflict");
-      if (replay.status === "released" || replay.status === "refunded")
-        throw new ContactRevealError("invalid_contact_detail");
-      const [original] = await tx
+      const [replay] = await tx
+        .select()
+        .from(contactRevealRequests)
+        .where(
+          and(
+            eq(contactRevealRequests.organizationId, input.organizationId),
+            eq(contactRevealRequests.idempotencyKey, input.idempotencyKey),
+          ),
+        )
+        .limit(1);
+      if (replay) {
+        if (replay.profileId !== input.profileId || replay.type !== input.type)
+          throw new ContactRevealError("idempotency_conflict");
+        if (replay.status === "released" || replay.status === "refunded")
+          throw new ContactRevealError("invalid_contact_detail");
+        const [original] = await tx
+          .select({ observation: profileObservations })
+          .from(profileObservations)
+          .innerJoin(
+            profiles,
+            eq(profiles.profileId, profileObservations.profileId),
+          )
+          .leftJoin(
+            contactDetailInvalidations,
+            eq(
+              contactDetailInvalidations.observationId,
+              profileObservations.id,
+            ),
+          )
+          .where(
+            and(
+              eq(profileObservations.id, replay.observationId),
+              eq(profileObservations.profileId, input.profileId),
+              eq(profileObservations.source, "tikhub"),
+              eq(profiles.searchable, true),
+              profileIsNotSuppressed(tx),
+              isNull(contactDetailInvalidations.observationId),
+            ),
+          )
+          .limit(1);
+        const originalDetail =
+          original && parseContactDetail(original.observation.value);
+        if (!original || !originalDetail || originalDetail.type !== input.type)
+          throw new ContactRevealError("invalid_contact_detail");
+        return {
+          detail: originalDetail,
+          observation: original.observation,
+          reveal: (
+            await tx
+              .select()
+              .from(contactReveals)
+              .where(eq(contactReveals.id, replay.revealId))
+              .limit(1)
+          )[0]!,
+          newlyReserved: false,
+          operationIdempotencyKey: replay.idempotencyKey,
+        };
+      }
+
+      const observations = await tx
         .select({ observation: profileObservations })
         .from(profileObservations)
         .innerJoin(
@@ -340,230 +444,263 @@ export const purchaseContactReveal = async (
         )
         .where(
           and(
-            eq(profileObservations.id, replay.observationId),
             eq(profileObservations.profileId, input.profileId),
+            eq(profileObservations.field, "contact-detail"),
             eq(profileObservations.source, "tikhub"),
             eq(profiles.searchable, true),
             profileIsNotSuppressed(tx),
             isNull(contactDetailInvalidations.observationId),
           ),
         )
-        .limit(1);
-      const originalDetail =
-        original && parseContactDetail(original.observation.value);
-      if (!original || !originalDetail || originalDetail.type !== input.type)
-        throw new ContactRevealError("invalid_contact_detail");
-      return {
-        detail: originalDetail,
-        observation: original.observation,
-        reveal: (
-          await tx
-            .select()
-            .from(contactReveals)
-            .where(eq(contactReveals.id, replay.revealId))
-            .limit(1)
-        )[0]!,
-        newlyReserved: false,
-        operationIdempotencyKey: replay.idempotencyKey,
-      };
-    }
+        .orderBy(desc(profileObservations.collectedAt));
+      const observation = observations.find(
+        ({ observation }) =>
+          (input.observationId === undefined ||
+            observation.id === input.observationId) &&
+          parseContactDetail(observation.value)?.type === input.type,
+      )?.observation;
+      const detail = observation && parseContactDetail(observation.value);
+      if (!observation || !detail) throw new ContactRevealError("not_found");
 
-    const observations = await tx
-      .select({ observation: profileObservations })
-      .from(profileObservations)
-      .innerJoin(
-        profiles,
-        eq(profiles.profileId, profileObservations.profileId),
-      )
-      .leftJoin(
-        contactDetailInvalidations,
-        eq(contactDetailInvalidations.observationId, profileObservations.id),
-      )
-      .where(
-        and(
-          eq(profileObservations.profileId, input.profileId),
-          eq(profileObservations.field, "contact-detail"),
-          eq(profileObservations.source, "tikhub"),
-          eq(profiles.searchable, true),
-          profileIsNotSuppressed(tx),
-          isNull(contactDetailInvalidations.observationId),
-        ),
-      )
-      .orderBy(desc(profileObservations.collectedAt));
-    const observation = observations.find(
-      ({ observation }) =>
-        (input.observationId === undefined ||
-          observation.id === input.observationId) &&
-        parseContactDetail(observation.value)?.type === input.type,
-    )?.observation;
-    const detail = observation && parseContactDetail(observation.value);
-    if (!observation || !detail) throw new ContactRevealError("not_found");
-
-    const [inserted] = await tx
-      .insert(contactReveals)
-      .values({
-        organizationId: input.organizationId,
-        profileId: input.profileId,
-        observationId: observation.id,
-        type: input.type,
-        purchasedBy: input.memberId,
-        price: contactRevealPrices[input.type],
-        idempotencyKey: input.idempotencyKey,
-      })
-      .onConflictDoNothing()
-      .returning();
-    if (!inserted) {
-      const [existing] = await tx
+      const [existingPurchase] = await tx
         .select()
         .from(contactReveals)
         .where(
           and(
             eq(contactReveals.organizationId, input.organizationId),
             eq(contactReveals.observationId, observation.id),
+            eq(contactReveals.status, "finalized"),
           ),
         )
         .limit(1);
-      if (!existing) throw new ContactRevealError("not_found");
-      if (existing.status === "released") {
-        const [renewed] = await tx
-          .update(contactReveals)
-          .set({
-            purchasedBy: input.memberId,
-            status: "reserved",
-            finalizedAt: null,
-          })
-          .where(eq(contactReveals.id, existing.id))
-          .returning();
-        if (!renewed) throw new ContactRevealError("not_found");
+      if (existingPurchase) {
         await tx.insert(contactRevealRequests).values({
           organizationId: input.organizationId,
           idempotencyKey: input.idempotencyKey,
           profileId: input.profileId,
           observationId: observation.id,
-          revealId: renewed.id,
+          revealId: existingPurchase.id,
           type: input.type,
-          status: "reserved",
+          status: "reopened",
         });
-        await reserveCredits(tx, renewed, input.idempotencyKey);
         return {
           detail,
           observation,
-          reveal: renewed,
-          newlyReserved: true,
+          reveal: existingPurchase,
+          newlyReserved: false,
           operationIdempotencyKey: input.idempotencyKey,
         };
       }
+
+      const startOfDay = new Date();
+      startOfDay.setUTCHours(0, 0, 0, 0);
+      const [usage] = await tx
+        .select({ total: count() })
+        .from(contactRevealRequests)
+        .where(
+          and(
+            eq(contactRevealRequests.organizationId, input.organizationId),
+            inArray(contactRevealRequests.status, ["reserved", "finalized"]),
+            gte(contactRevealRequests.createdAt, startOfDay),
+          ),
+        );
+      const [entitlement] = await tx
+        .select({
+          status: organizationEntitlements.status,
+          tier: organizationEntitlements.tier,
+        })
+        .from(organizationEntitlements)
+        .where(
+          eq(organizationEntitlements.organizationId, input.organizationId),
+        )
+        .limit(1);
+      const dailyLimit =
+        entitlement?.status === "active" && entitlement.tier === "pro"
+          ? 100
+          : 10;
+      if (Number(usage?.total ?? 0) >= dailyLimit)
+        throw new ContactRevealError("daily_limit");
+
+      const [inserted] = await tx
+        .insert(contactReveals)
+        .values({
+          organizationId: input.organizationId,
+          profileId: input.profileId,
+          observationId: observation.id,
+          type: input.type,
+          purchasedBy: input.memberId,
+          price: contactRevealPrices[input.type],
+          idempotencyKey: input.idempotencyKey,
+        })
+        .onConflictDoNothing()
+        .returning();
+      if (!inserted) {
+        const [existing] = await tx
+          .select()
+          .from(contactReveals)
+          .where(
+            and(
+              eq(contactReveals.organizationId, input.organizationId),
+              eq(contactReveals.observationId, observation.id),
+            ),
+          )
+          .limit(1);
+        if (!existing) throw new ContactRevealError("not_found");
+        if (existing.status === "released") {
+          const [renewed] = await tx
+            .update(contactReveals)
+            .set({
+              purchasedBy: input.memberId,
+              status: "reserved",
+              finalizedAt: null,
+            })
+            .where(eq(contactReveals.id, existing.id))
+            .returning();
+          if (!renewed) throw new ContactRevealError("not_found");
+          await tx.insert(contactRevealRequests).values({
+            organizationId: input.organizationId,
+            idempotencyKey: input.idempotencyKey,
+            profileId: input.profileId,
+            observationId: observation.id,
+            revealId: renewed.id,
+            type: input.type,
+            status: "reserved",
+          });
+          await reserveCredits(tx, renewed, input.idempotencyKey);
+          return {
+            detail,
+            observation,
+            reveal: renewed,
+            newlyReserved: true,
+            operationIdempotencyKey: input.idempotencyKey,
+          };
+        }
+        await tx.insert(contactRevealRequests).values({
+          organizationId: input.organizationId,
+          idempotencyKey: input.idempotencyKey,
+          profileId: input.profileId,
+          observationId: observation.id,
+          revealId: existing.id,
+          type: input.type,
+          status: "reopened",
+        });
+        return {
+          detail,
+          observation,
+          reveal: existing,
+          newlyReserved: false,
+          operationIdempotencyKey: input.idempotencyKey,
+        };
+      }
+
       await tx.insert(contactRevealRequests).values({
         organizationId: input.organizationId,
         idempotencyKey: input.idempotencyKey,
         profileId: input.profileId,
         observationId: observation.id,
-        revealId: existing.id,
+        revealId: inserted.id,
         type: input.type,
-        status: "reopened",
+        status: "reserved",
       });
+      await reserveCredits(tx, inserted, input.idempotencyKey);
       return {
         detail,
         observation,
-        reveal: existing,
-        newlyReserved: false,
+        reveal: inserted,
+        newlyReserved: true,
         operationIdempotencyKey: input.idempotencyKey,
       };
-    }
-
-    await tx.insert(contactRevealRequests).values({
-      organizationId: input.organizationId,
-      idempotencyKey: input.idempotencyKey,
-      profileId: input.profileId,
-      observationId: observation.id,
-      revealId: inserted.id,
-      type: input.type,
-      status: "reserved",
     });
-    await reserveCredits(tx, inserted, input.idempotencyKey);
-    return {
-      detail,
-      observation,
-      reveal: inserted,
-      newlyReserved: true,
-      operationIdempotencyKey: input.idempotencyKey,
-    };
-  });
 
-  if (reserved.reveal.status === "refunded")
-    throw new ContactRevealError("invalid_contact_detail");
-  if (reserved.reveal.status !== "finalized") {
-    try {
-      await database.transaction(async (tx) => {
-        await tx.execute(
-          sql`select pg_advisory_xact_lock(hashtext(${input.profileId}))`,
-        );
-        const [blocked] = await tx
-          .select({ id: contactDetailInvalidations.observationId })
-          .from(contactDetailInvalidations)
-          .where(
-            eq(
-              contactDetailInvalidations.observationId,
-              reserved.observation.id,
-            ),
-          )
-          .limit(1);
-        const [suppressed] = await tx
-          .select({ type: contactDetailSuppressions.type })
-          .from(contactDetailSuppressions)
-          .where(
-            and(
-              eq(contactDetailSuppressions.profileId, input.profileId),
-              eq(contactDetailSuppressions.type, input.type),
-            ),
-          )
-          .limit(1);
-        if (blocked || suppressed)
-          throw new ContactRevealError("invalid_contact_detail");
-        await tx
-          .update(contactReveals)
-          .set({ status: "finalized", finalizedAt: new Date() })
-          .where(eq(contactReveals.id, reserved.reveal.id));
-        await tx
-          .insert(creditLedgerEntries)
-          .values({
-            organizationId: input.organizationId,
-            idempotencyKey: `${reserved.operationIdempotencyKey}:consumption`,
-            kind: "consumption",
-            amount: 0,
-            referenceId: reserved.reveal.id,
-          })
-          .onConflictDoNothing();
-        await tx
-          .update(contactRevealRequests)
-          .set({ status: "finalized" })
-          .where(
-            and(
-              eq(contactRevealRequests.organizationId, input.organizationId),
-              eq(
-                contactRevealRequests.idempotencyKey,
-                reserved.operationIdempotencyKey,
-              ),
-            ),
+    if (reserved.reveal.status === "refunded")
+      throw new ContactRevealError("invalid_contact_detail");
+    if (reserved.reveal.status !== "finalized") {
+      try {
+        await database.transaction(async (tx) => {
+          await tx.execute(
+            sql`select pg_advisory_xact_lock(hashtext(${input.profileId}))`,
           );
-      });
-    } catch (cause) {
-      if (reserved.newlyReserved)
-        await releaseReservation(
-          database,
-          reserved.reveal,
-          reserved.operationIdempotencyKey,
-        );
-      throw cause;
+          const [blocked] = await tx
+            .select({ id: contactDetailInvalidations.observationId })
+            .from(contactDetailInvalidations)
+            .where(
+              eq(
+                contactDetailInvalidations.observationId,
+                reserved.observation.id,
+              ),
+            )
+            .limit(1);
+          const [suppressed] = await tx
+            .select({ type: contactDetailSuppressions.type })
+            .from(contactDetailSuppressions)
+            .where(
+              and(
+                eq(contactDetailSuppressions.profileId, input.profileId),
+                eq(contactDetailSuppressions.type, input.type),
+              ),
+            )
+            .limit(1);
+          if (blocked || suppressed)
+            throw new ContactRevealError("invalid_contact_detail");
+          await tx
+            .update(contactReveals)
+            .set({ status: "finalized", finalizedAt: new Date() })
+            .where(eq(contactReveals.id, reserved.reveal.id));
+          await tx
+            .insert(creditLedgerEntries)
+            .values({
+              organizationId: input.organizationId,
+              idempotencyKey: `${reserved.operationIdempotencyKey}:consumption`,
+              kind: "consumption",
+              amount: 0,
+              referenceId: reserved.reveal.id,
+            })
+            .onConflictDoNothing();
+          await tx
+            .update(contactRevealRequests)
+            .set({ status: "finalized" })
+            .where(
+              and(
+                eq(contactRevealRequests.organizationId, input.organizationId),
+                eq(
+                  contactRevealRequests.idempotencyKey,
+                  reserved.operationIdempotencyKey,
+                ),
+              ),
+            );
+        });
+      } catch (cause) {
+        if (reserved.newlyReserved)
+          await releaseReservation(
+            database,
+            reserved.reveal,
+            reserved.operationIdempotencyKey,
+          );
+        throw cause;
+      }
     }
+    const result = {
+      observationId: reserved.observation.id,
+      type: reserved.detail.type,
+      value: reserved.detail.value,
+      price: reserved.newlyReserved ? reserved.reveal.price : 0,
+      previouslyPurchased: !reserved.newlyReserved,
+    };
+    await database
+      .update(securityAuditEvents)
+      .set({ result: result.previouslyPurchased ? "reopened" : "finalized" })
+      .where(eq(securityAuditEvents.id, audit.id));
+    return result;
+  } catch (cause) {
+    await database
+      .update(securityAuditEvents)
+      .set({
+        result:
+          cause instanceof ContactRevealError ? cause.code : "service_error",
+      })
+      .where(eq(securityAuditEvents.id, audit.id));
+    throw cause;
   }
-  return {
-    observationId: reserved.observation.id,
-    type: reserved.detail.type,
-    value: reserved.detail.value,
-    price: reserved.newlyReserved ? reserved.reveal.price : 0,
-    previouslyPurchased: !reserved.newlyReserved,
-  };
 };
 
 const reserveCredits = async (
@@ -571,6 +708,13 @@ const reserveCredits = async (
   reveal: typeof contactReveals.$inferSelect,
   idempotencyKey: string,
 ) => {
+  const [entitlement] = await tx
+    .select({ status: organizationEntitlements.status })
+    .from(organizationEntitlements)
+    .where(eq(organizationEntitlements.organizationId, reveal.organizationId))
+    .limit(1);
+  if (entitlement?.status !== "active")
+    throw new ContactRevealError("credits_unavailable");
   await tx
     .insert(creditAccounts)
     .values({ organizationId: reveal.organizationId })

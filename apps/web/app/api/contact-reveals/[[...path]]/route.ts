@@ -1,6 +1,10 @@
 import { auth } from "@clerk/nextjs/server";
 
 import { env } from "@/env";
+import {
+  protectedProxyHeaders,
+  protectedResponseHeaders,
+} from "../../proxy-security";
 
 const proxy = async (
   request: Request,
@@ -21,23 +25,17 @@ const proxy = async (
     `${env.HUMANS_API_URL}/v1/${path.map(encodeURIComponent).join("/")}`,
     {
       method: request.method,
-      headers: {
-        authorization: `Bearer ${token}`,
+      headers: protectedProxyHeaders(request, token, {
         "content-type": "application/json",
         ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
-      },
+      }),
       body: request.method === "GET" ? undefined : await request.text(),
       cache: "no-store",
     },
   );
   return new Response(response.body, {
     status: response.status,
-    headers: {
-      "content-type":
-        response.headers.get("content-type") ?? "application/json",
-      "cache-control": "private, no-store",
-      "x-robots-tag": "noindex, nofollow",
-    },
+    headers: protectedResponseHeaders(response),
   });
 };
 

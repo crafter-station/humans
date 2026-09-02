@@ -6,6 +6,7 @@ export const env = createEnv({
   server: {
     CLERK_SECRET_KEY: z.string().min(1),
     HUMANS_API_URL: z.url().default("http://localhost:8787"),
+    HUMANS_PROXY_SECRET: z.string().min(16),
   },
   client: {
     NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: z.string().min(1),
@@ -13,6 +14,7 @@ export const env = createEnv({
   runtimeEnv: {
     CLERK_SECRET_KEY: process.env.CLERK_SECRET_KEY,
     HUMANS_API_URL: process.env.HUMANS_API_URL,
+    HUMANS_PROXY_SECRET: process.env.HUMANS_PROXY_SECRET,
     NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:
       process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY,
   },

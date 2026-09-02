@@ -11,6 +11,7 @@ import {
   contactRevealLogFields,
   type ContactDetailType,
 } from "@humans/database/contact-reveals";
+import { profileSearchRequestFingerprint } from "@humans/database/search-profiles";
 
 import {
   clerkIdentityBoundary,
@@ -25,16 +26,24 @@ import {
   type NaturalSearchDecoder,
 } from "./natural-search";
 import { handleMcpRequest } from "./mcp";
+import { polarBoundary, type PolarBoundary } from "./polar";
 
 export type Bindings = {
   CLERK_PUBLISHABLE_KEY: string;
   CLERK_SECRET_KEY: string;
   CLERK_WEBHOOK_SIGNING_SECRET: string;
+  CLERK_BOT_PROTECTION_ENABLED?: "true";
   DATABASE_URL: string;
   SEARCH_CURSOR_SECRET?: string;
   OPENAI_API_KEY?: string;
   ORGANIZATION_RATE_LIMITER?: RateLimitBinding;
+  MEMBER_RATE_LIMITER?: RateLimitBinding;
+  API_KEY_RATE_LIMITER?: RateLimitBinding;
+  IP_RATE_LIMITER?: RateLimitBinding;
   NATURAL_SEARCH_RATE_LIMITER?: RateLimitBinding;
+  OPERATOR_SECRET?: string;
+  POLAR_WEBHOOK_SECRET?: string;
+  WEB_PROXY_SECRET?: string;
 };
 
 type RateLimitBinding = {
@@ -424,11 +433,16 @@ export const createApp = (
   databaseLayer: DatabaseLayerFactory,
   identity: IdentityBoundary = clerkIdentityBoundary,
   naturalSearchDecoder?: NaturalSearchDecoder,
+  polar: PolarBoundary = polarBoundary,
 ) => {
   const app = new OpenAPIHono<{ Bindings: Bindings }>();
   let naturalSearch: NaturalSearchInterpreter | undefined;
   const organizationRequests = new Map<string, number[]>();
+  const memberRequests = new Map<string, number[]>();
+  const apiKeyRequests = new Map<string, number[]>();
+  const ipRequests = new Map<string, number[]>();
   const naturalSearchRequests = new Map<string, number[]>();
+  const internalMcpToken = crypto.randomUUID();
 
   app.openapi(healthRoute, async (context) => {
     try {
@@ -483,6 +497,128 @@ export const createApp = (
     }
   });
 
+  app.post("/webhooks/polar", async (context) => {
+    let event: Awaited<ReturnType<PolarBoundary["verifySubscriptionWebhook"]>>;
+    try {
+      event = await polar.verifySubscriptionWebhook(
+        context.req.raw,
+        context.env,
+      );
+    } catch {
+      return context.json(
+        {
+          error: {
+            code: "invalid_webhook_signature",
+            message: "The webhook signature is invalid",
+          },
+        },
+        400,
+      );
+    }
+    if (event === null) return context.json({ processed: false }, 200);
+    try {
+      await runDatabase(context, (database) =>
+        database.setPolarSubscriptionStatus({
+          organizationId: event.organizationId,
+          polarSubscriptionId: event.subscriptionId,
+          active: event.active,
+          eventId: event.eventId,
+          occurredAt: event.occurredAt,
+        }),
+      );
+      return context.json({ processed: true }, 200);
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+
+  const requireOperator = (context: AppContext) =>
+    Boolean(
+      context.env.OPERATOR_SECRET &&
+        context.req.header("Authorization") ===
+          `Bearer ${context.env.OPERATOR_SECRET}`,
+    );
+
+  app.post("/v1/operator/suspensions", async (context) => {
+    if (!requireOperator(context)) return unauthorized(context);
+    const input = z
+      .object({
+        principalType: z.enum(["member", "organization", "api_key"]),
+        principalId: z.string().min(1),
+        reason: z.string().trim().min(1).max(500),
+      })
+      .strict()
+      .safeParse(await context.req.json().catch(() => null));
+    if (!input.success) return validationError(context, "invalid_suspension");
+    try {
+      const suspension = await runDatabase(context, (database) =>
+        database.suspendPrincipal({
+          ...input.data,
+          suspendedBy: "operator",
+        }),
+      );
+      if (input.data.principalType === "member")
+        await identity.revokeMemberSessions?.(
+          input.data.principalId,
+          context.env,
+        );
+      if (input.data.principalType === "organization")
+        await identity.revokeAllOrganizationApiKeys?.(
+          input.data.principalId,
+          context.env,
+        );
+      return context.json({ suspension }, 201);
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+
+  app.delete("/v1/operator/suspensions/:suspensionId", async (context) => {
+    if (!requireOperator(context)) return unauthorized(context);
+    try {
+      const suspension = await runDatabase(context, (database) =>
+        database.revokeSuspension(context.req.param("suspensionId")),
+      );
+      return suspension
+        ? context.json({ suspension }, 200)
+        : context.json(
+            {
+              error: { code: "not_found", message: "Suspension was not found" },
+            },
+            404,
+          );
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+
+  app.post(
+    "/v1/operator/members/:memberId/revoke-sessions",
+    async (context) => {
+      if (!requireOperator(context)) return unauthorized(context);
+      if (!identity.revokeMemberSessions) return serviceUnavailable(context);
+      await identity.revokeMemberSessions(
+        context.req.param("memberId"),
+        context.env,
+      );
+      return context.json({ revoked: true }, 200);
+    },
+  );
+
+  app.post(
+    "/v1/operator/organizations/:organizationId/revoke-keys",
+    async (context) => {
+      if (!requireOperator(context)) return unauthorized(context);
+      if (!identity.revokeAllOrganizationApiKeys)
+        return serviceUnavailable(context);
+      await identity.revokeAllOrganizationApiKeys(
+        context.req.param("organizationId"),
+        context.env,
+      );
+      return context.json({ revoked: true }, 200);
+    },
+  );
+
   app.all("/mcp", async (context) => {
     const authorization = context.req.header("Authorization");
     if (authorization === undefined) return unauthorized(context);
@@ -493,11 +629,20 @@ export const createApp = (
     if (actor === null) return unauthorized(context);
 
     const origin = new URL(context.req.url).origin;
+    const mcpCorrelationId =
+      context.req.header("X-Correlation-ID")?.slice(0, 200) ??
+      crypto.randomUUID();
     const response = await handleMcpRequest(
       context.req.raw,
       async (path, init) => {
         const headers = new Headers(init?.headers);
         headers.set("Authorization", authorization);
+        headers.set("X-Humans-Internal-MCP", internalMcpToken);
+        headers.set("X-Correlation-ID", mcpCorrelationId);
+        headers.set(
+          "X-Humans-Client-IP",
+          context.req.header("CF-Connecting-IP") ?? "unknown",
+        );
         return await app.request(
           `${origin}${path}`,
           { ...init, headers },
@@ -508,6 +653,7 @@ export const createApp = (
     const headers = new Headers(response.headers);
     headers.set("Cache-Control", "private, no-store");
     headers.set("X-Robots-Tag", "noindex, nofollow");
+    headers.set("X-Correlation-ID", mcpCorrelationId);
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
@@ -520,6 +666,19 @@ export const createApp = (
     if (session === null) return unauthorized(context);
 
     try {
+      const provisioningPrincipal = {
+        memberId: session.memberId,
+        organizationId:
+          session.organizationId ?? `provisioning:${session.memberId}`,
+      };
+      await runDatabase(context, (database) =>
+        database.assertPrincipalActive(provisioningPrincipal),
+      );
+      const limited = await enforcePrincipalRateLimits(
+        context,
+        provisioningPrincipal,
+      );
+      if (limited instanceof Response) return limited;
       const workspace = await Effect.runPromise(
         Effect.gen(function* () {
           const database = yield* Database;
@@ -532,8 +691,27 @@ export const createApp = (
           );
         }).pipe(Effect.provide(databaseLayer(context.env))),
       );
+      await recordActivity(context, workspace, "organization_access");
+      await runDatabase(context, (database) =>
+        database.activateOrganizationEntitlement({
+          memberId: session.memberId,
+          organizationId: workspace.organizationId,
+          emailVerified: session.emailVerified === true,
+          botProtectionVerified: session.botProtectionVerified === true,
+        }),
+      );
       return context.json(workspace, 200);
-    } catch {
+    } catch (error) {
+      if (tagged(error, "AbuseControlRejected"))
+        return context.json(
+          {
+            error: {
+              code: taggedReason(error) ?? "forbidden",
+              message: "A verified Member is required to activate free Credits",
+            },
+          },
+          403,
+        );
       return context.json(
         {
           error: {
@@ -761,6 +939,10 @@ export const createApp = (
       if (!query.success || !idempotencyKey || idempotencyKey.length > 200)
         return validationError(context, "invalid_search");
       const filters = queryFilters(query.data);
+      if (!query.data.cursor)
+        await recordActivity(context, actor, "search", {
+          fingerprint: await profileSearchRequestFingerprint(filters, {}),
+        });
       const page = await runDatabase(context, (database) =>
         database.searchProfilesWithCredit({
           organizationId: actor.organizationId,
@@ -817,6 +999,10 @@ export const createApp = (
       const filters =
         interpretation?.filters ??
         ("filters" in input.data ? input.data.filters : {});
+      if (!input.data.cursor)
+        await recordActivity(context, actor, "search", {
+          fingerprint: await profileSearchRequestFingerprint(filters, {}),
+        });
       const page = await runDatabase(context, (database) =>
         database.searchProfilesWithCredit({
           organizationId: actor.organizationId,
@@ -842,10 +1028,10 @@ export const createApp = (
   });
 
   app.get("/v1/profiles/search", async (context) => {
-    const session = await identity.authenticate(context.req.raw, context.env);
-    if (session === null || session.organizationId === null)
-      return unauthorized(context);
-    const organizationId = session.organizationId;
+    const actor = await contactActor(context);
+    if (actor === null) return unauthorized(context);
+    if (actor instanceof Response) return actor;
+    const organizationId = actor.organizationId;
     const parsed = z
       .object({
         q: z.string().optional(),
@@ -862,7 +1048,29 @@ export const createApp = (
       .safeParse(context.req.query());
     if (!parsed.success) return invalidSearch(context);
 
+    const filters = {
+      query: parsed.data.q,
+      roles: list(parsed.data.role),
+      skills: list(parsed.data.skill),
+      currentResidences: list(parsed.data.residence),
+      companies: list(parsed.data.company),
+      seniorities: list(parsed.data.seniority),
+      minimumExperience: parsed.data.experience,
+      opportunityStatuses: list(parsed.data.opportunityStatus).filter(
+        (status): status is "open" | "not_open" | "unspecified" =>
+          status === "open" ||
+          status === "not_open" ||
+          status === "unspecified",
+      ),
+    };
+    if (!parsed.data.cursor && !hasMeaningfulFilter(filters))
+      return invalidSearch(context);
+
     try {
+      if (!parsed.data.cursor)
+        await recordActivity(context, actor, "search", {
+          fingerprint: await profileSearchRequestFingerprint(filters, {}),
+        });
       const page = await Effect.runPromise(
         Effect.gen(function* () {
           const database = yield* Database;
@@ -870,21 +1078,7 @@ export const createApp = (
             organizationId,
             idempotencyKey:
               context.req.header("Idempotency-Key") ?? crypto.randomUUID(),
-            filters: {
-              query: parsed.data.q,
-              roles: list(parsed.data.role),
-              skills: list(parsed.data.skill),
-              currentResidences: list(parsed.data.residence),
-              companies: list(parsed.data.company),
-              seniorities: list(parsed.data.seniority),
-              minimumExperience: parsed.data.experience,
-              opportunityStatuses: list(parsed.data.opportunityStatus).filter(
-                (status): status is "open" | "not_open" | "unspecified" =>
-                  status === "open" ||
-                  status === "not_open" ||
-                  status === "unspecified",
-              ),
-            },
+            filters,
             cursor: parsed.data.cursor,
             pageSize: parsed.data.pageSize,
           });
@@ -899,8 +1093,16 @@ export const createApp = (
   });
 
   app.post("/v1/profiles/search/interpret", async (context) => {
-    const session = await identity.authenticate(context.req.raw, context.env);
-    if (session === null) return unauthorized(context);
+    const actor = await contactActor(context);
+    if (actor === null) return unauthorized(context);
+    if (actor instanceof Response) return actor;
+    const naturalLimit = await enforceRateLimit(
+      context.env?.NATURAL_SEARCH_RATE_LIMITER,
+      takeRateLimit(naturalSearchRequests, actor.organizationId, 10),
+      actor.organizationId,
+    );
+    setRateLimitHeaders(context, naturalLimit);
+    if (!naturalLimit.allowed) return rateLimited(context, naturalLimit);
     const body = z
       .object({ query: z.string() })
       .strict()
@@ -938,16 +1140,22 @@ export const createApp = (
     if (authorizedApiKey instanceof Response) return authorizedApiKey;
     const session =
       authorizedApiKey === null
-        ? await identity.authenticate(context.req.raw, context.env)
+        ? await contactActor(context)
         : {
             memberId: authorizedApiKey.memberId,
             organizationId: authorizedApiKey.organizationId,
           };
-    if (session === null || session.organizationId === null)
-      return unauthorized(context);
+    if (session === null) return unauthorized(context);
+    if (session instanceof Response) return session;
     const organizationId = session.organizationId;
 
     try {
+      await recordActivity(
+        context,
+        authorizedApiKey ?? session,
+        "profile_read",
+        { profileId: context.req.param("profileId") },
+      );
       const result = await Effect.runPromise(
         Effect.gen(function* () {
           const database = yield* Database;
@@ -983,11 +1191,27 @@ export const createApp = (
       : value === "phone"
         ? "direct-professional-phone"
         : null;
-  const contactActor = async (context: Context<{ Bindings: Bindings }>) => {
+  const contactActor = async (context: AppContext) => {
     const session = await identity.authenticate(context.req.raw, context.env);
-    return session?.organizationId
-      ? { memberId: session.memberId, organizationId: session.organizationId }
-      : null;
+    if (!session?.organizationId) return null;
+    const actor = {
+      memberId: session.memberId,
+      organizationId: session.organizationId,
+    };
+    try {
+      await runDatabase(context, (database) =>
+        database.getWorkspace(actor.memberId, actor.organizationId),
+      );
+      const limited = await enforcePrincipalRateLimits(context, actor);
+      if (limited instanceof Response) return limited;
+      await recordActivity(context, actor, "organization_access");
+      return actor;
+    } catch (error) {
+      return tagged(error, "WorkspaceForbidden") ||
+        tagged(error, "AbuseControlRejected")
+        ? forbidden(context)
+        : serviceUnavailable(context);
+    }
   };
   const runDatabase = <A>(
     context: Context<{ Bindings: Bindings }>,
@@ -1001,6 +1225,104 @@ export const createApp = (
         return yield* effect(database);
       }).pipe(Effect.provide(databaseLayer(context.env))),
     );
+
+  const requestSource = (
+    context: AppContext,
+    apiKey = false,
+  ): "web" | "api" | "mcp" =>
+    context.req.header("X-Humans-Internal-MCP") === internalMcpToken
+      ? "mcp"
+      : apiKey
+        ? "api"
+        : "web";
+  const clientIp = (context: AppContext) =>
+    context.req.header("X-Humans-Internal-MCP") === internalMcpToken
+      ? (context.req.header("X-Humans-Client-IP") ?? "unknown")
+      : context.env?.WEB_PROXY_SECRET &&
+          context.req.header("X-Humans-Web-Proxy") ===
+            context.env.WEB_PROXY_SECRET
+        ? (context.req.header("X-Humans-Client-IP") ?? "unknown")
+        : (context.req.header("CF-Connecting-IP") ?? "unknown");
+  const correlationId = (context: AppContext) => {
+    const value = context.req.header("X-Correlation-ID")?.trim();
+    const id = value && value.length <= 200 ? value : crypto.randomUUID();
+    context.header("X-Correlation-ID", id);
+    return id;
+  };
+  const hashIp = async (value: string) => {
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(value),
+    );
+    return Array.from(new Uint8Array(digest), (byte) =>
+      byte.toString(16).padStart(2, "0"),
+    ).join("");
+  };
+  const recordActivity = async (
+    context: AppContext,
+    actor: { memberId: string; organizationId: string; keyId?: string },
+    kind: "organization_access" | "search" | "profile_read" | "reveal",
+    details?: { fingerprint?: string; profileId?: string },
+  ) => {
+    const ipHash = await hashIp(clientIp(context));
+    return runDatabase(context, (database) =>
+      database.recordSecurityActivity({
+        memberId: actor.memberId,
+        organizationId: actor.organizationId,
+        apiKeyId: actor.keyId,
+        ipHash,
+        source: requestSource(context, actor.keyId !== undefined),
+        kind,
+        ...details,
+      }),
+    );
+  };
+
+  const enforcePrincipalRateLimits = async (
+    context: AppContext,
+    actor: { memberId: string; organizationId: string; apiKeyId?: string },
+  ) => {
+    const ip = clientIp(context);
+    const dimensions = [
+      [
+        context.env?.MEMBER_RATE_LIMITER,
+        takeRateLimit(memberRequests, actor.memberId, 60),
+        `member:${actor.memberId}`,
+      ],
+      [
+        context.env?.ORGANIZATION_RATE_LIMITER,
+        takeRateLimit(organizationRequests, actor.organizationId, 60),
+        `organization:${actor.organizationId}`,
+      ],
+      [
+        context.env?.IP_RATE_LIMITER,
+        takeRateLimit(ipRequests, ip, 120),
+        `ip:${ip}`,
+      ],
+      ...(actor.apiKeyId
+        ? [
+            [
+              context.env?.API_KEY_RATE_LIMITER,
+              takeRateLimit(apiKeyRequests, actor.apiKeyId, 60),
+              `api-key:${actor.apiKeyId}`,
+            ] as const,
+          ]
+        : []),
+    ] as const;
+    const limits = await Promise.all(
+      dimensions.map(([binding, local, key]) =>
+        enforceRateLimit(binding, local, key),
+      ),
+    );
+    const denied = limits.find((limit) => !limit.allowed);
+    const tightest =
+      denied ??
+      limits.reduce((left, right) =>
+        left.remaining <= right.remaining ? left : right,
+      );
+    setRateLimitHeaders(context, tightest);
+    return denied ? rateLimited(context, denied) : null;
+  };
 
   const authorizeApiKey = async (
     context: AppContext,
@@ -1024,13 +1346,18 @@ export const createApp = (
       throw error;
     }
 
-    const generalLimit = await enforceRateLimit(
-      context.env?.ORGANIZATION_RATE_LIMITER,
-      takeRateLimit(organizationRequests, actor.organizationId, 60),
-      actor.organizationId,
-    );
-    setRateLimitHeaders(context, generalLimit);
-    if (!generalLimit.allowed) return rateLimited(context, generalLimit);
+    const generalLimit = await enforcePrincipalRateLimits(context, {
+      memberId: actor.memberId,
+      organizationId: actor.organizationId,
+      apiKeyId: actor.keyId,
+    });
+    if (generalLimit instanceof Response) return generalLimit;
+    try {
+      await recordActivity(context, actor, "organization_access");
+    } catch (error) {
+      if (tagged(error, "AbuseControlRejected")) return forbidden(context);
+      throw error;
+    }
     if (naturalLanguage) {
       const naturalLimit = await enforceRateLimit(
         context.env?.NATURAL_SEARCH_RATE_LIMITER,
@@ -1054,6 +1381,7 @@ export const createApp = (
       ]);
       if (actor instanceof Response) return actor;
       const profileId = context.req.param("profileId");
+      await recordActivity(context, actor, "reveal", { profileId });
       const idempotencyKey = context.req.header("Idempotency-Key")?.trim();
       const input = z
         .object({ observationId: z.string().min(1).optional() })
@@ -1075,6 +1403,9 @@ export const createApp = (
           type,
           idempotencyKey,
           observationId: input.data.observationId,
+          apiKeyId: actor.keyId,
+          source: requestSource(context, true),
+          correlationId: correlationId(context),
         }),
       );
       console.info({
@@ -1102,11 +1433,48 @@ export const createApp = (
     revealWithApiKey(context, "direct-professional-phone"),
   );
 
+  app.all("/v1/contact-details/export", async (context) => {
+    const apiKey = await identity.authenticateApiKey(
+      context.req.raw,
+      context.env,
+    );
+    const actor = apiKey
+      ? await authorizeApiKey(context, ["profiles:read"], false, apiKey)
+      : await contactActor(context);
+    if (actor === null) return unauthorized(context);
+    if (actor instanceof Response) return actor;
+    const body = z
+      .object({ profileId: z.string().min(1).optional() })
+      .passthrough()
+      .safeParse(await context.req.json().catch(() => ({})));
+    await runDatabase(context, (database) =>
+      database.recordAttemptedExport({
+        actorMemberId: actor.memberId,
+        organizationId: actor.organizationId,
+        apiKeyId: apiKey?.keyId,
+        profileId: body.success ? body.data.profileId : undefined,
+        source: requestSource(context, apiKey !== null),
+        correlationId: correlationId(context),
+      }),
+    );
+    privateContactResponse(context);
+    return context.json(
+      {
+        error: {
+          code: "bulk_export_not_supported",
+          message: "Bulk Contact Detail export is not supported",
+        },
+      },
+      405,
+    );
+  });
+
   app.post(
     "/v1/profiles/:profileId/contact-reveals/:contactType",
     async (context) => {
       const actor = await contactActor(context);
       if (actor === null) return unauthorized(context);
+      if (actor instanceof Response) return actor;
       const type = contactType(context.req.param("contactType"));
       const idempotencyKey = context.req.header("Idempotency-Key")?.trim();
       const body = z
@@ -1124,6 +1492,9 @@ export const createApp = (
           400,
         );
       try {
+        await recordActivity(context, actor, "reveal", {
+          profileId: context.req.param("profileId"),
+        });
         const reveal = await runDatabase(context, (database) =>
           database.purchaseContactReveal({
             ...actor,
@@ -1131,6 +1502,8 @@ export const createApp = (
             type,
             idempotencyKey,
             observationId: body.success ? body.data.observationId : undefined,
+            source: "web",
+            correlationId: correlationId(context),
           }),
         );
         console.info(
@@ -1153,6 +1526,7 @@ export const createApp = (
   app.post("/v1/contact-details/:observationId/report", async (context) => {
     const actor = await contactActor(context);
     if (actor === null) return unauthorized(context);
+    if (actor instanceof Response) return actor;
     const input = z
       .object({ reason: z.enum(["bounced-email", "wrong-phone"]) })
       .strict()
@@ -1221,6 +1595,7 @@ export const createApp = (
   app.patch("/v1/organization/contact-reveal-policy", async (context) => {
     const actor = await contactActor(context);
     if (actor === null) return unauthorized(context);
+    if (actor instanceof Response) return actor;
     const input = z
       .object({ membersCanReveal: z.boolean() })
       .strict()
@@ -1253,6 +1628,7 @@ export const createApp = (
   app.get("/v1/organization/contact-reveal-policy", async (context) => {
     const actor = await contactActor(context);
     if (actor === null) return unauthorized(context);
+    if (actor instanceof Response) return actor;
     try {
       const policy = await runDatabase(context, (database) =>
         database.getOrganizationContactRevealPolicy(
@@ -1270,12 +1646,7 @@ export const createApp = (
   const savedListInput = z.object({ name: z.string().trim().min(1).max(120) });
   type AppContext = Context<{ Bindings: Bindings }>;
   const savedListContext = async (context: AppContext) => {
-    const session = await identity.authenticate(context.req.raw, context.env);
-    if (session === null || session.organizationId === null) return null;
-    return {
-      memberId: session.memberId,
-      organizationId: session.organizationId,
-    };
+    return contactActor(context);
   };
   const runSavedList = <A>(
     context: AppContext,
@@ -1293,6 +1664,7 @@ export const createApp = (
   app.get("/v1/saved-lists", async (context) => {
     const actor = await savedListContext(context);
     if (actor === null) return unauthorized(context);
+    if (actor instanceof Response) return actor;
     try {
       return context.json(
         {
@@ -1309,6 +1681,7 @@ export const createApp = (
   app.post("/v1/saved-lists", async (context) => {
     const actor = await savedListContext(context);
     if (actor === null) return unauthorized(context);
+    if (actor instanceof Response) return actor;
     const input = savedListInput.safeParse(
       await context.req.json().catch(() => null),
     );
@@ -1337,6 +1710,7 @@ export const createApp = (
   app.patch("/v1/saved-lists/:listId", async (context) => {
     const actor = await savedListContext(context);
     if (actor === null) return unauthorized(context);
+    if (actor instanceof Response) return actor;
     const input = savedListInput.safeParse(
       await context.req.json().catch(() => null),
     );
@@ -1366,6 +1740,7 @@ export const createApp = (
   app.delete("/v1/saved-lists/:listId", async (context) => {
     const actor = await savedListContext(context);
     if (actor === null) return unauthorized(context);
+    if (actor instanceof Response) return actor;
     try {
       await runSavedList(context, (database) =>
         database.deleteSavedList(
@@ -1382,6 +1757,7 @@ export const createApp = (
   app.put("/v1/saved-lists/:listId/entries/:profileId", async (context) => {
     const actor = await savedListContext(context);
     if (actor === null) return unauthorized(context);
+    if (actor instanceof Response) return actor;
     try {
       await runSavedList(context, (database) =>
         database.addSavedListEntry(
@@ -1399,6 +1775,7 @@ export const createApp = (
   app.delete("/v1/saved-lists/:listId/entries/:profileId", async (context) => {
     const actor = await savedListContext(context);
     if (actor === null) return unauthorized(context);
+    if (actor instanceof Response) return actor;
     try {
       await runSavedList(context, (database) =>
         database.removeSavedListEntry(
@@ -1416,6 +1793,7 @@ export const createApp = (
   app.patch("/v1/saved-lists/:listId/entries/:profileId", async (context) => {
     const actor = await savedListContext(context);
     if (actor === null) return unauthorized(context);
+    if (actor instanceof Response) return actor;
     const input = z
       .object({ note: z.string().max(5000) })
       .safeParse(await context.req.json().catch(() => null));
@@ -1627,6 +2005,7 @@ const contactError = (
   context: Context<{ Bindings: Bindings }>,
   error: unknown,
 ) => {
+  if (tagged(error, "AbuseControlRejected")) return forbidden(context);
   const reason =
     typeof error === "object" &&
     error !== null &&
@@ -1662,6 +2041,16 @@ const contactError = (
       },
       402,
     );
+  if (reason === "credits_unavailable")
+    return context.json(
+      {
+        error: {
+          code: reason,
+          message: "The Organization has no active Credit entitlement",
+        },
+      },
+      403,
+    );
   if (reason === "idempotency_conflict")
     return context.json(
       {
@@ -1679,6 +2068,16 @@ const contactError = (
       },
       410,
     );
+  if (reason === "daily_limit")
+    return context.json(
+      {
+        error: {
+          code: reason,
+          message: "The Organization daily Contact Reveal limit was reached",
+        },
+      },
+      429,
+    );
   return serviceUnavailable(context);
 };
 
@@ -1694,6 +2093,7 @@ const externalSearchError = (
   context: Context<{ Bindings: Bindings }>,
   error: unknown,
 ) => {
+  if (tagged(error, "AbuseControlRejected")) return forbidden(context);
   if (tagged(error, "SearchRejected")) return invalidSearch(context);
   const reason = taggedErrorReason(error, "SearchChargeRejected");
   if (reason === "insufficient_credits")
@@ -1705,6 +2105,16 @@ const externalSearchError = (
         },
       },
       402,
+    );
+  if (reason === "credits_unavailable")
+    return context.json(
+      {
+        error: {
+          code: reason,
+          message: "The Organization has no active Credit entitlement",
+        },
+      },
+      403,
     );
   if (reason === "idempotency_conflict")
     return context.json(
@@ -1738,6 +2148,27 @@ const list = (value: string | undefined) =>
     ?.split(",")
     .map((item) => item.trim())
     .filter(Boolean) ?? [];
+
+const hasMeaningfulFilter = (filters: {
+  query?: string;
+  roles?: string[];
+  skills?: string[];
+  currentResidences?: string[];
+  companies?: string[];
+  seniorities?: string[];
+  minimumExperience?: number;
+  opportunityStatuses?: string[];
+}) =>
+  Boolean(filters.query?.trim()) ||
+  filters.minimumExperience !== undefined ||
+  [
+    filters.roles,
+    filters.skills,
+    filters.currentResidences,
+    filters.companies,
+    filters.seniorities,
+    filters.opportunityStatuses,
+  ].some((values) => (values?.length ?? 0) > 0);
 
 const decodeNaturalSearch = async (prompt: string, bindings: Bindings) => {
   if (!bindings.OPENAI_API_KEY)

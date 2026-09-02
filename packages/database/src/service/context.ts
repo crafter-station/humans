@@ -2,6 +2,15 @@ import { Context, type Effect } from "effect";
 
 import type { runChargedProfileSearch } from "../charged-search";
 import type {
+  activateOrganizationEntitlement,
+  assertPrincipalActive,
+  recordSecurityActivity,
+  recordSecurityAudit,
+  revokeSuspension,
+  setPolarSubscriptionStatus,
+  suspendPrincipal,
+} from "../abuse-controls";
+import type {
   ContactDetailType,
   getOrganizationContactRevealPolicy,
   listContactDetails,
@@ -22,6 +31,7 @@ import type {
   renameSavedList,
 } from "../saved-lists";
 import type {
+  AbuseControlRejected,
   ContactRevealRejected,
   DatabaseUnavailable,
   ProfileRejected,
@@ -41,6 +51,15 @@ import type {
 export class Database extends Context.Service<
   Database,
   {
+    readonly activateOrganizationEntitlement: (
+      input: Parameters<typeof activateOrganizationEntitlement>[1],
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof activateOrganizationEntitlement>>,
+      DatabaseUnavailable | AbuseControlRejected
+    >;
+    readonly assertPrincipalActive: (
+      input: Parameters<typeof assertPrincipalActive>[1],
+    ) => Effect.Effect<void, DatabaseUnavailable | AbuseControlRejected>;
     readonly check: Effect.Effect<void, DatabaseUnavailable>;
     readonly projectClerkEvent: (
       event: ClerkProjectionEvent,
@@ -106,6 +125,9 @@ export class Database extends Context.Service<
       type: ContactDetailType;
       idempotencyKey: string;
       observationId?: string;
+      apiKeyId?: string;
+      source?: "web" | "api" | "mcp";
+      correlationId?: string;
     }) => Effect.Effect<
       Awaited<ReturnType<typeof purchaseContactReveal>>,
       DatabaseUnavailable | ContactRevealRejected
@@ -118,6 +140,33 @@ export class Database extends Context.Service<
     }) => Effect.Effect<
       Awaited<ReturnType<typeof reportInvalidContactDetail>>,
       DatabaseUnavailable | ContactRevealRejected
+    >;
+    readonly recordSecurityActivity: (
+      input: Parameters<typeof recordSecurityActivity>[1],
+    ) => Effect.Effect<void, DatabaseUnavailable | AbuseControlRejected>;
+    readonly recordAttemptedExport: (
+      input: Omit<
+        Parameters<typeof recordSecurityAudit>[1],
+        "eventType" | "result"
+      >,
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof recordSecurityAudit>>,
+      DatabaseUnavailable
+    >;
+    readonly revokeSuspension: (
+      suspensionId: string,
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof revokeSuspension>>,
+      DatabaseUnavailable
+    >;
+    readonly setPolarSubscriptionStatus: (
+      input: Parameters<typeof setPolarSubscriptionStatus>[1],
+    ) => Effect.Effect<void, DatabaseUnavailable>;
+    readonly suspendPrincipal: (
+      input: Parameters<typeof suspendPrincipal>[1],
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof suspendPrincipal>>,
+      DatabaseUnavailable
     >;
     readonly setContactDetailSuppression: (
       memberId: string,

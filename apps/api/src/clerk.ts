@@ -13,6 +13,8 @@ import type { Bindings } from "./app";
 export type SessionIdentity = {
   memberId: string;
   organizationId: string | null;
+  emailVerified?: boolean;
+  botProtectionVerified?: boolean;
 };
 
 export type ApiScope = "profiles:read" | "contacts:reveal";
@@ -68,6 +70,11 @@ export type IdentityBoundary = {
     apiKeyId: string,
     bindings: Bindings,
   ): Promise<OrganizationApiKey | null>;
+  revokeMemberSessions?(memberId: string, bindings: Bindings): Promise<void>;
+  revokeAllOrganizationApiKeys?(
+    organizationId: string,
+    bindings: Bindings,
+  ): Promise<void>;
   verifyWebhook(
     request: Request,
     bindings: Bindings,
@@ -122,7 +129,17 @@ export const clerkIdentityBoundary: IdentityBoundary = {
     if (!state.isAuthenticated) return null;
 
     const auth = state.toAuth();
-    return { memberId: auth.userId, organizationId: auth.orgId ?? null };
+    const member = await clerk.users.getUser(auth.userId);
+    const primaryEmail = member.emailAddresses.find(
+      (email) => email.id === member.primaryEmailAddressId,
+    );
+    return {
+      memberId: auth.userId,
+      organizationId: auth.orgId ?? null,
+      emailVerified: primaryEmail?.verification?.status === "verified",
+      // A completed Clerk signup proves the configured protection flow passed.
+      botProtectionVerified: bindings.CLERK_BOT_PROTECTION_ENABLED === "true",
+    };
   },
 
   async authenticateApiKey(request, bindings) {
@@ -192,6 +209,38 @@ export const clerkIdentityBoundary: IdentityBoundary = {
         apiKeyId,
         revocationReason: "Revoked by an Organization admin",
       }),
+    );
+  },
+
+  async revokeMemberSessions(memberId, bindings) {
+    const clerk = createClerkClient({ secretKey: bindings.CLERK_SECRET_KEY });
+    const sessions = await clerk.sessions.getSessionList({
+      userId: memberId,
+      limit: 500,
+    });
+    await Promise.all(
+      sessions.data.map((session) =>
+        clerk.sessions.revokeSession(session.id).then(() => undefined),
+      ),
+    );
+  },
+
+  async revokeAllOrganizationApiKeys(organizationId, bindings) {
+    const clerk = createClerkClient({ secretKey: bindings.CLERK_SECRET_KEY });
+    const keys = await clerk.apiKeys.list({
+      subject: organizationId,
+      includeInvalid: false,
+      limit: 500,
+    });
+    await Promise.all(
+      keys.data.map((key) =>
+        clerk.apiKeys
+          .revoke({
+            apiKeyId: key.id,
+            revocationReason: "Revoked by a Humans Operator",
+          })
+          .then(() => undefined),
+      ),
     );
   },
 

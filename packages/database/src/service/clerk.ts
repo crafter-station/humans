@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, isNull, notExists, or, sql } from "drizzle-orm";
 import { Effect } from "effect";
 
 import {
@@ -7,6 +7,7 @@ import {
   members,
   organizationMemberships,
   organizations,
+  principalSuspensions,
 } from "../schema";
 import { DatabaseUnavailable, WorkspaceForbidden } from "./errors";
 import type {
@@ -135,6 +136,29 @@ export const makeClerkService = (database: DrizzleDatabase) => {
               eq(organizationMemberships.active, true),
               eq(members.active, true),
               eq(organizations.active, true),
+              notExists(
+                database
+                  .select({ id: principalSuspensions.id })
+                  .from(principalSuspensions)
+                  .where(
+                    and(
+                      isNull(principalSuspensions.revokedAt),
+                      or(
+                        and(
+                          eq(principalSuspensions.principalType, "member"),
+                          eq(principalSuspensions.principalId, memberId),
+                        ),
+                        and(
+                          eq(
+                            principalSuspensions.principalType,
+                            "organization",
+                          ),
+                          eq(principalSuspensions.principalId, organizationId),
+                        ),
+                      ),
+                    ),
+                  ),
+              ),
             ),
           )
           .limit(1),

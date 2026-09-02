@@ -7,6 +7,7 @@ import {
 } from "@humans/database";
 import * as schema from "@humans/database/schema";
 import { applyCreditEntry, getCreditBalance } from "@humans/database/credits";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { fileURLToPath } from "node:url";
@@ -14,7 +15,7 @@ import { Pool } from "pg";
 import { Webhook } from "standardwebhooks";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { createApp } from "../src/app";
+import { createApp, type Bindings } from "../src/app";
 import {
   clerkIdentityBoundary,
   type ApiKeyIdentity,
@@ -272,6 +273,34 @@ describe("Humans API", () => {
       organizationId: "personal_new_member",
     });
     expect(identity.personalOrganizationsCreated).toBe(1);
+
+    const verificationIdentity = new FakeIdentity();
+    const verificationApp = createApp(
+      () => makeDatabaseLayer(database),
+      verificationIdentity,
+    );
+    verificationIdentity.sessions.set("verification_session", {
+      memberId: "verification_member",
+      organizationId: null,
+      emailVerified: false,
+      botProtectionVerified: false,
+    });
+    const blocked = await verificationApp.request("/v1/workspace", {
+      method: "POST",
+      headers: { authorization: "Bearer verification_session" },
+    });
+    expect(blocked.status).toBe(403);
+    verificationIdentity.sessions.set("verification_session", {
+      memberId: "verification_member",
+      organizationId: null,
+      emailVerified: true,
+      botProtectionVerified: true,
+    });
+    const verified = await verificationApp.request("/v1/workspace", {
+      method: "POST",
+      headers: { authorization: "Bearer verification_session" },
+    });
+    expect(verified.status).toBe(200);
 
     identity.sessions.set("invited_session", {
       memberId: "invited_member",
@@ -599,6 +628,11 @@ describe("Humans API", () => {
       clerkId: "reveal_organization",
       name: "Reveal Organization",
     });
+    await database.insert(schema.organizationEntitlements).values({
+      organizationId: "reveal_organization",
+      tier: "free",
+      status: "active",
+    });
     await database.insert(schema.organizationMemberships).values({
       clerkId: "reveal_membership",
       memberId: "reveal_member",
@@ -691,6 +725,11 @@ describe("Humans API", () => {
     await database.insert(schema.organizations).values({
       clerkId: "external_organization",
       name: "External Organization",
+    });
+    await database.insert(schema.organizationEntitlements).values({
+      organizationId: "external_organization",
+      tier: "free",
+      status: "active",
     });
     await database.insert(schema.organizationMemberships).values({
       clerkId: "external_membership",
@@ -829,6 +868,46 @@ describe("Humans API", () => {
       body: JSON.stringify({ filters: { roles: [] } }),
     });
     expect(emptyStructured.status).toBe(422);
+    identity.sessions.set("external_session", {
+      memberId: "external_member",
+      organizationId: "external_organization",
+    });
+    const broadWebSearch = await app.request("/v1/profiles/search", {
+      headers: { authorization: "Bearer external_session" },
+    });
+    expect(broadWebSearch.status).toBe(400);
+
+    const exportAttempt = await app.request("/v1/contact-details/export", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer reveal_key",
+        "content-type": "application/json",
+        "X-Correlation-ID": "export-correlation",
+      },
+      body: JSON.stringify({
+        profileId: "external_profile",
+        fields: ["email"],
+      }),
+    });
+    expect(exportAttempt.status).toBe(405);
+    const [exportAudit] = await database
+      .select()
+      .from(schema.securityAuditEvents)
+      .where(
+        eq(schema.securityAuditEvents.correlationId, "export-correlation"),
+      );
+    expect(exportAudit).toMatchObject({
+      eventType: "attempted_export",
+      actorMemberId: "external_member",
+      organizationId: "external_organization",
+      apiKeyId: "reveal_key_id",
+      profileId: "external_profile",
+      source: "api",
+      result: "rejected",
+    });
+    expect(JSON.stringify(exportAudit)).not.toContain(
+      "external@company.example",
+    );
 
     const listResponse = await app.request("/v1/profiles?q=External", {
       headers: {
@@ -924,6 +1003,11 @@ describe("Humans API", () => {
     await database.insert(schema.organizations).values({
       clerkId: "empty_credit_organization",
       name: "Empty Credit Organization",
+    });
+    await database.insert(schema.organizationEntitlements).values({
+      organizationId: "empty_credit_organization",
+      tier: "free",
+      status: "active",
     });
     await database.insert(schema.organizationMemberships).values({
       clerkId: "empty_credit_membership",
@@ -1074,6 +1158,75 @@ describe("Humans API", () => {
     expect(naturalLimit.headers.get("ratelimit-limit")).toBe("10");
     expect(naturalLimit.headers.get("retry-after")).not.toBeNull();
 
+    const webNaturalApp = createApp(
+      () => makeDatabaseLayer(database),
+      identity,
+      async () => ({
+        language: "en",
+        filters: { query: "External" },
+      }),
+    );
+    for (let request = 0; request < 10; request += 1) {
+      const response = await webNaturalApp.request(
+        "/v1/profiles/search/interpret",
+        {
+          method: "POST",
+          headers: {
+            authorization: "Bearer external_session",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ query: "TypeScript builders" }),
+        },
+      );
+      expect(response.status).toBe(200);
+    }
+    const webNaturalLimit = await webNaturalApp.request(
+      "/v1/profiles/search/interpret",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer external_session",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ query: "TypeScript builders" }),
+      },
+    );
+    expect(webNaturalLimit.status).toBe(429);
+    expect(webNaturalLimit.headers.get("ratelimit-limit")).toBe("10");
+
+    const dimensionApp = createApp(() => makeDatabaseLayer(database), identity);
+    const dimensionKeys: string[] = [];
+    const distributedLimiter = {
+      limit: async ({ key }: { key: string }) => {
+        dimensionKeys.push(key);
+        return { success: true };
+      },
+    };
+    const rateBindings = {
+      MEMBER_RATE_LIMITER: distributedLimiter,
+      ORGANIZATION_RATE_LIMITER: distributedLimiter,
+      API_KEY_RATE_LIMITER: distributedLimiter,
+      IP_RATE_LIMITER: distributedLimiter,
+    } as Bindings;
+    const dimensionResponse = await dimensionApp.request(
+      "/v1/search/facets",
+      {
+        headers: {
+          authorization: "Bearer read_key",
+          "CF-Connecting-IP": "203.0.113.10",
+        },
+      },
+      rateBindings,
+    );
+    expect(dimensionResponse.status).toBe(200);
+    expect(dimensionKeys).toEqual(
+      expect.arrayContaining([
+        "member:external_member",
+        "organization:external_organization",
+        "api-key:read_key_id",
+        "ip:203.0.113.10",
+      ]),
+    );
     const rateLimitApp = createApp(() => makeDatabaseLayer(database), identity);
     for (let request = 0; request < 60; request += 1) {
       const response = await rateLimitApp.request("/v1/search/facets", {
@@ -1096,6 +1249,44 @@ describe("Humans API", () => {
       headers: { authorization: "Bearer read_key" },
     });
     expect(suppressed.status).toBe(404);
+
+    const operatorApp = createApp(() => makeDatabaseLayer(database), identity);
+    const suspended = await operatorApp.request(
+      "/v1/operator/suspensions",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer operator-secret",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          principalType: "organization",
+          principalId: "external_organization",
+          reason: "credential abuse",
+        }),
+      },
+      { OPERATOR_SECRET: "operator-secret" } as Bindings,
+    );
+    expect(suspended.status).toBe(201);
+    const deniedAfterSuspension = await operatorApp.request(
+      "/v1/search/facets",
+      { headers: { authorization: "Bearer read_key" } },
+      { OPERATOR_SECRET: "operator-secret" } as Bindings,
+    );
+    expect(deniedAfterSuspension.status).toBe(403);
+    const deniedInterpretation = await operatorApp.request(
+      "/v1/profiles/search/interpret",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer external_session",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ query: "TypeScript builders" }),
+      },
+      { OPERATOR_SECRET: "operator-secret" } as Bindings,
+    );
+    expect(deniedInterpretation.status).toBe(403);
   });
 });
 
@@ -1161,7 +1352,15 @@ class FakeIdentity implements IdentityBoundary {
 
   async authenticate(request: Request) {
     const token = request.headers.get("authorization")?.replace("Bearer ", "");
-    return token === undefined ? null : (this.sessions.get(token) ?? null);
+    const session =
+      token === undefined ? null : (this.sessions.get(token) ?? null);
+    return session
+      ? {
+          emailVerified: true,
+          botProtectionVerified: true,
+          ...session,
+        }
+      : null;
   }
 
   async authenticateApiKey(request: Request) {

@@ -6,6 +6,7 @@
     "DATABASE_URL",
     "HUMANS_ENV",
     "HUMANS_API_URL",
+    "HUMANS_PROXY_SECRET",
     "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY"
   ],
   "tasks": {

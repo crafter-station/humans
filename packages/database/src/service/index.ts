@@ -3,6 +3,16 @@ import { Effect, Layer } from "effect";
 
 import { runChargedProfileSearch } from "../charged-search";
 import {
+  AbuseControlError,
+  activateOrganizationEntitlement,
+  assertPrincipalActive,
+  recordSecurityActivity,
+  recordSecurityAudit,
+  revokeSuspension,
+  setPolarSubscriptionStatus,
+  suspendPrincipal,
+} from "../abuse-controls";
+import {
   ContactRevealError,
   getOrganizationContactRevealPolicy,
   listContactDetails,
@@ -31,6 +41,7 @@ import {
 import { makeClerkService } from "./clerk";
 import { Database } from "./context";
 import {
+  AbuseControlRejected,
   ContactRevealRejected,
   DatabaseUnavailable,
   SearchChargeRejected,
@@ -41,6 +52,7 @@ import type { DrizzleDatabase } from "./types";
 
 export { Database } from "./context";
 export {
+  AbuseControlRejected,
   ContactRevealRejected,
   DatabaseUnavailable,
   ProfileRejected,
@@ -131,7 +143,24 @@ export const makeDatabaseService = (
           : new DatabaseUnavailable({ cause }),
     }).pipe(Effect.withSpan(name));
 
+  const abuse = <A>(name: string, operation: () => Promise<A>) =>
+    Effect.tryPromise({
+      try: operation,
+      catch: (cause) =>
+        cause instanceof AbuseControlError
+          ? new AbuseControlRejected({ reason: cause.code })
+          : new DatabaseUnavailable({ cause }),
+    }).pipe(Effect.withSpan(name));
+
   return Database.of({
+    activateOrganizationEntitlement: (input) =>
+      abuse("Database.activateOrganizationEntitlement", () =>
+        activateOrganizationEntitlement(database, input),
+      ),
+    assertPrincipalActive: (input) =>
+      abuse("Database.assertPrincipalActive", () =>
+        assertPrincipalActive(database, input),
+      ),
     check,
     ...makeClerkService(database),
     ...makeProfileService(database),
@@ -173,6 +202,30 @@ export const makeDatabaseService = (
     purchaseContactReveal: (input) =>
       contact("Database.purchaseContactReveal", () =>
         purchaseContactReveal(database, input),
+      ),
+    recordSecurityActivity: (input) =>
+      abuse("Database.recordSecurityActivity", () =>
+        recordSecurityActivity(database, input),
+      ),
+    recordAttemptedExport: (input) =>
+      saved("Database.recordAttemptedExport", () =>
+        recordSecurityAudit(database, {
+          ...input,
+          eventType: "attempted_export",
+          result: "rejected",
+        }),
+      ),
+    revokeSuspension: (suspensionId) =>
+      saved("Database.revokeSuspension", () =>
+        revokeSuspension(database, suspensionId),
+      ),
+    setPolarSubscriptionStatus: (input) =>
+      saved("Database.setPolarSubscriptionStatus", () =>
+        setPolarSubscriptionStatus(database, input),
+      ),
+    suspendPrincipal: (input) =>
+      saved("Database.suspendPrincipal", () =>
+        suspendPrincipal(database, input),
       ),
     reportInvalidContactDetail: (input) =>
       contact("Database.reportInvalidContactDetail", () =>

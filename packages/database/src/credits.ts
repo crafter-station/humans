@@ -2,7 +2,11 @@ import { and, eq, sql } from "drizzle-orm";
 import type { NeonDatabase } from "drizzle-orm/neon-serverless";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
-import { creditAccounts, creditLedgerEntries } from "./schema";
+import {
+  creditAccounts,
+  creditLedgerEntries,
+  organizationEntitlements,
+} from "./schema";
 
 type Database =
   | NeonDatabase<typeof import("./schema")>
@@ -12,7 +16,10 @@ export type CreditEntryKind = "grant" | "charge" | "refund";
 
 export class CreditOperationError extends Error {
   constructor(
-    public readonly code: "insufficient_credits" | "idempotency_conflict",
+    public readonly code:
+      | "insufficient_credits"
+      | "idempotency_conflict"
+      | "credits_unavailable",
   ) {
     super(code);
   }
@@ -36,6 +43,8 @@ export const applyCreditEntry = (
     if (!Number.isSafeInteger(input.amount) || input.amount <= 0)
       throw new Error("invalid_credit_amount");
     const signedAmount = input.kind === "charge" ? -input.amount : input.amount;
+    if (signedAmount < 0)
+      await requireActiveEntitlement(tx, input.organizationId);
 
     const [inserted] = await tx
       .insert(creditLedgerEntries)
@@ -135,6 +144,7 @@ export const reserveSearchPage = (
   },
 ) =>
   database.transaction(async (tx) => {
+    await requireActiveEntitlement(tx, input.organizationId);
     const referenceId = `profile-search:${input.requestFingerprint}`;
     const [reservation] = await tx
       .insert(creditLedgerEntries)
@@ -203,6 +213,19 @@ export const reserveSearchPage = (
     if (!account) throw new CreditOperationError("insufficient_credits");
     return { applied: true };
   });
+
+const requireActiveEntitlement = async (
+  database: Parameters<Parameters<Database["transaction"]>[0]>[0],
+  organizationId: string,
+) => {
+  const [entitlement] = await database
+    .select({ status: organizationEntitlements.status })
+    .from(organizationEntitlements)
+    .where(eq(organizationEntitlements.organizationId, organizationId))
+    .limit(1);
+  if (entitlement?.status !== "active")
+    throw new CreditOperationError("credits_unavailable");
+};
 
 export const finalizeSearchPage = (
   database: Database,

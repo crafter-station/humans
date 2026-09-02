@@ -1,8 +1,12 @@
 import { auth } from "@clerk/nextjs/server";
 
 import { env } from "@/env";
+import {
+  protectedProxyHeaders,
+  protectedResponseHeaders,
+} from "../proxy-security";
 
-export async function POST() {
+export async function POST(request: Request) {
   const session = await auth();
   const token = await session.getToken();
   if (token === null) {
@@ -14,8 +18,12 @@ export async function POST() {
     );
   }
 
-  return fetch(`${env.HUMANS_API_URL}/v1/workspace`, {
+  const response = await fetch(`${env.HUMANS_API_URL}/v1/workspace`, {
     method: "POST",
-    headers: { authorization: `Bearer ${token}` },
+    headers: protectedProxyHeaders(request, token),
+  });
+  return new Response(response.body, {
+    status: response.status,
+    headers: protectedResponseHeaders(response),
   });
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAuth } from "@clerk/nextjs";
 
 type SearchResult = {
@@ -51,7 +51,8 @@ export function ProfileSearch({
   const [results, setResults] = useState<SearchResult[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [profile, setProfile] = useState<ProfileDetail | null>(null);
-  const [message, setMessage] = useState("Searching protected Profiles...");
+  const [message, setMessage] = useState("Add a filter to search Profiles.");
+  const searchRequestIds = useRef(new Map<string, string>());
   const [lists, setLists] = useState<SavedList[]>([]);
   const [interpretationError, setInterpretationError] = useState<string | null>(
     null,
@@ -125,8 +126,20 @@ export function ProfileSearch({
   };
 
   useEffect(() => {
+    if (requestKey === "") {
+      setResults([]);
+      setNextCursor(null);
+      setMessage("Add a filter to search Profiles.");
+      return;
+    }
     const controller = new AbortController();
-    void fetch(`/api/search?${requestKey}`, { signal: controller.signal })
+    const idempotencyKey =
+      searchRequestIds.current.get(requestKey) ?? crypto.randomUUID();
+    searchRequestIds.current.set(requestKey, idempotencyKey);
+    void fetch(`/api/search?${requestKey}`, {
+      signal: controller.signal,
+      headers: { "Idempotency-Key": idempotencyKey },
+    })
       .then(async (response) => {
         if (!response.ok) throw new Error("Search is temporarily unavailable");
         return (await response.json()) as {

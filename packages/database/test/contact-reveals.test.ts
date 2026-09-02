@@ -39,6 +39,11 @@ describe("Contact Reveals", () => {
   });
 
   beforeEach(async () => {
+    await database.delete(schema.securityActivity);
+    await database.delete(schema.securityAuditEvents);
+    await database.delete(schema.principalSuspensions);
+    await database.delete(schema.memberFreeCreditClaims);
+    await database.delete(schema.organizationEntitlements);
     await database.delete(schema.reenrichmentOutbox);
     await database.delete(schema.contactDetailInvalidations);
     await database.delete(schema.contactRevealRequests);
@@ -70,6 +75,10 @@ describe("Contact Reveals", () => {
     await database.insert(schema.organizations).values([
       { clerkId: "organization_one", name: "One" },
       { clerkId: "organization_two", name: "Two" },
+    ]);
+    await database.insert(schema.organizationEntitlements).values([
+      { organizationId: "organization_one", tier: "free", status: "active" },
+      { organizationId: "organization_two", tier: "free", status: "active" },
     ]);
     await database.insert(schema.organizationMemberships).values([
       {
@@ -255,6 +264,103 @@ describe("Contact Reveals", () => {
       "profile_one",
     );
     expect(isolated[0]).not.toHaveProperty("value");
+  });
+
+  it("caps free Organizations at ten daily Contact Reveals and redacts every audit event", async () => {
+    await applyCreditEntry(database, {
+      organizationId: "organization_one",
+      idempotencyKey: "grant:daily-cap",
+      kind: "grant",
+      amount: 100,
+    });
+    const profileRows = Array.from({ length: 11 }, (_, index) => ({
+      profileId: `daily_profile_${index}`,
+      name: `Daily Profile ${index}`,
+      githubAccountId: `daily_github_${index}`,
+      githubLogin: `daily-${index}`,
+      eligibilityBasis: "owned_repository" as const,
+      adultAttested: true,
+      searchable: true,
+      searchabilityReason: "member_opt_in" as const,
+    }));
+    await database.insert(schema.profiles).values(profileRows);
+    await database.insert(schema.profileObservations).values(
+      profileRows.map((profile, index) => ({
+        id: `daily_observation_${index}`,
+        profileId: profile.profileId,
+        field: "contact-detail",
+        value: {
+          type: "professional-email",
+          value: `daily-${index}@private.example`,
+        },
+        source: "tikhub",
+        sourceRecordId: `daily_source_${index}`,
+        pipelineVersion: "tikhub-v1",
+        confidence: 1,
+        collectedAt: new Date(),
+      })),
+    );
+
+    await purchaseContactReveal(database, {
+      memberId: "member_one",
+      organizationId: "organization_one",
+      profileId: "daily_profile_0",
+      type: "professional-email",
+      idempotencyKey: "daily_reveal_0",
+      apiKeyId: "key_one",
+      source: "api",
+      correlationId: "correlation_0",
+    });
+    for (let index = 0; index < 10; index += 1) {
+      await expect(
+        purchaseContactReveal(database, {
+          memberId: "member_one",
+          organizationId: "organization_one",
+          profileId: "daily_profile_0",
+          type: "professional-email",
+          idempotencyKey: `daily_reopen_${index}`,
+          source: "web",
+          correlationId: `correlation_reopen_${index}`,
+        }),
+      ).resolves.toMatchObject({ previouslyPurchased: true, price: 0 });
+    }
+    for (let index = 1; index < 10; index += 1) {
+      await purchaseContactReveal(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+        profileId: `daily_profile_${index}`,
+        type: "professional-email",
+        idempotencyKey: `daily_reveal_${index}`,
+        apiKeyId: "key_one",
+        source: "api",
+        correlationId: `correlation_${index}`,
+      });
+    }
+    await expect(
+      purchaseContactReveal(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+        profileId: "daily_profile_10",
+        type: "professional-email",
+        idempotencyKey: "daily_reveal_10",
+        source: "api",
+        correlationId: "correlation_10",
+      }),
+    ).rejects.toMatchObject({ code: "daily_limit" });
+
+    const audit = await database.select().from(schema.securityAuditEvents);
+    expect(audit).toHaveLength(21);
+    expect(
+      audit.find(({ correlationId }) => correlationId === "correlation_10"),
+    ).toMatchObject({
+      actorMemberId: "member_one",
+      organizationId: "organization_one",
+      profileId: "daily_profile_10",
+      source: "api",
+      correlationId: "correlation_10",
+      result: "daily_limit",
+    });
+    expect(JSON.stringify(audit)).not.toContain("@private.example");
   });
 
   it("rejects insufficient Credits without leaving a purchase or reservation", async () => {

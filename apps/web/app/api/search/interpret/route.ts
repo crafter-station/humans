@@ -1,6 +1,10 @@
 import { auth } from "@clerk/nextjs/server";
 
 import { env } from "@/env";
+import {
+  protectedProxyHeaders,
+  protectedResponseHeaders,
+} from "../../proxy-security";
 
 export async function POST(request: Request) {
   const session = await auth();
@@ -17,21 +21,15 @@ export async function POST(request: Request) {
     `${env.HUMANS_API_URL}/v1/profiles/search/interpret`,
     {
       method: "POST",
-      headers: {
-        authorization: `Bearer ${token}`,
+      headers: protectedProxyHeaders(request, token, {
         "content-type": "application/json",
-      },
+      }),
       body: await request.text(),
       cache: "no-store",
     },
   );
   return new Response(response.body, {
     status: response.status,
-    headers: {
-      "content-type":
-        response.headers.get("content-type") ?? "application/json",
-      "cache-control": "private, no-store",
-      "x-robots-tag": "noindex, nofollow",
-    },
+    headers: protectedResponseHeaders(response),
   });
 }

@@ -44,6 +44,11 @@ describe("Profile search", () => {
       clerkId: "organization_search",
       name: "Search",
     });
+    await database.insert(schema.organizationEntitlements).values({
+      organizationId: "organization_search",
+      tier: "free",
+      status: "active",
+    });
   });
 
   afterAll(async () => {

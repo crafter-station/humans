@@ -30,6 +30,11 @@ describe("Organization credit ledger", () => {
       clerkId: "organization_credits",
       name: "Credits",
     });
+    await database.insert(schema.organizationEntitlements).values({
+      organizationId: "organization_credits",
+      tier: "free",
+      status: "active",
+    });
   });
 
   afterAll(async () => {

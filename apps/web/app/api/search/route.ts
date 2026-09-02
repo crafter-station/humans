@@ -1,6 +1,10 @@
 import { auth } from "@clerk/nextjs/server";
 
 import { env } from "@/env";
+import {
+  protectedProxyHeaders,
+  protectedResponseHeaders,
+} from "../proxy-security";
 
 export async function GET(request: Request) {
   const session = await auth();
@@ -17,15 +21,16 @@ export async function GET(request: Request) {
   const url = new URL(request.url);
   const response = await fetch(
     `${env.HUMANS_API_URL}/v1/profiles/search?${url.searchParams}`,
-    { headers: { authorization: `Bearer ${token}` }, cache: "no-store" },
+    {
+      headers: protectedProxyHeaders(request, token, {
+        "Idempotency-Key":
+          request.headers.get("Idempotency-Key") ?? crypto.randomUUID(),
+      }),
+      cache: "no-store",
+    },
   );
   return new Response(response.body, {
     status: response.status,
-    headers: {
-      "content-type":
-        response.headers.get("content-type") ?? "application/json",
-      "cache-control": "private, no-store",
-      "x-robots-tag": "noindex, nofollow",
-    },
+    headers: protectedResponseHeaders(response),
   });
 }
