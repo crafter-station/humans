@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import repositoryPages from "./fixtures/repository-pages.json" with { type: "json" };
+
 import {
   GitHubProviderError,
   PIPELINE_VERSION,
@@ -27,6 +29,7 @@ const user = {
 };
 const repository = (id: number) => ({
   id,
+  ownerId: user.id,
   name: `repo-${id}`,
   description: null,
   fork: false,
@@ -305,9 +308,12 @@ describe("GitHub enrichment workflow", () => {
       })({ profileId: "profile-1", githubLogin: "ada", runId: "limited" }),
     ).rejects.toThrow("rate limited");
     expect(store.run).toMatchObject({
-      status: "failed",
+      status: "running",
+      currentStage: "repositories",
       completedStages: ["account"],
     });
+    expect(store.run?.finishedAt).toBeUndefined();
+    expect(store.observationsStaleAt).toBe("2026-09-01T00:00:00.000Z");
     expect(store.checkpoints.has("limited:account")).toBe(true);
     expect(
       retryOptionsForGitHubError(
@@ -327,6 +333,15 @@ describe("GitHub enrichment workflow", () => {
     expect(
       retryOptionsForGitHubError(new GitHubProviderError("busy", 503)),
     ).toBeUndefined();
+    expect(
+      retryOptionsForGitHubError(
+        new GitHubProviderError(
+          "slow down",
+          429,
+          new Date("2026-09-01T00:02:00.000Z"),
+        ),
+      ),
+    ).toEqual({ retryAt: new Date("2026-09-01T00:02:00.000Z") });
   });
 
   it("runs stages independently and preserves the first inaccessible time", async () => {
@@ -364,5 +379,43 @@ describe("GitHub enrichment workflow", () => {
       "2026-09-01T00:00:00.000Z",
     );
     expect(store.inaccessibleSince).toBe("2026-08-01T00:00:00.000Z");
+  });
+
+  it("retries a partial pagination failure without repeating completed stages", async () => {
+    const store = new MemoryStore();
+    const provider = makeProvider();
+    let secondPageAttempts = 0;
+    provider.getRecentlyActiveRepositories = vi.fn(async (_login, cursor) => {
+      const page = cursor ? repositoryPages.second : repositoryPages.first;
+      if (cursor && secondPageAttempts++ === 0)
+        throw new GitHubProviderError("temporary outage", 503);
+      return {
+        repositories: page.repositories.map(repository),
+        ...(cursor ? {} : { nextCursor: repositoryPages.first.nextCursor }),
+      };
+    });
+    const workflow = createGitHubEnrichmentWorkflow({
+      provider,
+      normalizer,
+      store,
+      now: fixedNow,
+    });
+    const input = {
+      profileId: "profile-1",
+      githubLogin: "ada",
+      runId: "partial-page",
+    };
+
+    await expect(workflow(input)).rejects.toThrow("temporary outage");
+    expect(store.run).toMatchObject({
+      status: "running",
+      currentStage: "repositories",
+      completedStages: ["account"],
+    });
+    await expect(workflow(input)).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    expect(provider.getUser).toHaveBeenCalledTimes(1);
+    expect(provider.getRecentlyActiveRepositories).toHaveBeenCalledTimes(4);
   });
 });

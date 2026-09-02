@@ -18,7 +18,8 @@ import {
 
 export const classifyGitHubError = (error: unknown) => {
   if (!(error instanceof GitHubProviderError)) return "fatal" as const;
-  if (error.status === 403 && error.retryAfter) return "rate-limit" as const;
+  if ((error.status === 403 || error.status === 429) && error.retryAfter)
+    return "rate-limit" as const;
   if (error.status === 429 || error.status >= 500) return "retry" as const;
   if (error.status === 404 || error.status === 410)
     return "inaccessible" as const;
@@ -131,23 +132,32 @@ export const createGitHubEnrichmentStages = (
   ) => {
     const classification = classifyGitHubError(error);
     const failedAt = now().toISOString();
-    if (classification === "inaccessible") {
+    if (error instanceof GitHubProviderError) {
       await dependencies.store.markGitHubObservationsStale(
         input.profileId,
         failedAt,
       );
+    }
+    if (classification === "inaccessible") {
       await dependencies.store.markGitHubInaccessibleIfUnset(
         input.profileId,
         failedAt,
       );
     }
+    const retrying =
+      classification === "retry" || classification === "rate-limit";
     const failedRun: EnrichmentRun = {
       ...run,
-      status: classification === "inaccessible" ? "stale" : "failed",
-      currentStage: null,
+      status:
+        classification === "inaccessible"
+          ? "stale"
+          : retrying
+            ? "running"
+            : "failed",
+      currentStage: retrying ? run.currentStage : null,
       error:
         error instanceof Error ? error.message : "Unknown enrichment failure",
-      finishedAt: failedAt,
+      finishedAt: retrying ? undefined : failedAt,
     };
     await dependencies.store.saveRun(failedRun);
     throw error;

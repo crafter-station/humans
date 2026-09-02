@@ -1,0 +1,9 @@
+{
+  "first": {
+    "repositories": [1, 2],
+    "nextCursor": "page-2"
+  },
+  "second": {
+    "repositories": [3]
+  }
+}

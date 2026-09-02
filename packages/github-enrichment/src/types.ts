@@ -22,6 +22,7 @@ export type GitHubUser = {
 
 export type Repository = {
   id: number;
+  ownerId: number;
   name: string;
   description: string | null;
   fork: boolean;
