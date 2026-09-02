@@ -49,6 +49,9 @@ class MemoryStore implements EnrichmentStore {
   inaccessibleSince?: string;
   observationsStaleAt?: string;
   failPersistenceOnce = false;
+  failPersistenceCheckpointOnce = false;
+  persistedRunIds = new Set<string>();
+  persistCalls = 0;
 
   async getRun(runId: string) {
     return this.run?.id === runId ? structuredClone(this.run) : undefined;
@@ -77,6 +80,10 @@ class MemoryStore implements EnrichmentStore {
     value: T,
     options?: { expiresAt?: string },
   ) {
+    if (stage === "persistence" && this.failPersistenceCheckpointOnce) {
+      this.failPersistenceCheckpointOnce = false;
+      throw new Error("checkpoint unavailable");
+    }
     this.checkpoints.set(`${runId}:${stage}`, structuredClone(value));
     if (options?.expiresAt)
       this.checkpointExpirations.set(`${runId}:${stage}`, options.expiresAt);
@@ -84,11 +91,14 @@ class MemoryStore implements EnrichmentStore {
   async getImmutableGitHubUserId() {
     return this.immutableId;
   }
-  async saveObservations(observations: Observation[]) {
+  async persistObservations(runId: string, observations: Observation[]) {
+    this.persistCalls += 1;
     if (this.failPersistenceOnce) {
       this.failPersistenceOnce = false;
       throw new Error("database unavailable");
     }
+    if (this.persistedRunIds.has(runId)) return;
+    this.persistedRunIds.add(runId);
     this.observations = observations;
     this.immutableId = (
       observations.find(({ kind }) => kind === "github-account")
@@ -417,5 +427,69 @@ describe("GitHub enrichment workflow", () => {
     });
     expect(provider.getUser).toHaveBeenCalledTimes(1);
     expect(provider.getRecentlyActiveRepositories).toHaveBeenCalledTimes(4);
+  });
+
+  it("keeps persistence idempotent when checkpointing fails after the write", async () => {
+    const store = new MemoryStore();
+    store.failPersistenceCheckpointOnce = true;
+    const workflow = createGitHubEnrichmentWorkflow({
+      provider: makeProvider(),
+      normalizer,
+      store,
+      now: fixedNow,
+    });
+    const input = {
+      profileId: "profile-1",
+      githubLogin: "ada",
+      runId: "atomic-persistence",
+    };
+
+    await expect(workflow(input)).rejects.toThrow("checkpoint unavailable");
+    await expect(workflow(input)).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    expect(store.persistCalls).toBe(2);
+    expect(store.persistedRunIds).toEqual(new Set([input.runId]));
+  });
+
+  it("makes retry exhaustion terminal and does not suppress for repository 404s", async () => {
+    const store = new MemoryStore();
+    store.inaccessibleSince = "2026-08-01T00:00:00.000Z";
+    const provider = makeProvider();
+    provider.getPinnedRepositories = vi.fn(async () => {
+      throw new GitHubProviderError("repository unavailable", 404);
+    });
+    const stages = createGitHubEnrichmentStages({
+      provider,
+      normalizer,
+      store,
+      now: fixedNow,
+    });
+    const input = {
+      profileId: "profile-1",
+      githubLogin: "ada",
+      runId: "repository-404",
+    };
+
+    await stages.account(input);
+    expect(store.inaccessibleSince).toBeUndefined();
+    await expect(stages.repositories(input)).rejects.toThrow(
+      "repository unavailable",
+    );
+    expect(store.run?.status).toBe("failed");
+    expect(store.inaccessibleSince).toBeUndefined();
+
+    store.run = {
+      ...store.run!,
+      status: "running",
+      currentStage: "repositories",
+    };
+    await stages.retryExhausted(input, new Error("retries exhausted"));
+    expect(store.run).toMatchObject({
+      status: "failed",
+      currentStage: null,
+      error: "retries exhausted",
+      finishedAt: "2026-09-01T00:00:00.000Z",
+    });
   });
 });

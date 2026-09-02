@@ -3,6 +3,7 @@ import {
   INACCESSIBLE_GRACE_PERIOD_DAYS,
   PIPELINE_VERSION,
   PROVIDER_SNAPSHOT_RETENTION_DAYS,
+  PermanentEnrichmentError,
   type EnrichmentRun,
   type EnrichmentStore,
   type EvidenceNormalizer,
@@ -40,6 +41,7 @@ const pageAll = async <T>(
 };
 
 const observationsFor = (
+  runId: string,
   profileId: string,
   evidence: GitHubEvidence,
   normalized: NormalizedEvidence,
@@ -53,6 +55,7 @@ const observationsFor = (
   return [
     {
       ...base,
+      sourceRecordId: `${runId}:account:${evidence.user.id}`,
       kind: "github-account",
       source: "github",
       confidence: 1,
@@ -60,6 +63,7 @@ const observationsFor = (
     },
     ...evidence.repositories.map((value) => ({
       ...base,
+      sourceRecordId: `${runId}:repository:${value.id}`,
       kind: "github-repository" as const,
       source: "github" as const,
       confidence: 1,
@@ -67,6 +71,7 @@ const observationsFor = (
     })),
     ...evidence.contributions.map((value) => ({
       ...base,
+      sourceRecordId: `${runId}:contribution:${value.repositoryId}:${value.kind}:${value.occurredAt}`,
       kind: "github-contribution" as const,
       source: "github" as const,
       confidence: 1,
@@ -74,6 +79,7 @@ const observationsFor = (
     })),
     {
       ...base,
+      sourceRecordId: `${runId}:normalization`,
       kind: "github-normalization",
       source: "github-ai-normalization",
       confidence: 0.8,
@@ -138,22 +144,22 @@ export const createGitHubEnrichmentStages = (
         failedAt,
       );
     }
-    if (classification === "inaccessible") {
+    const accountInaccessible =
+      classification === "inaccessible" && run.currentStage === "account";
+    if (accountInaccessible) {
       await dependencies.store.markGitHubInaccessibleIfUnset(
         input.profileId,
         failedAt,
       );
     }
     const retrying =
-      classification === "retry" || classification === "rate-limit";
+      classification === "retry" ||
+      classification === "rate-limit" ||
+      (!(error instanceof GitHubProviderError) &&
+        !(error instanceof PermanentEnrichmentError));
     const failedRun: EnrichmentRun = {
       ...run,
-      status:
-        classification === "inaccessible"
-          ? "stale"
-          : retrying
-            ? "running"
-            : "failed",
+      status: accountInaccessible ? "stale" : retrying ? "running" : "failed",
       currentStage: retrying ? run.currentStage : null,
       error:
         error instanceof Error ? error.message : "Unknown enrichment failure",
@@ -170,19 +176,23 @@ export const createGitHubEnrichmentStages = (
         run.id,
         "account",
       );
+      let fetched = false;
       if (!user) {
+        fetched = true;
         user = await dependencies.provider.getUser(input.githubLogin);
         const immutableId = await dependencies.store.getImmutableGitHubUserId(
           input.profileId,
         );
         if (immutableId !== undefined && immutableId !== user.id)
-          throw new Error(
+          throw new PermanentEnrichmentError(
             "GitHub login resolves to a different immutable user ID",
           );
+      }
+      await dependencies.store.clearGitHubInaccessible(input.profileId);
+      if (fetched)
         await dependencies.store.saveCheckpoint(run.id, "account", user, {
           expiresAt: snapshotExpiresAt(now()),
         });
-      }
       run = complete(run, "account");
       await dependencies.store.saveRun(run);
       return run;
@@ -198,7 +208,8 @@ export const createGitHubEnrichmentStages = (
         run.id,
         "account",
       );
-      if (!user) throw new Error("Account stage must complete first");
+      if (!user)
+        throw new PermanentEnrichmentError("Account stage must complete first");
       let repositoryEvidence = await dependencies.store.loadCheckpoint<{
         repositories: Repository[];
         contributions: GitHubEvidence["contributions"];
@@ -267,7 +278,9 @@ export const createGitHubEnrichmentStages = (
         contributions: GitHubEvidence["contributions"];
       }>(run.id, "repositories");
       if (!user || !repositoryEvidence)
-        throw new Error("Repository stage must complete first");
+        throw new PermanentEnrichmentError(
+          "Repository stage must complete first",
+        );
       let normalized =
         await dependencies.store.loadCheckpoint<NormalizedEvidence>(
           run.id,
@@ -280,7 +293,7 @@ export const createGitHubEnrichmentStages = (
         if (
           normalized.evidenceRepositoryIds.some((id) => !supportedIds.has(id))
         )
-          throw new Error(
+          throw new PermanentEnrichmentError(
             "AI normalization cited unsupported repository evidence",
           );
         await dependencies.store.saveCheckpoint(
@@ -319,16 +332,19 @@ export const createGitHubEnrichmentStages = (
             "normalization",
           );
         if (!user || !repositoryEvidence || !normalized)
-          throw new Error("Normalization stage must complete first");
-        await dependencies.store.saveObservations(
+          throw new PermanentEnrichmentError(
+            "Normalization stage must complete first",
+          );
+        await dependencies.store.persistObservations(
+          run.id,
           observationsFor(
+            run.id,
             input.profileId,
             { user, ...repositoryEvidence },
             normalized,
             now().toISOString(),
           ),
         );
-        await dependencies.store.clearGitHubInaccessible(input.profileId);
         await dependencies.store.saveCheckpoint(run.id, "persistence", true);
       }
       run = {
@@ -343,7 +359,29 @@ export const createGitHubEnrichmentStages = (
     }
   };
 
-  return { account, repositories, normalization, persistence };
+  const retryExhausted = async (
+    input: GitHubEnrichmentInput,
+    error: unknown,
+  ) => {
+    const run = await dependencies.store.getRun(input.runId);
+    if (!run || run.status !== "running") return;
+    await dependencies.store.saveRun({
+      ...run,
+      status: "failed",
+      currentStage: null,
+      error:
+        error instanceof Error ? error.message : "GitHub retries exhausted",
+      finishedAt: now().toISOString(),
+    });
+  };
+
+  return {
+    account,
+    repositories,
+    normalization,
+    persistence,
+    retryExhausted,
+  };
 };
 
 export const createGitHubEnrichmentWorkflow = (

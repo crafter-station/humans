@@ -5,6 +5,7 @@ import {
   type EnrichmentRun,
   type GitHubEnrichmentInput,
   type GitHubProviderError,
+  PermanentEnrichmentError,
 } from "./types.js";
 import { classifyGitHubError } from "./workflow.js";
 
@@ -29,12 +30,37 @@ export type GitHubEnrichmentStageHandlers = {
   repositories(input: GitHubEnrichmentInput): Promise<EnrichmentRun>;
   normalization(input: GitHubEnrichmentInput): Promise<EnrichmentRun>;
   persistence(input: GitHubEnrichmentInput): Promise<EnrichmentRun>;
+  retryExhausted(input: GitHubEnrichmentInput, error: unknown): Promise<void>;
 };
 
 /** Registers independently retryable stages and their thin durable orchestrator. */
 export const createGitHubEnrichmentTasks = (
   stages: GitHubEnrichmentStageHandlers,
 ) => {
+  const catchProviderError = async (
+    input: GitHubEnrichmentInput,
+    error: unknown,
+    attempt: number,
+  ) => {
+    const options = retryOptionsForGitHubError(error);
+    if (options?.skipRetrying || attempt >= retry.maxAttempts)
+      await stages.retryExhausted(input, error);
+    return options;
+  };
+  const catchStageError = async (
+    input: GitHubEnrichmentInput,
+    error: unknown,
+    attempt: number,
+  ) => {
+    const options =
+      error instanceof PermanentEnrichmentError
+        ? ({ skipRetrying: true } as const)
+        : undefined;
+    if (options?.skipRetrying || attempt >= retry.maxAttempts)
+      await stages.retryExhausted(input, error);
+    return options;
+  };
+
   const accountTask = task({
     id: "github-enrichment-account-v1",
     queue: {
@@ -42,7 +68,8 @@ export const createGitHubEnrichmentTasks = (
       concurrencyLimit: GITHUB_CONCURRENCY_LIMIT,
     },
     retry,
-    catchError: ({ error }) => retryOptionsForGitHubError(error),
+    catchError: ({ payload, error, ctx }) =>
+      catchProviderError(payload, error, ctx.attempt.number),
     run: stages.account,
   });
 
@@ -53,7 +80,8 @@ export const createGitHubEnrichmentTasks = (
       concurrencyLimit: GITHUB_CONCURRENCY_LIMIT,
     },
     retry,
-    catchError: ({ error }) => retryOptionsForGitHubError(error),
+    catchError: ({ payload, error, ctx }) =>
+      catchProviderError(payload, error, ctx.attempt.number),
     run: stages.repositories,
   });
 
@@ -61,6 +89,8 @@ export const createGitHubEnrichmentTasks = (
     id: "github-enrichment-normalization-v1",
     queue: { name: "github-normalization", concurrencyLimit: 2 },
     retry,
+    catchError: ({ payload, error, ctx }) =>
+      catchStageError(payload, error, ctx.attempt.number),
     run: stages.normalization,
   });
 
@@ -68,6 +98,8 @@ export const createGitHubEnrichmentTasks = (
     id: "github-enrichment-persistence-v1",
     queue: { name: "github-persistence", concurrencyLimit: 4 },
     retry,
+    catchError: ({ payload, error, ctx }) =>
+      catchStageError(payload, error, ctx.attempt.number),
     run: stages.persistence,
   });
 

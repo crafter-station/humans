@@ -54,6 +54,7 @@ export type NormalizedEvidence = {
 
 export type Observation = {
   profileId: string;
+  sourceRecordId: string;
   kind:
     | "github-account"
     | "github-repository"
@@ -93,6 +94,13 @@ export class GitHubProviderError extends Error {
   }
 }
 
+export class PermanentEnrichmentError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PermanentEnrichmentError";
+  }
+}
+
 export interface GitHubProvider {
   getUser(login: string): Promise<GitHubUser>;
   getPinnedRepositories(login: string): Promise<Repository[]>;
@@ -127,7 +135,11 @@ export interface EnrichmentStore {
     options?: { expiresAt?: string },
   ): Promise<void>;
   getImmutableGitHubUserId(profileId: string): Promise<number | undefined>;
-  saveObservations(observations: Observation[]): Promise<void>;
+  /** Atomically persists an idempotent run result keyed by runId. */
+  persistObservations(
+    runId: string,
+    observations: Observation[],
+  ): Promise<void>;
   markGitHubObservationsStale(profileId: string, at: string): Promise<void>;
   markGitHubInaccessibleIfUnset(profileId: string, at: string): Promise<string>;
   clearGitHubInaccessible(profileId: string): Promise<void>;
