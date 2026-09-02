@@ -310,8 +310,16 @@ export const clerkIdentityBoundary: IdentityBoundary = {
           query: `query($from: DateTime!) {
           viewer {
             contributionsCollection(from: $from) {
-              totalCommitContributions
-              totalPullRequestContributions
+              commitContributionsByRepository(maxRepositories: 100) {
+                repository { isPrivate }
+                contributions(first: 1) { nodes { occurredAt } }
+              }
+              pullRequestContributions(first: 100) {
+                nodes {
+                  occurredAt
+                  pullRequest { repository { isPrivate } }
+                }
+              }
             }
           }
         }`,
@@ -325,26 +333,50 @@ export const clerkIdentityBoundary: IdentityBoundary = {
             data?: {
               viewer: {
                 contributionsCollection: {
-                  totalCommitContributions: number;
-                  totalPullRequestContributions: number;
+                  commitContributionsByRepository: Array<{
+                    repository: { isPrivate: boolean };
+                    contributions: { nodes: Array<{ occurredAt: string }> };
+                  }>;
+                  pullRequestContributions: {
+                    nodes: Array<{
+                      occurredAt: string;
+                      pullRequest: { repository: { isPrivate: boolean } };
+                    }>;
+                  };
                 };
               };
             };
           }
         ).data?.viewer.contributionsCollection
       : undefined;
-    const hasPublicContribution =
-      contributions !== undefined &&
-      contributions.totalCommitContributions +
-        contributions.totalPullRequestContributions >
-        0;
+    const publicContributionDates = contributions
+      ? [
+          ...contributions.commitContributionsByRepository.flatMap(
+            ({ repository, contributions: repositoryContributions }) =>
+              repository.isPrivate
+                ? []
+                : repositoryContributions.nodes.map(
+                    (contribution) => contribution.occurredAt,
+                  ),
+          ),
+          ...contributions.pullRequestContributions.nodes.flatMap(
+            (contribution) =>
+              contribution.pullRequest.repository.isPrivate
+                ? []
+                : [contribution.occurredAt],
+          ),
+        ]
+      : [];
 
     return {
       accountId: String(account.id),
       login: account.login,
       accountType: account.type,
       ownsNonForkRepository,
-      contributedPubliclySince: hasPublicContribution ? cutoff : null,
+      contributedPubliclySince:
+        publicContributionDates.length > 0
+          ? new Date(publicContributionDates.sort().at(-1)!)
+          : null,
       ownershipVerified: true,
       knownMinor: member.privateMetadata.knownMinor === true,
     };
