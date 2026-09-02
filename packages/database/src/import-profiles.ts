@@ -3,6 +3,9 @@ import type { NeonDatabase } from "drizzle-orm/neon-serverless";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import {
+  importRowFailures,
+  importRuns,
+  operatorAuditEvents,
   profileObservations,
   profiles,
   professionalLinks,
@@ -71,8 +74,9 @@ export class ImportContractError extends Error {}
 export const importProfiles = async (
   database: ImportDatabase,
   csv: string,
-  options: { dryRun: boolean },
+  options: { dryRun: boolean; runId?: string },
 ): Promise<ImportProfilesReport> => {
+  const startedAt = Date.now();
   const parsed = parseContract(csv);
   const identities = [
     ...new Set(parsed.valid.map((row) => row.githubAccountId)),
@@ -198,27 +202,96 @@ export const importProfiles = async (
     };
   }
 
-  const appliedChanges = emptyChanges();
-  const rows: ImportProfilesReport["rows"] = [];
-  for (const row of parsed.valid) {
-    const result = await applyRow(database, row);
-    if (result.created) appliedChanges.createProfiles += 1;
-    if (result.observed) appliedChanges.addObservations += 1;
-    if (result.suppressed) {
-      appliedChanges.suppressedProfiles += 1;
-    }
-    if (!result.created && !result.observed) appliedChanges.noops += 1;
-    rows.push({
-      row: row.row,
-      outcome: result.created
-        ? "created"
-        : result.observed
-          ? "observed"
-          : "noop",
-      searchable: result.searchable,
+  const runId = options.runId ?? crypto.randomUUID();
+  await database
+    .insert(importRuns)
+    .values({
+      id: runId,
+      contractVersion,
+      status: "running",
+      validRows: parsed.valid.length,
+      invalidRows: parsed.invalid.length,
+      duplicateCandidates,
+      appliedChanges: emptyChanges(),
+    })
+    .onConflictDoUpdate({
+      target: importRuns.id,
+      set: {
+        status: "running",
+        appliedChanges: emptyChanges(),
+        finishedAt: null,
+      },
     });
+  if (parsed.invalid.length > 0) {
+    await database
+      .insert(importRowFailures)
+      .values(
+        parsed.invalid.map((failure) => ({
+          importId: runId,
+          row: failure.row,
+          errors: failure.errors,
+        })),
+      )
+      .onConflictDoNothing();
   }
 
+  const appliedChanges = emptyChanges();
+  const rows: ImportProfilesReport["rows"] = [];
+  try {
+    for (const row of parsed.valid) {
+      const result = await applyRow(database, row);
+      if (result.created) appliedChanges.createProfiles += 1;
+      if (result.observed) appliedChanges.addObservations += 1;
+      if (result.suppressed) {
+        appliedChanges.suppressedProfiles += 1;
+      }
+      if (!result.created && !result.observed) appliedChanges.noops += 1;
+      rows.push({
+        row: row.row,
+        outcome: result.created
+          ? "created"
+          : result.observed
+            ? "observed"
+            : "noop",
+        searchable: result.searchable,
+      });
+    }
+  } catch (error) {
+    await database
+      .update(importRuns)
+      .set({ status: "failed", appliedChanges, finishedAt: new Date() })
+      .where(eq(importRuns.id, runId));
+    console.error({
+      event: "profile_import",
+      importId: runId,
+      durationMs: Date.now() - startedAt,
+      attempts: 1,
+      costMetadata: null,
+      terminalClassification: "failed",
+      validRows: parsed.valid.length,
+      invalidRows: parsed.invalid.length,
+    });
+    throw error;
+  }
+
+  await database
+    .update(importRuns)
+    .set({
+      status: "succeeded",
+      appliedChanges,
+      finishedAt: new Date(),
+    })
+    .where(eq(importRuns.id, runId));
+  console.info({
+    event: "profile_import",
+    importId: runId,
+    durationMs: Date.now() - startedAt,
+    attempts: 1,
+    costMetadata: null,
+    terminalClassification: "succeeded",
+    validRows: parsed.valid.length,
+    invalidRows: parsed.invalid.length,
+  });
   return { ...reportBase, applied: true, appliedChanges, rows };
 };
 
@@ -229,21 +302,35 @@ export const suppressProviderIdentity = async (
     canonicalProviderId: string;
     reason: string;
   },
+  operator?: {
+    operatorId: string;
+    correlationId: string;
+  },
 ) => {
-  await database
-    .insert(suppressionRecords)
-    .values(suppression)
-    .onConflictDoUpdate({
-      target: [
-        suppressionRecords.canonicalProvider,
-        suppressionRecords.canonicalProviderId,
-      ],
-      set: { reason: suppression.reason },
-    });
-  await database
-    .update(profiles)
-    .set({ searchable: false, searchabilityReason: "operator_suppression" })
-    .where(eq(profiles.githubAccountId, suppression.canonicalProviderId));
+  await database.transaction(async (tx) => {
+    await tx
+      .insert(suppressionRecords)
+      .values(suppression)
+      .onConflictDoUpdate({
+        target: [
+          suppressionRecords.canonicalProvider,
+          suppressionRecords.canonicalProviderId,
+        ],
+        set: { reason: suppression.reason },
+      });
+    await tx
+      .update(profiles)
+      .set({ searchable: false, searchabilityReason: "operator_suppression" })
+      .where(eq(profiles.githubAccountId, suppression.canonicalProviderId));
+    if (operator)
+      await tx.insert(operatorAuditEvents).values({
+        ...operator,
+        reason: suppression.reason,
+        action: "profile.suppress",
+        subjectType: "github_account",
+        subjectId: suppression.canonicalProviderId,
+      });
+  });
 };
 
 const applyRow = (database: ImportDatabase, row: ImportRow) =>

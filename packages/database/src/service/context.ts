@@ -20,6 +20,17 @@ import type {
   setOrganizationContactRevealPolicy,
 } from "../contact-reveals";
 import type {
+  adjustCreditsAsOperator,
+  getOperatorOverview,
+  recordOperatorAudit,
+  retryReconciliationAsOperator,
+  revokeSuspensionAsOperator,
+  reviewClaimAsOperator,
+  reviewRequestAsOperator,
+  suppressProfileAsOperator,
+  suspendPrincipalAsOperator,
+} from "../operations";
+import type {
   getSearchableProfile,
   listProfileSearchFacets,
   searchProfiles,
@@ -68,6 +79,92 @@ export class Database extends Context.Service<
       memberId: string,
       organizationId: string,
     ) => Effect.Effect<Workspace, DatabaseUnavailable | WorkspaceForbidden>;
+    readonly getOperatorOverview: () => Effect.Effect<
+      Awaited<ReturnType<typeof getOperatorOverview>>,
+      DatabaseUnavailable
+    >;
+    readonly recordOperatorAudit: (
+      ...input: Parameters<typeof recordOperatorAudit> extends [
+        unknown,
+        ...infer Rest,
+      ]
+        ? Rest
+        : never
+    ) => Effect.Effect<void, DatabaseUnavailable>;
+    readonly reviewClaimAsOperator: (
+      ...input: Parameters<typeof reviewClaimAsOperator> extends [
+        unknown,
+        ...infer Rest,
+      ]
+        ? Rest
+        : never
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof reviewClaimAsOperator>>,
+      DatabaseUnavailable
+    >;
+    readonly reviewRequestAsOperator: (
+      ...input: Parameters<typeof reviewRequestAsOperator> extends [
+        unknown,
+        ...infer Rest,
+      ]
+        ? Rest
+        : never
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof reviewRequestAsOperator>>,
+      DatabaseUnavailable
+    >;
+    readonly suppressProfileAsOperator: (
+      ...input: Parameters<typeof suppressProfileAsOperator> extends [
+        unknown,
+        ...infer Rest,
+      ]
+        ? Rest
+        : never
+    ) => Effect.Effect<void, DatabaseUnavailable>;
+    readonly adjustCreditsAsOperator: (
+      ...input: Parameters<typeof adjustCreditsAsOperator> extends [
+        unknown,
+        ...infer Rest,
+      ]
+        ? Rest
+        : never
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof adjustCreditsAsOperator>>,
+      DatabaseUnavailable
+    >;
+    readonly retryReconciliationAsOperator: (
+      ...input: Parameters<typeof retryReconciliationAsOperator> extends [
+        unknown,
+        ...infer Rest,
+      ]
+        ? Rest
+        : never
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof retryReconciliationAsOperator>>,
+      DatabaseUnavailable
+    >;
+    readonly suspendPrincipalAsOperator: (
+      ...input: Parameters<typeof suspendPrincipalAsOperator> extends [
+        unknown,
+        ...infer Rest,
+      ]
+        ? Rest
+        : never
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof suspendPrincipalAsOperator>>,
+      DatabaseUnavailable
+    >;
+    readonly revokeSuspensionAsOperator: (
+      ...input: Parameters<typeof revokeSuspensionAsOperator> extends [
+        unknown,
+        ...infer Rest,
+      ]
+        ? Rest
+        : never
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof revokeSuspensionAsOperator>>,
+      DatabaseUnavailable
+    >;
     readonly provisionWorkspace: (
       memberId: string,
       provision: () => Promise<ProvisionedWorkspace>,

@@ -58,7 +58,10 @@ describe("Profile importer", () => {
       },
     });
 
-    const imported = await importProfiles(database, csv, { dryRun: false });
+    const imported = await importProfiles(database, csv, {
+      dryRun: false,
+      runId: "fixture-import",
+    });
     expect(imported).toMatchObject({
       applied: true,
       canonicalMatches: 0,
@@ -69,6 +72,13 @@ describe("Profile importer", () => {
         noops: 0,
       },
     });
+    await expect(database.select().from(schema.importRuns)).resolves.toEqual([
+      expect.objectContaining({
+        id: "fixture-import",
+        status: "succeeded",
+        validRows: 2,
+      }),
+    ]);
 
     const rerun = await importProfiles(database, csv, { dryRun: false });
     expect(rerun).toMatchObject({

@@ -232,7 +232,7 @@ export const suspendPrincipal = async (
 };
 
 export const revokeSuspension = async (
-  database: DrizzleDatabase,
+  database: DrizzleDatabase | Transaction,
   suspensionId: string,
 ) => {
   const [suspension] = await database

@@ -6,6 +6,7 @@ import {
   creditAccounts,
   creditLedgerEntries,
   organizationEntitlements,
+  operatorAuditEvents,
 } from "./schema";
 
 type Database =
@@ -37,6 +38,14 @@ export const applyCreditEntry = (
     kind: CreditEntryKind;
     amount: number;
     referenceId?: string;
+    operatorAudit?: {
+      operatorId: string;
+      correlationId: string;
+      reason?: string;
+      action: string;
+      subjectType: string;
+      subjectId: string;
+    };
   },
 ) =>
   database.transaction(async (tx) => {
@@ -104,6 +113,8 @@ export const applyCreditEntry = (
       )
       .returning();
     if (!account) throw new CreditOperationError("insufficient_credits");
+    if (input.operatorAudit)
+      await tx.insert(operatorAuditEvents).values(input.operatorAudit);
     return { entry: inserted, balance: account.balance, applied: true };
   });
 

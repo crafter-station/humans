@@ -1251,27 +1251,65 @@ describe("Humans API", () => {
     expect(suppressed.status).toBe(404);
 
     const operatorApp = createApp(() => makeDatabaseLayer(database), identity);
-    const suspended = await operatorApp.request(
+    identity.sessions.set("operator_session", {
+      memberId: "system_operator",
+      organizationId: null,
+      systemRole: "operator",
+    });
+    const suspended = await operatorApp.request("/v1/operator/suspensions", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer operator_session",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        principalType: "organization",
+        principalId: "external_organization",
+        reason: "credential abuse",
+      }),
+    });
+    expect(suspended.status).toBe(201);
+    identity.sessions.set("organization_admin_session", {
+      memberId: "external_member",
+      organizationId: "external_organization",
+    });
+    const operatorOverview = await operatorApp.request(
+      "/v1/operator/overview",
+      { headers: { authorization: "Bearer operator_session" } },
+    );
+    expect(operatorOverview.status).toBe(200);
+    await expect(operatorOverview.json()).resolves.toMatchObject({
+      imports: [],
+      claims: [],
+      abuse: {
+        suspensions: [
+          expect.objectContaining({ principalId: "external_organization" }),
+        ],
+      },
+    });
+    const adminOverview = await operatorApp.request("/v1/operator/overview", {
+      headers: { authorization: "Bearer organization_admin_session" },
+    });
+    expect(adminOverview.status).toBe(401);
+    const adminMutation = await operatorApp.request(
       "/v1/operator/suspensions",
       {
         method: "POST",
         headers: {
-          authorization: "Bearer operator-secret",
+          authorization: "Bearer organization_admin_session",
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          principalType: "organization",
-          principalId: "external_organization",
-          reason: "credential abuse",
+          principalType: "member",
+          principalId: "someone_else",
+          reason: "not authorized",
         }),
       },
-      { OPERATOR_SECRET: "operator-secret" } as Bindings,
     );
-    expect(suspended.status).toBe(201);
+    expect(adminMutation.status).toBe(401);
     const deniedAfterSuspension = await operatorApp.request(
       "/v1/search/facets",
       { headers: { authorization: "Bearer read_key" } },
-      { OPERATOR_SECRET: "operator-secret" } as Bindings,
     );
     expect(deniedAfterSuspension.status).toBe(403);
     const deniedInterpretation = await operatorApp.request(
@@ -1284,7 +1322,6 @@ describe("Humans API", () => {
         },
         body: JSON.stringify({ query: "TypeScript builders" }),
       },
-      { OPERATOR_SECRET: "operator-secret" } as Bindings,
     );
     expect(deniedInterpretation.status).toBe(403);
   });

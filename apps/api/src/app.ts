@@ -41,7 +41,6 @@ export type Bindings = {
   API_KEY_RATE_LIMITER?: RateLimitBinding;
   IP_RATE_LIMITER?: RateLimitBinding;
   NATURAL_SEARCH_RATE_LIMITER?: RateLimitBinding;
-  OPERATOR_SECRET?: string;
   POLAR_WEBHOOK_SECRET?: string;
   WEB_PROXY_SECRET?: string;
 };
@@ -364,6 +363,13 @@ const profileInput = z.object({
   searchable: z.boolean(),
 });
 
+const operatorDecision = z
+  .object({
+    approved: z.boolean(),
+    reason: z.string().trim().min(1).max(500),
+  })
+  .strict();
+
 const externalSearchOptions = {
   cursor: z.string().min(1).optional(),
   pageSize: z.number().int().min(1).max(100).optional(),
@@ -532,15 +538,187 @@ export const createApp = (
     }
   });
 
-  const requireOperator = (context: AppContext) =>
-    Boolean(
-      context.env.OPERATOR_SECRET &&
-        context.req.header("Authorization") ===
-          `Bearer ${context.env.OPERATOR_SECRET}`,
+  const operatorActor = async (context: AppContext) => {
+    const session = await identity.authenticate(context.req.raw, context.env);
+    return session?.systemRole === "operator"
+      ? { operatorId: session.memberId }
+      : null;
+  };
+
+  const operatorContext = (context: AppContext, operatorId: string) => ({
+    operatorId,
+    correlationId: correlationId(context),
+  });
+
+  app.get("/v1/operator/overview", async (context) => {
+    const operator = await operatorActor(context);
+    if (!operator) return unauthorized(context);
+    try {
+      const overview = await runDatabase(context, (database) =>
+        database.getOperatorOverview(),
+      );
+      privateResponse(context);
+      return context.json(overview, 200);
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+
+  app.post("/v1/operator/claims/:claimId/review", async (context) => {
+    const operator = await operatorActor(context);
+    if (!operator) return unauthorized(context);
+    const input = operatorDecision.safeParse(
+      await context.req.json().catch(() => null),
     );
+    if (!input.success) return validationError(context, "invalid_decision");
+    try {
+      const claim = await runDatabase(context, (database) =>
+        database.reviewClaimAsOperator(
+          context.req.param("claimId"),
+          input.data.approved,
+          {
+            ...operatorContext(context, operator.operatorId),
+            reason: input.data.reason,
+          },
+        ),
+      );
+      return context.json({ claim }, 200);
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+
+  app.post(
+    "/v1/operator/profile-requests/:requestId/review",
+    async (context) => {
+      const operator = await operatorActor(context);
+      if (!operator) return unauthorized(context);
+      const input = operatorDecision
+        .extend({
+          correction: z
+            .object({
+              name: z.string().trim().min(1).optional(),
+              currentCompany: z.string().trim().min(1).nullable().optional(),
+              githubAccountId: z.string().trim().min(1).optional(),
+              githubLogin: z.string().trim().min(1).optional(),
+            })
+            .optional(),
+        })
+        .safeParse(await context.req.json().catch(() => null));
+      if (!input.success) return validationError(context, "invalid_decision");
+      try {
+        const request = await runDatabase(context, (database) =>
+          database.reviewRequestAsOperator(
+            context.req.param("requestId"),
+            input.data.approved,
+            {
+              ...operatorContext(context, operator.operatorId),
+              reason: input.data.reason,
+              correction: input.data.correction,
+            },
+          ),
+        );
+        return context.json({ request }, 200);
+      } catch {
+        return serviceUnavailable(context);
+      }
+    },
+  );
+
+  app.post("/v1/operator/suppressions", async (context) => {
+    const operator = await operatorActor(context);
+    if (!operator) return unauthorized(context);
+    const input = z
+      .object({
+        canonicalProviderId: z.string().min(1),
+        reason: z.string().trim().min(1).max(500),
+      })
+      .strict()
+      .safeParse(await context.req.json().catch(() => null));
+    if (!input.success) return validationError(context, "invalid_suppression");
+    try {
+      await runDatabase(context, (database) =>
+        database.suppressProfileAsOperator(
+          input.data,
+          operatorContext(context, operator.operatorId),
+        ),
+      );
+      return context.json({ suppressed: true }, 201);
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+
+  app.post("/v1/operator/credit-adjustments", async (context) => {
+    const operator = await operatorActor(context);
+    if (!operator) return unauthorized(context);
+    const input = z
+      .object({
+        organizationId: z.string().min(1),
+        amount: z
+          .number()
+          .int()
+          .refine((amount) => amount !== 0),
+        idempotencyKey: z.string().min(1).max(200),
+        reason: z.string().trim().min(1).max(500),
+      })
+      .strict()
+      .safeParse(await context.req.json().catch(() => null));
+    if (!input.success) return validationError(context, "invalid_adjustment");
+    try {
+      const { reason, ...adjustment } = input.data;
+      const result = await runDatabase(context, (database) =>
+        database.adjustCreditsAsOperator(adjustment, {
+          ...operatorContext(context, operator.operatorId),
+          reason,
+        }),
+      );
+      return context.json(result, 200);
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+
+  app.post(
+    "/v1/operator/reconciliations/:reconciliationId/retry",
+    async (context) => {
+      const operator = await operatorActor(context);
+      if (!operator) return unauthorized(context);
+      const input = z
+        .object({ reason: z.string().trim().min(1).max(500) })
+        .strict()
+        .safeParse(await context.req.json().catch(() => null));
+      if (!input.success) return validationError(context, "invalid_retry");
+      try {
+        const reconciliation = await runDatabase(context, (database) =>
+          database.retryReconciliationAsOperator(
+            context.req.param("reconciliationId"),
+            {
+              ...operatorContext(context, operator.operatorId),
+              reason: input.data.reason,
+            },
+          ),
+        );
+        return reconciliation
+          ? context.json({ reconciliation }, 200)
+          : context.json(
+              {
+                error: {
+                  code: "not_found",
+                  message: "Reconciliation was not found",
+                },
+              },
+              404,
+            );
+      } catch {
+        return serviceUnavailable(context);
+      }
+    },
+  );
 
   app.post("/v1/operator/suspensions", async (context) => {
-    if (!requireOperator(context)) return unauthorized(context);
+    const operator = await operatorActor(context);
+    if (!operator) return unauthorized(context);
     const input = z
       .object({
         principalType: z.enum(["member", "organization", "api_key"]),
@@ -552,10 +730,16 @@ export const createApp = (
     if (!input.success) return validationError(context, "invalid_suspension");
     try {
       const suspension = await runDatabase(context, (database) =>
-        database.suspendPrincipal({
-          ...input.data,
-          suspendedBy: "operator",
-        }),
+        database.suspendPrincipalAsOperator(
+          {
+            ...input.data,
+            suspendedBy: operator.operatorId,
+          },
+          {
+            ...operatorContext(context, operator.operatorId),
+            reason: input.data.reason,
+          },
+        ),
       );
       if (input.data.principalType === "member")
         await identity.revokeMemberSessions?.(
@@ -574,10 +758,14 @@ export const createApp = (
   });
 
   app.delete("/v1/operator/suspensions/:suspensionId", async (context) => {
-    if (!requireOperator(context)) return unauthorized(context);
+    const operator = await operatorActor(context);
+    if (!operator) return unauthorized(context);
     try {
       const suspension = await runDatabase(context, (database) =>
-        database.revokeSuspension(context.req.param("suspensionId")),
+        database.revokeSuspensionAsOperator(
+          context.req.param("suspensionId"),
+          operatorContext(context, operator.operatorId),
+        ),
       );
       return suspension
         ? context.json({ suspension }, 200)
@@ -595,8 +783,17 @@ export const createApp = (
   app.post(
     "/v1/operator/members/:memberId/revoke-sessions",
     async (context) => {
-      if (!requireOperator(context)) return unauthorized(context);
+      const operator = await operatorActor(context);
+      if (!operator) return unauthorized(context);
       if (!identity.revokeMemberSessions) return serviceUnavailable(context);
+      await runDatabase(context, (database) =>
+        database.recordOperatorAudit(
+          operatorContext(context, operator.operatorId),
+          "member.sessions_revoke_requested",
+          "member",
+          context.req.param("memberId"),
+        ),
+      );
       await identity.revokeMemberSessions(
         context.req.param("memberId"),
         context.env,
@@ -608,9 +805,18 @@ export const createApp = (
   app.post(
     "/v1/operator/organizations/:organizationId/revoke-keys",
     async (context) => {
-      if (!requireOperator(context)) return unauthorized(context);
+      const operator = await operatorActor(context);
+      if (!operator) return unauthorized(context);
       if (!identity.revokeAllOrganizationApiKeys)
         return serviceUnavailable(context);
+      await runDatabase(context, (database) =>
+        database.recordOperatorAudit(
+          operatorContext(context, operator.operatorId),
+          "organization.keys_revoke_requested",
+          "organization",
+          context.req.param("organizationId"),
+        ),
+      );
       await identity.revokeAllOrganizationApiKeys(
         context.req.param("organizationId"),
         context.env,

@@ -106,6 +106,7 @@ export type GitHubEnrichmentDependencies = {
   normalizer: EvidenceNormalizer;
   store: EnrichmentStore;
   now?: () => Date;
+  log?: (event: Record<string, unknown>) => void;
 };
 
 const snapshotExpiresAt = (now: Date) =>
@@ -117,6 +118,28 @@ export const createGitHubEnrichmentStages = (
   dependencies: GitHubEnrichmentDependencies,
 ) => {
   const now = dependencies.now ?? (() => new Date());
+  const log = dependencies.log ?? console.info;
+  const logRun = (
+    input: GitHubEnrichmentInput,
+    run: EnrichmentRun,
+    terminalClassification: string,
+    finishedAt: string,
+  ) =>
+    log({
+      event: "enrichment_run",
+      profileId: input.profileId,
+      runId: input.runId,
+      provider: "github",
+      stage: run.currentStage,
+      durationMs: Math.max(
+        0,
+        new Date(finishedAt).getTime() - new Date(run.startedAt).getTime(),
+      ),
+      attempts: run.completedStages.length + 1,
+      costMetadata: null,
+      pipelineVersion: PIPELINE_VERSION,
+      terminalClassification,
+    });
 
   const getRun = async (input: GitHubEnrichmentInput, stage: Stage) => {
     let run = await dependencies.store.getOrCreateRun(
@@ -171,6 +194,7 @@ export const createGitHubEnrichmentStages = (
       finishedAt: retrying ? undefined : failedAt,
     };
     await dependencies.store.saveRun(failedRun);
+    logRun(input, run, classification, failedAt);
     throw error;
   };
 
@@ -376,12 +400,14 @@ export const createGitHubEnrichmentStages = (
         );
         await dependencies.store.saveCheckpoint(run.id, "persistence", true);
       }
+      const finishedAt = now().toISOString();
       run = {
         ...complete(run, "persistence"),
         status: "succeeded",
-        finishedAt: now().toISOString(),
+        finishedAt,
       };
       await dependencies.store.saveRun(run);
+      logRun(input, run, "succeeded", finishedAt);
       return run;
     } catch (error) {
       return fail(input, run, error);
@@ -394,14 +420,16 @@ export const createGitHubEnrichmentStages = (
   ) => {
     const run = await dependencies.store.getRun(input.runId);
     if (!run || run.status !== "running") return;
+    const finishedAt = now().toISOString();
     await dependencies.store.saveRun({
       ...run,
       status: "failed",
       currentStage: null,
       error:
         error instanceof Error ? error.message : "GitHub retries exhausted",
-      finishedAt: now().toISOString(),
+      finishedAt,
     });
+    logRun(input, run, "retries_exhausted", finishedAt);
   };
 
   return {

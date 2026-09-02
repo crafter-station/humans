@@ -3,6 +3,7 @@ export * from "./contact-details";
 export * from "./contact-reveals";
 export * from "./credits";
 export * from "./identity";
+export * from "./operations";
 export * from "./profile-observations";
 export * from "./profiles";
 export * from "./saved-lists";

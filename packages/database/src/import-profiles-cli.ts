@@ -48,11 +48,24 @@ const main = async () => {
       }
     }
 
-    const report = await importProfiles(database, csv, { dryRun: false });
+    const report = await importProfiles(database, csv, {
+      dryRun: false,
+      runId: `csv:${await fileDigest(csv)}`,
+    });
     console.log(JSON.stringify(report, null, 2));
   } finally {
     await pool.end();
   }
+};
+
+const fileDigest = async (value: string) => {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
 };
 
 const parseArguments = (arguments_: string[]) => {

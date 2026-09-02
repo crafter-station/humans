@@ -1,4 +1,11 @@
-import { jsonb, pgTable, real, text, timestamp, unique } from "drizzle-orm/pg-core";
+import {
+  jsonb,
+  pgTable,
+  real,
+  text,
+  timestamp,
+  unique,
+} from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
 import { profiles } from "./profiles";
@@ -21,9 +28,7 @@ export const memberStatements = pgTable("member_statements", {
 export const profileObservations = pgTable(
   "profile_observations",
   {
-    id: text("id")
-      .primaryKey()
-      .default(sql`gen_random_uuid()::text`),
+    id: text("id").primaryKey().default(sql`gen_random_uuid()::text`),
     profileId: text("profile_id")
       .notNull()
       .references(() => profiles.profileId),
@@ -36,6 +41,7 @@ export const profileObservations = pgTable(
     collectedAt: timestamp("collected_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
+    staleAt: timestamp("stale_at", { withTimezone: true }),
   },
   (table) => [
     unique("profile_observations_source_record_field_unique").on(

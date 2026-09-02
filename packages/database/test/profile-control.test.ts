@@ -7,6 +7,7 @@ import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { importProfiles } from "../src/import-profiles";
+import { getOperatorOverview, reviewClaimAsOperator } from "../src/operations";
 import {
   editControlledProfile,
   findClaimCandidates,
@@ -304,5 +305,69 @@ describe("Profile control", () => {
       searchable: true,
       searchabilityReason: "member_opt_in",
     });
+  });
+
+  it("records an auditable Operator claim decision", async () => {
+    await createMember("member-operator-review");
+    const profile = await createImportedProfile("509");
+    const claim = await requestProfileClaim(database, {
+      profileId: profile.profileId,
+      memberId: "member-operator-review",
+      oauthGithubAccountId: "different-account",
+    });
+
+    await reviewClaimAsOperator(database, claim.id, false, {
+      operatorId: "operator-one",
+      correlationId: "correlation-one",
+      reason: "Identity evidence did not match",
+    });
+
+    const overview = await getOperatorOverview(database);
+    expect(overview.claims).not.toContainEqual(
+      expect.objectContaining({ id: claim.id }),
+    );
+    expect(overview.auditTrail).toContainEqual(
+      expect.objectContaining({
+        operatorId: "operator-one",
+        action: "claim.reject",
+        subjectId: claim.id,
+        reason: "Identity evidence did not match",
+        correlationId: "correlation-one",
+      }),
+    );
+  });
+
+  it("applies an Operator-reviewed correction and restores Searchability", async () => {
+    const profile = await createImportedProfile("510", "old-login");
+    const request = await submitPublicProfileRequest(database, {
+      profileId: profile.profileId,
+      kind: "correction",
+      requesterEmail: "correct-me@example.com",
+      details: "My GitHub login and company changed",
+    });
+
+    await reviewProfileRequest(database, request.id, true, {
+      operatorId: "operator-two",
+      correlationId: "correlation-two",
+      reason: "Verified against the immutable GitHub account",
+      correction: {
+        githubLogin: "correct-login",
+        currentCompany: "Correct Company",
+      },
+    });
+
+    await expect(
+      database
+        .select()
+        .from(schema.profiles)
+        .where(eq(schema.profiles.profileId, profile.profileId)),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        githubLogin: "correct-login",
+        currentCompany: "Correct Company",
+        searchable: true,
+        searchabilityReason: "approved_import",
+      }),
+    ]);
   });
 });

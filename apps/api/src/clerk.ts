@@ -13,6 +13,7 @@ import type { Bindings } from "./app";
 export type SessionIdentity = {
   memberId: string;
   organizationId: string | null;
+  systemRole?: "operator";
   emailVerified?: boolean;
   botProtectionVerified?: boolean;
 };
@@ -136,6 +137,10 @@ export const clerkIdentityBoundary: IdentityBoundary = {
     return {
       memberId: auth.userId,
       organizationId: auth.orgId ?? null,
+      systemRole:
+        member.publicMetadata.humansRole === "operator"
+          ? "operator"
+          : undefined,
       emailVerified: primaryEmail?.verification?.status === "verified",
       // A completed Clerk signup proves the configured protection flow passed.
       botProtectionVerified: bindings.CLERK_BOT_PROTECTION_ENABLED === "true",

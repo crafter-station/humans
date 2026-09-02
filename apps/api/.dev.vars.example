@@ -13,5 +13,4 @@ CLERK_BOT_PROTECTION_ENABLED=true
 
 # Optional locally; required with a deployed web proxy to preserve client IP isolation.
 WEB_PROXY_SECRET=replace-with-the-web-shared-random-secret
-# OPERATOR_SECRET=replace-with-a-dedicated-operator-secret
 # POLAR_WEBHOOK_SECRET=replace-with-the-polar-webhook-secret

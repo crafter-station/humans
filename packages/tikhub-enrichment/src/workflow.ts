@@ -186,8 +186,31 @@ export const createTikHubEnrichmentStages = (dependencies: {
   provider: TikHubProvider;
   store: TikHubStore;
   now?: () => Date;
+  log?: (event: Record<string, unknown>) => void;
 }) => {
   const now = dependencies.now ?? (() => new Date());
+  const log = dependencies.log ?? console.info;
+  const logRun = (
+    input: TikHubEnrichmentInput,
+    run: TikHubRun,
+    terminalClassification: string,
+    finishedAt: string,
+  ) =>
+    log({
+      event: "enrichment_run",
+      profileId: input.profileId,
+      runId: input.runId,
+      provider: "tikhub",
+      stage: run.currentStage,
+      durationMs: Math.max(
+        0,
+        new Date(finishedAt).getTime() - new Date(run.startedAt).getTime(),
+      ),
+      attempts: run.completedStages.length + 1,
+      costMetadata: null,
+      pipelineVersion: TIKHUB_PIPELINE_VERSION,
+      terminalClassification,
+    });
   const getRun = async (input: TikHubEnrichmentInput, stage: TikHubStage) => {
     let run = await dependencies.store.getOrCreateRun(
       input.profileId,
@@ -216,7 +239,8 @@ export const createTikHubEnrichmentStages = (dependencies: {
         input.profileId,
         failedAt,
       );
-    const retrying = classifyTikHubError(error) !== "fatal";
+    const classification = classifyTikHubError(error);
+    const retrying = classification !== "fatal";
     await dependencies.store.saveRun({
       ...run,
       status: retrying ? "running" : "failed",
@@ -227,6 +251,7 @@ export const createTikHubEnrichmentStages = (dependencies: {
           : "Unknown TikHub enrichment failure",
       finishedAt: retrying ? undefined : failedAt,
     });
+    logRun(input, run, classification, failedAt);
     throw error;
   };
   const fetch = async (input: TikHubEnrichmentInput) => {
@@ -309,12 +334,14 @@ export const createTikHubEnrichmentStages = (dependencies: {
         );
         await dependencies.store.saveCheckpoint(run.id, "persistence", true);
       }
+      const finishedAt = now().toISOString();
       run = {
         ...complete(run, "persistence"),
         status: "succeeded",
-        finishedAt: now().toISOString(),
+        finishedAt,
       };
       await dependencies.store.saveRun(run);
+      logRun(input, run, "succeeded", finishedAt);
       return run;
     } catch (error) {
       return fail(input, run, error);
@@ -326,14 +353,16 @@ export const createTikHubEnrichmentStages = (dependencies: {
   ) => {
     const run = await dependencies.store.getRun(input.runId);
     if (!run || run.status !== "running") return;
+    const finishedAt = now().toISOString();
     await dependencies.store.saveRun({
       ...run,
       status: "failed",
       currentStage: null,
       error:
         error instanceof Error ? error.message : "TikHub retries exhausted",
-      finishedAt: now().toISOString(),
+      finishedAt,
     });
+    logRun(input, run, "retries_exhausted", finishedAt);
   };
   return { fetch, normalization, persistence, retryExhausted };
 };

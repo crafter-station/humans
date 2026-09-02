@@ -11,6 +11,7 @@
     "./contact-reveals": "./src/contact-reveals.ts",
     "./charged-search": "./src/charged-search.ts",
     "./abuse-controls": "./src/abuse-controls.ts",
+    "./operations": "./src/operations.ts",
     "./neon": "./src/neon.ts",
     "./search-profiles": "./src/search-profiles.ts",
     "./saved-lists": "./src/saved-lists.ts",

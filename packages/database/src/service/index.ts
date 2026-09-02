@@ -23,6 +23,17 @@ import {
 } from "../contact-reveals";
 import { CreditOperationError } from "../credits";
 import {
+  adjustCreditsAsOperator,
+  getOperatorOverview,
+  recordOperatorAudit,
+  retryReconciliationAsOperator,
+  revokeSuspensionAsOperator,
+  reviewClaimAsOperator,
+  reviewRequestAsOperator,
+  suppressProfileAsOperator,
+  suspendPrincipalAsOperator,
+} from "../operations";
+import {
   getSearchableProfile,
   InvalidSearchCursor,
   listProfileSearchFacets,
@@ -183,6 +194,14 @@ export const makeDatabaseService = (
         deleteSavedList(database, memberId, organizationId, listId),
       ),
     getSearchableProfile: getSearchResult,
+    getOperatorOverview: () =>
+      saved("Database.getOperatorOverview", () =>
+        getOperatorOverview(database),
+      ),
+    recordOperatorAudit: (context, action, subjectType, subjectId) =>
+      saved("Database.recordOperatorAudit", () =>
+        recordOperatorAudit(database, context, action, subjectType, subjectId),
+      ),
     getOrganizationContactRevealPolicy: (memberId, organizationId) =>
       contact("Database.getOrganizationContactRevealPolicy", () =>
         getOrganizationContactRevealPolicy(database, memberId, organizationId),
@@ -202,6 +221,34 @@ export const makeDatabaseService = (
     purchaseContactReveal: (input) =>
       contact("Database.purchaseContactReveal", () =>
         purchaseContactReveal(database, input),
+      ),
+    reviewClaimAsOperator: (claimId, approved, context) =>
+      saved("Database.reviewClaimAsOperator", () =>
+        reviewClaimAsOperator(database, claimId, approved, context),
+      ),
+    reviewRequestAsOperator: (requestId, confirmed, context) =>
+      saved("Database.reviewRequestAsOperator", () =>
+        reviewRequestAsOperator(database, requestId, confirmed, context),
+      ),
+    suppressProfileAsOperator: (input, context) =>
+      saved("Database.suppressProfileAsOperator", () =>
+        suppressProfileAsOperator(database, input, context),
+      ),
+    adjustCreditsAsOperator: (input, context) =>
+      saved("Database.adjustCreditsAsOperator", () =>
+        adjustCreditsAsOperator(database, input, context),
+      ),
+    retryReconciliationAsOperator: (reconciliationId, context) =>
+      saved("Database.retryReconciliationAsOperator", () =>
+        retryReconciliationAsOperator(database, reconciliationId, context),
+      ),
+    suspendPrincipalAsOperator: (input, context) =>
+      saved("Database.suspendPrincipalAsOperator", () =>
+        suspendPrincipalAsOperator(database, input, context),
+      ),
+    revokeSuspensionAsOperator: (suspensionId, context) =>
+      saved("Database.revokeSuspensionAsOperator", () =>
+        revokeSuspensionAsOperator(database, suspensionId, context),
       ),
     recordSecurityActivity: (input) =>
       abuse("Database.recordSecurityActivity", () =>

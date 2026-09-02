@@ -4,6 +4,7 @@ import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import {
   memberStatements,
+  operatorAuditEvents,
   profileClaims,
   profileObservations,
   profileRequests,
@@ -118,6 +119,11 @@ export const reviewProfileClaim = (
   database: Database,
   claimId: string,
   approved: boolean,
+  operator?: {
+    operatorId: string;
+    correlationId: string;
+    reason?: string;
+  },
 ) =>
   database.transaction(async (tx) => {
     const [claim] = await tx
@@ -148,6 +154,13 @@ export const reviewProfileClaim = (
       })
       .where(eq(profileClaims.id, claimId))
       .returning();
+    if (operator)
+      await tx.insert(operatorAuditEvents).values({
+        ...operator,
+        action: approved ? "claim.approve" : "claim.reject",
+        subjectType: "profile_claim",
+        subjectId: claimId,
+      });
     return reviewed!;
   });
 
@@ -335,6 +348,17 @@ export const reviewProfileRequest = (
   database: Database,
   requestId: string,
   confirmed: boolean,
+  operator?: {
+    operatorId: string;
+    correlationId: string;
+    reason?: string;
+    correction?: {
+      name?: string;
+      currentCompany?: string | null;
+      githubAccountId?: string;
+      githubLogin?: string;
+    };
+  },
 ) =>
   database.transaction(async (tx) => {
     const [request] = await tx
@@ -383,6 +407,18 @@ export const reviewProfileRequest = (
       await tx
         .delete(profileClaims)
         .where(eq(profileClaims.profileId, profile.profileId));
+    } else if (confirmed && request.kind === "correction") {
+      if (!operator?.correction)
+        throw new Error("confirmed_correction_requires_changes");
+      await tx
+        .update(profiles)
+        .set({
+          ...operator.correction,
+          searchable: request.previousSearchable,
+          searchabilityReason: request.previousSearchabilityReason,
+          updatedAt: new Date(),
+        })
+        .where(eq(profiles.profileId, profile.profileId));
     } else if (!confirmed) {
       await tx
         .update(profiles)
@@ -401,5 +437,16 @@ export const reviewProfileRequest = (
       })
       .where(eq(profileRequests.id, requestId))
       .returning();
+    if (operator) {
+      const { correction: _, ...auditContext } = operator;
+      await tx.insert(operatorAuditEvents).values({
+        ...auditContext,
+        action: confirmed
+          ? "profile_request.confirm"
+          : "profile_request.reject",
+        subjectType: "profile_request",
+        subjectId: requestId,
+      });
+    }
     return reviewed!;
   });
