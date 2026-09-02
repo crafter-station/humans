@@ -6,7 +6,10 @@ import {
   type ProvisionedWorkspace,
 } from "@humans/database";
 import * as schema from "@humans/database/schema";
-import { applyCreditEntry } from "@humans/database/credits";
+import {
+  applyCreditEntry,
+  getCreditBalance,
+} from "@humans/database/credits";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { fileURLToPath } from "node:url";
@@ -17,6 +20,9 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
 import {
   clerkIdentityBoundary,
+  type ApiKeyIdentity,
+  type ApiScope,
+  type OrganizationApiKey,
   type IdentityBoundary,
   type SessionIdentity,
 } from "../src/clerk";
@@ -68,10 +74,30 @@ describe("Humans API", () => {
     expect(openApiResponse.status).toBe(200);
     const openApi = await openApiResponse.json();
     expect(openApi).toMatchObject({
-      info: { title: "Humans API" },
-      paths: { "/health": {} },
+      info: { title: "Humans API", version: "1.0.0" },
+      paths: {
+        "/health": {},
+        "/v1/profiles": { get: { operationId: "listProfiles" } },
+        "/v1/profiles/{profileId}": {
+          get: { operationId: "getProfile" },
+        },
+        "/v1/search/facets": {
+          get: { operationId: "listSearchFacets" },
+        },
+        "/v1/search": { post: { operationId: "searchProfiles" } },
+        "/v1/profiles/{profileId}/reveal-email": {
+          post: { operationId: "revealProfileEmail" },
+        },
+        "/v1/profiles/{profileId}/reveal-phone": {
+          post: { operationId: "revealProfilePhone" },
+        },
+      },
     });
-    expect(JSON.stringify(openApi)).not.toContain("Profile");
+    expect(openApi.components.securitySchemes).toHaveProperty(
+      "OrganizationApiKey",
+    );
+    expect(JSON.stringify(openApi)).not.toContain("private@company.example");
+    expect(JSON.stringify(openApi)).not.toContain("secret_key_1");
 
     const documentationResponse = await app.request("/docs");
     expect(documentationResponse.status).toBe(200);
@@ -266,6 +292,80 @@ describe("Humans API", () => {
     expect(search.status).toBe(401);
     const detail = await app.request("/v1/profiles/any-profile");
     expect(detail.status).toBe(401);
+  });
+
+  it("lets only Organization admins create, list, and revoke scoped API keys", async () => {
+    await database
+      .insert(schema.members)
+      .values({ clerkId: "api_admin", name: "API Admin" })
+      .onConflictDoNothing();
+    await database
+      .insert(schema.organizations)
+      .values({ clerkId: "api_organization", name: "API Organization" })
+      .onConflictDoNothing();
+    await database
+      .insert(schema.organizationMemberships)
+      .values({
+        clerkId: "api_admin_membership",
+        memberId: "api_admin",
+        organizationId: "api_organization",
+        role: "org:admin",
+      })
+      .onConflictDoNothing();
+    identity.sessions.set("api_admin_session", {
+      memberId: "api_admin",
+      organizationId: "api_organization",
+    });
+    const created = await app.request("/v1/organization/api-keys", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer api_admin_session",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        name: "Recruiting integration",
+        scopes: ["profiles:read", "contacts:reveal"],
+      }),
+    });
+    expect(created.status).toBe(201);
+    const createdBody = await created.json();
+    expect(createdBody).toMatchObject({
+      apiKey: {
+        name: "Recruiting integration",
+        scopes: ["profiles:read", "contacts:reveal"],
+        secret: expect.stringMatching(/^secret_/),
+      },
+    });
+
+    const listed = await app.request("/v1/organization/api-keys", {
+      headers: { authorization: "Bearer api_admin_session" },
+    });
+    expect(listed.status).toBe(200);
+    const listedBody = await listed.json();
+    expect(listedBody.apiKeys).toHaveLength(1);
+    expect(listedBody.apiKeys[0]).not.toHaveProperty("secret");
+
+    const invalidScopes = await app.request("/v1/organization/api-keys", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer api_admin_session",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ name: "Unsafe", scopes: ["contacts:reveal"] }),
+    });
+    expect(invalidScopes.status).toBe(422);
+
+    const revoked = await app.request(
+      `/v1/organization/api-keys/${createdBody.apiKey.id}`,
+      {
+        method: "DELETE",
+        headers: { authorization: "Bearer api_admin_session" },
+      },
+    );
+    expect(revoked.status).toBe(200);
+    await expect(revoked.json()).resolves.toMatchObject({
+      apiKey: { revoked: true },
+    });
   });
 
   it("creates an eligible Profile only after explicit Member opt-in", async () => {
@@ -555,6 +655,193 @@ describe("Humans API", () => {
     expect(JSON.stringify(log.mock.calls)).not.toContain("p***@c***.example");
     log.mockRestore();
   });
+
+  it("enforces API-key scopes, Credits, idempotency, and the stable v1 contract", async () => {
+    await database.insert(schema.members).values([
+      { clerkId: "external_member", name: "External Member" },
+      { clerkId: "external_owner", name: "External Profile Owner" },
+    ]);
+    await database.insert(schema.organizations).values({
+      clerkId: "external_organization",
+      name: "External Organization",
+    });
+    await database.insert(schema.organizationMemberships).values({
+      clerkId: "external_membership",
+      memberId: "external_member",
+      organizationId: "external_organization",
+      role: "org:member",
+    });
+    await database.insert(schema.profiles).values({
+      profileId: "external_profile",
+      memberId: "external_owner",
+      name: "External Profile",
+      githubAccountId: "external_github",
+      githubLogin: "external-profile",
+      eligibilityBasis: "owned_repository",
+      adultAttested: true,
+      searchable: true,
+      searchabilityReason: "member_opt_in",
+    });
+    await database.insert(schema.profileObservations).values({
+      id: "external_email",
+      profileId: "external_profile",
+      field: "contact-detail",
+      value: {
+        type: "professional-email",
+        value: "external@company.example",
+      },
+      source: "tikhub",
+      sourceRecordId: "external_email_source",
+      pipelineVersion: "tikhub-v1",
+      confidence: 0.99,
+    });
+    await applyCreditEntry(database, {
+      organizationId: "external_organization",
+      idempotencyKey: "external:grant",
+      kind: "grant",
+      amount: 20,
+    });
+    identity.apiKeySessions.set("read_key", {
+      keyId: "read_key_id",
+      memberId: "external_member",
+      organizationId: "external_organization",
+      scopes: ["profiles:read"],
+    });
+    identity.apiKeySessions.set("reveal_key", {
+      keyId: "reveal_key_id",
+      memberId: "external_member",
+      organizationId: "external_organization",
+      scopes: ["profiles:read", "contacts:reveal"],
+    });
+    identity.apiKeySessions.set("unscoped_key", {
+      keyId: "unscoped_key_id",
+      memberId: "external_member",
+      organizationId: "external_organization",
+      scopes: [],
+    });
+
+    const unscoped = await app.request("/v1/profiles?q=External", {
+      headers: {
+        authorization: "Bearer unscoped_key",
+        "Idempotency-Key": "external:unscoped",
+      },
+    });
+    expect(unscoped.status).toBe(403);
+    const broad = await app.request("/v1/profiles", {
+      headers: {
+        authorization: "Bearer read_key",
+        "Idempotency-Key": "external:broad",
+      },
+    });
+    expect(broad.status).toBe(422);
+
+    const listResponse = await app.request("/v1/profiles?q=External", {
+      headers: {
+        authorization: "Bearer read_key",
+        "Idempotency-Key": "external:list",
+      },
+    });
+    expect(listResponse.status).toBe(200);
+    expect(listResponse.headers.get("ratelimit-limit")).toBe("60");
+    await expect(listResponse.json()).resolves.toMatchObject({
+      results: [{ profileId: "external_profile" }],
+    });
+    const replay = await app.request("/v1/profiles?q=External", {
+      headers: {
+        authorization: "Bearer read_key",
+        "Idempotency-Key": "external:list",
+      },
+    });
+    expect(replay.status).toBe(200);
+    expect(await getCreditBalance(database, "external_organization")).toBe(19);
+
+    const facets = await app.request("/v1/search/facets", {
+      headers: { authorization: "Bearer read_key" },
+    });
+    expect(facets.status).toBe(200);
+    expect(await getCreditBalance(database, "external_organization")).toBe(19);
+
+    const detail = await app.request("/v1/profiles/external_profile", {
+      headers: { authorization: "Bearer read_key" },
+    });
+    expect(detail.status).toBe(200);
+
+    const forbiddenReveal = await app.request(
+      "/v1/profiles/external_profile/reveal-email",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer read_key",
+          "Idempotency-Key": "external:forbidden-reveal",
+        },
+      },
+    );
+    expect(forbiddenReveal.status).toBe(403);
+    const reveal = await app.request(
+      "/v1/profiles/external_profile/reveal-email",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer reveal_key",
+          "Idempotency-Key": "external:reveal",
+        },
+      },
+    );
+    expect(reveal.status).toBe(200);
+    await expect(reveal.json()).resolves.toMatchObject({
+      reveal: { value: "external@company.example", price: 5 },
+    });
+    expect(await getCreditBalance(database, "external_organization")).toBe(14);
+
+    const naturalApp = createApp(
+      () => makeDatabaseLayer(database),
+      identity,
+      async () => ({
+        language: "en",
+        filters: { query: "External" },
+      }),
+    );
+    for (let request = 0; request < 10; request += 1) {
+      const response = await naturalApp.request("/v1/search", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer read_key",
+          "content-type": "application/json",
+          "Idempotency-Key": `external:natural:${request}`,
+        },
+        body: JSON.stringify({ query: "TypeScript builders" }),
+      });
+      expect(response.status).toBe(200);
+    }
+    const naturalLimit = await naturalApp.request("/v1/search", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer read_key",
+        "content-type": "application/json",
+        "Idempotency-Key": "external:natural:limited",
+      },
+      body: JSON.stringify({ query: "TypeScript builders" }),
+    });
+    expect(naturalLimit.status).toBe(429);
+    expect(naturalLimit.headers.get("ratelimit-limit")).toBe("10");
+    expect(naturalLimit.headers.get("retry-after")).not.toBeNull();
+
+    const rateLimitApp = createApp(
+      () => makeDatabaseLayer(database),
+      identity,
+    );
+    for (let request = 0; request < 60; request += 1) {
+      const response = await rateLimitApp.request("/v1/search/facets", {
+        headers: { authorization: "Bearer read_key" },
+      });
+      expect(response.status).toBe(200);
+    }
+    const organizationLimit = await rateLimitApp.request("/v1/search/facets", {
+      headers: { authorization: "Bearer read_key" },
+    });
+    expect(organizationLimit.status).toBe(429);
+    expect(organizationLimit.headers.get("ratelimit-limit")).toBe("60");
+  });
 });
 
 const postWebhook = async (
@@ -592,12 +879,58 @@ const invitedProjection: ProvisionedWorkspace = {
 class FakeIdentity implements IdentityBoundary {
   readonly github = new Map<string, GitHubVerification>();
   readonly sessions = new Map<string, SessionIdentity>();
+  readonly apiKeySessions = new Map<string, ApiKeyIdentity>();
+  readonly apiKeys = new Map<string, OrganizationApiKey & { secret?: string }>();
   readonly organizations = new Map<string, ProvisionedWorkspace>();
   personalOrganizationsCreated = 0;
 
   async authenticate(request: Request) {
     const token = request.headers.get("authorization")?.replace("Bearer ", "");
     return token === undefined ? null : (this.sessions.get(token) ?? null);
+  }
+
+  async authenticateApiKey(request: Request) {
+    const token = request.headers.get("authorization")?.replace("Bearer ", "");
+    return token === undefined ? null : (this.apiKeySessions.get(token) ?? null);
+  }
+
+  async createOrganizationApiKey(input: {
+    memberId: string;
+    organizationId: string;
+    name: string;
+    description?: string;
+    scopes: ApiScope[];
+    secondsUntilExpiration?: number;
+  }) {
+    const id = `key_${this.apiKeys.size + 1}`;
+    const key = {
+      id,
+      name: input.name,
+      description: input.description ?? null,
+      scopes: input.scopes,
+      revoked: false,
+      expired: false,
+      expiration: input.secondsUntilExpiration
+        ? Date.now() + input.secondsUntilExpiration * 1000
+        : null,
+      createdAt: Date.now(),
+      secret: `secret_${id}`,
+    };
+    this.apiKeys.set(id, key);
+    return key;
+  }
+
+  async listOrganizationApiKeys() {
+    return [...this.apiKeys.values()].map(({ secret: _, ...key }) => key);
+  }
+
+  async revokeOrganizationApiKey(_organizationId: string, apiKeyId: string) {
+    const key = this.apiKeys.get(apiKeyId);
+    if (!key) return null;
+    const revoked = { ...key, revoked: true };
+    this.apiKeys.set(apiKeyId, revoked);
+    const { secret: _, ...result } = revoked;
+    return result;
   }
 
   async verifyWebhook(request: Request) {

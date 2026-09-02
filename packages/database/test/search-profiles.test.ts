@@ -1,16 +1,25 @@
 import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
+import { Effect } from "effect";
 import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { runChargedProfileSearch } from "../src/charged-search";
+import {
+  applyCreditEntry,
+  CreditOperationError,
+  getCreditBalance,
+} from "../src/credits";
 import {
   InvalidSearchCursor,
   getSearchableProfile,
+  listProfileSearchFacets,
   searchProfiles,
 } from "../src/search-profiles";
 import * as schema from "../src/schema";
+import { makeDatabaseService } from "../src/service";
 
 describe("Profile search", () => {
   const resources: {
@@ -31,6 +40,10 @@ describe("Profile search", () => {
       migrationsFolder: fileURLToPath(new URL("../drizzle", import.meta.url)),
     });
     await seedSearchProfiles(database);
+    await database.insert(schema.organizations).values({
+      clerkId: "organization_search",
+      name: "Search",
+    });
   });
 
   afterAll(async () => {
@@ -103,13 +116,24 @@ describe("Profile search", () => {
       {},
       {
         cursor: first.nextCursor!,
-        pageSize: 2,
+        pageSize: 1,
         now: new Date("2026-09-01T12:01:00Z"),
       },
     );
     expect(second.results.map(({ profileId }) => profileId)).not.toEqual(
       expect.arrayContaining(first.results.map(({ profileId }) => profileId)),
     );
+    await expect(
+      searchProfiles(
+        database,
+        {},
+        {
+          cursor: second.nextCursor!,
+          pageSize: 1,
+          now: new Date("2026-09-01T12:16:00Z"),
+        },
+      ),
+    ).rejects.toBeInstanceOf(InvalidSearchCursor);
     await expect(
       searchProfiles(
         database,
@@ -139,6 +163,134 @@ describe("Profile search", () => {
     ).resolves.toMatchObject({
       results: expect.any(Array),
     });
+  });
+
+  it("lists facets without exposing suppressed or non-searchable Profiles", async () => {
+    const facets = await listProfileSearchFacets(database);
+
+    expect(facets).toMatchObject({
+      roles: ["Backend Engineer", "Frontend Engineer"],
+      skills: ["PostgreSQL", "React", "Rust", "TypeScript"],
+      companies: ["Acme", "Beta", "Cloud", "Delta"],
+      seniorities: ["Senior"],
+      opportunityStatuses: ["not_open", "open"],
+    });
+    expect(facets.currentResidences).not.toContain("Bogota, Colombia");
+  });
+
+  it("charges successful initial and page searches once and leaves failures free", async () => {
+    await applyCreditEntry(database, {
+      organizationId: "organization_search",
+      idempotencyKey: "grant:search",
+      kind: "grant",
+      amount: 2,
+    });
+    const failedCursor = "not-a-cursor";
+    await expect(
+      runChargedProfileSearch(database, {
+        organizationId: "organization_search",
+        idempotencyKey: "search:failed",
+        filters: {},
+        cursor: failedCursor,
+      }),
+    ).rejects.toBeInstanceOf(InvalidSearchCursor);
+    expect(await getCreditBalance(database, "organization_search")).toBe(2);
+
+    const first = await runChargedProfileSearch(database, {
+      organizationId: "organization_search",
+      idempotencyKey: "search:first",
+      filters: { skills: ["typescript"] },
+      pageSize: 1,
+    });
+    await runChargedProfileSearch(database, {
+      organizationId: "organization_search",
+      idempotencyKey: "search:first",
+      filters: { skills: ["typescript"] },
+      pageSize: 1,
+    });
+    expect(await getCreditBalance(database, "organization_search")).toBe(1);
+
+    await runChargedProfileSearch(database, {
+      organizationId: "organization_search",
+      idempotencyKey: "search:second",
+      filters: { skills: ["typescript"] },
+      cursor: first.page.nextCursor!,
+      pageSize: 1,
+    });
+    expect(await getCreditBalance(database, "organization_search")).toBe(0);
+    await expect(
+      runChargedProfileSearch(database, {
+        organizationId: "organization_search",
+        idempotencyKey: "search:first",
+        filters: { skills: ["rust"] },
+      }),
+    ).rejects.toMatchObject({ code: "idempotency_conflict" });
+    await expect(
+      runChargedProfileSearch(database, {
+        organizationId: "organization_search",
+        idempotencyKey: "search:third",
+        filters: { skills: ["rust"] },
+      }),
+    ).rejects.toBeInstanceOf(CreditOperationError);
+    expect(await getCreditBalance(database, "organization_search")).toBe(0);
+
+    const service = makeDatabaseService(database);
+    await expect(
+      Effect.runPromise(
+        service.searchProfilesWithCredit({
+          organizationId: "organization_search",
+          idempotencyKey: "search:service-insufficient",
+          filters: { skills: ["rust"] },
+        }),
+      ),
+    ).rejects.toMatchObject({
+      _tag: "SearchChargeRejected",
+      reason: "insufficient_credits",
+    });
+    await expect(
+      Effect.runPromise(
+        service.searchProfilesWithCredit({
+          organizationId: "organization_search",
+          idempotencyKey: "search:first",
+          filters: { skills: ["rust"] },
+        }),
+      ),
+    ).rejects.toMatchObject({
+      _tag: "SearchChargeRejected",
+      reason: "idempotency_conflict",
+    });
+  });
+
+  it("caps a query at exactly 1,000 reachable results across variable pages", async () => {
+    await database.insert(schema.profiles).values(
+      Array.from({ length: 1_001 }, (_, index) => ({
+        profileId: `reachable-${index.toString().padStart(4, "0")}`,
+        name: `Reachable ${index.toString().padStart(4, "0")}`,
+        currentCompany: null,
+        githubAccountId: `reachable-github-${index}`,
+        githubLogin: `reachable-${index}`,
+        eligibilityBasis: "owned_repository",
+        adultAttested: true,
+        searchable: true,
+        searchabilityReason: "approved_import",
+      })),
+    );
+
+    let cursor: string | undefined;
+    let reached = 0;
+    for (const pageSize of [
+      73, 100, 100, 100, 100, 100, 100, 100, 100, 100, 27,
+    ]) {
+      const page = await searchProfiles(
+        database,
+        { query: "reachable" },
+        { cursor, pageSize },
+      );
+      reached += page.results.length;
+      cursor = page.nextCursor ?? undefined;
+    }
+    expect(reached).toBe(1_000);
+    expect(cursor).toBeUndefined();
   });
 });
 

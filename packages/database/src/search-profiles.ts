@@ -59,10 +59,10 @@ type SearchDocument = ProfileSearchResult & {
 };
 
 type Cursor = {
-  version: 1;
+  version: 2;
   expiresAt: number;
   filters: string;
-  depth: number;
+  reached: number;
   rank: number;
   evidenceRank: number;
   opportunityRank: number;
@@ -72,7 +72,7 @@ type Cursor = {
 };
 
 const cursorLifetimeMs = 15 * 60 * 1000;
-const maximumCursorDepth = 10;
+const maximumReachableResults = 1_000;
 
 export const searchProfiles = async (
   database: SearchDatabase,
@@ -103,19 +103,26 @@ export const searchProfiles = async (
     cursor === null
       ? documents
       : documents.filter((document) => isAfterCursor(document, cursor));
-  const page = remaining.slice(0, pageSize);
+  const availablePageSize = Math.min(
+    pageSize,
+    maximumReachableResults - (cursor?.reached ?? 0),
+  );
+  const page = remaining.slice(0, availablePageSize);
   const last = page.at(-1);
+  const reached = (cursor?.reached ?? 0) + page.length;
 
   return {
     results: page.map(toSearchResult),
     nextCursor:
-      remaining.length > pageSize && last !== undefined
+      remaining.length > availablePageSize &&
+      reached < maximumReachableResults &&
+      last !== undefined
         ? await encodeCursor(
             {
-              version: 1,
-              expiresAt: now.getTime() + cursorLifetimeMs,
+              version: 2,
+              expiresAt: cursor?.expiresAt ?? now.getTime() + cursorLifetimeMs,
               filters: JSON.stringify(normalized),
-              depth: (cursor?.depth ?? 0) + 1,
+              reached,
               rank: last.rank,
               evidenceRank: last.evidenceRank,
               opportunityRank: last.opportunityRank,
@@ -136,6 +143,57 @@ export const getSearchableProfile = async (
   const document = (await loadDocuments(database, profileId, new Date()))[0];
   if (document === undefined) return null;
   return { ...toSearchResult(document), links: document.links };
+};
+
+export type ProfileSearchFacets = {
+  roles: string[];
+  skills: string[];
+  currentResidences: string[];
+  companies: string[];
+  seniorities: string[];
+  opportunityStatuses: OpportunityStatus[];
+};
+
+/** Lists zero-cost filters from the same searchable Profile view as search. */
+export const listProfileSearchFacets = async (
+  database: SearchDatabase,
+  now = new Date(),
+): Promise<ProfileSearchFacets> => {
+  const documents = await loadDocuments(database, undefined, now);
+  return {
+    roles: facetValues(
+      documents.flatMap(({ primaryRole }) => primaryRole ?? []),
+    ),
+    skills: facetValues(documents.flatMap(({ skills }) => skills)),
+    currentResidences: facetValues(
+      documents.flatMap(({ currentResidence }) => currentResidence ?? []),
+    ),
+    companies: facetValues(
+      documents.flatMap(({ currentCompany }) => currentCompany ?? []),
+    ),
+    seniorities: facetValues(
+      documents.flatMap(({ seniority }) => seniority ?? []),
+    ),
+    opportunityStatuses: facetValues(
+      documents.map(({ opportunityStatus }) => opportunityStatus),
+    ) as OpportunityStatus[],
+  };
+};
+
+export const profileSearchRequestFingerprint = async (
+  filters: ProfileSearchFilters,
+  options: { cursor?: string; pageSize?: number },
+) => {
+  const request = JSON.stringify({
+    filters: normalizeFilters(filters),
+    cursor: options.cursor ?? null,
+    pageSize: Math.max(1, Math.min(100, options.pageSize ?? 25)),
+  });
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(request),
+  );
+  return base64Url(new Uint8Array(digest));
 };
 
 const toSearchResult = (document: SearchDocument): ProfileSearchResult => ({
@@ -462,9 +520,18 @@ const isAfterCursor = (document: SearchDocument, cursor: Cursor) =>
   compareDocuments(document, cursor) > 0;
 
 const encodeCursor = async (cursor: Cursor, secret: string) => {
-  const payload = base64Url(new TextEncoder().encode(JSON.stringify(cursor)));
-  const signature = await sign(payload, secret);
-  return `${payload}.${base64Url(signature)}`;
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      await encryptionKey(secret),
+      new TextEncoder().encode(JSON.stringify(cursor)),
+    ),
+  );
+  const value = new Uint8Array(iv.length + encrypted.length);
+  value.set(iv);
+  value.set(encrypted, iv.length);
+  return base64Url(value);
 };
 
 const decodeCursor = async (
@@ -474,29 +541,21 @@ const decodeCursor = async (
   secret: string,
 ): Promise<Cursor> => {
   try {
-    const [payload, encodedSignature, extra] = value.split(".");
-    if (
-      payload === undefined ||
-      encodedSignature === undefined ||
-      extra !== undefined
-    )
-      throw new Error("invalid cursor");
-    const key = await hmacKey(secret);
-    const valid = await crypto.subtle.verify(
-      "HMAC",
-      key,
-      fromBase64Url(encodedSignature),
-      new TextEncoder().encode(payload),
+    const encoded = fromBase64Url(value);
+    if (encoded.length <= 28) throw new Error("invalid cursor");
+    const decoded = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: encoded.slice(0, 12) },
+      await encryptionKey(secret),
+      encoded.slice(12),
     );
-    if (!valid) throw new Error("invalid cursor");
-    const cursor = JSON.parse(
-      new TextDecoder().decode(fromBase64Url(payload)),
-    ) as Cursor;
+    const cursor: unknown = JSON.parse(new TextDecoder().decode(decoded));
     if (
-      cursor.version !== 1 ||
+      !isCursor(cursor) ||
+      cursor.version !== 2 ||
       cursor.expiresAt <= now.getTime() ||
       cursor.filters !== JSON.stringify(filters) ||
-      cursor.depth > maximumCursorDepth
+      cursor.reached <= 0 ||
+      cursor.reached >= maximumReachableResults
     ) {
       throw new Error("invalid cursor");
     }
@@ -506,22 +565,13 @@ const decodeCursor = async (
   }
 };
 
-const sign = async (value: string, secret: string) =>
-  new Uint8Array(
-    await crypto.subtle.sign(
-      "HMAC",
-      await hmacKey(secret),
-      new TextEncoder().encode(value),
-    ),
-  );
-
-const hmacKey = (secret: string) =>
+const encryptionKey = async (secret: string) =>
   crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret)),
+    "AES-GCM",
     false,
-    ["sign", "verify"],
+    ["encrypt", "decrypt"],
   );
 
 const base64Url = (value: Uint8Array) =>
@@ -533,6 +583,37 @@ const base64Url = (value: Uint8Array) =>
 const fromBase64Url = (value: string) => {
   const base64 = value.replaceAll("-", "+").replaceAll("_", "/");
   return Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
+};
+
+const isCursor = (value: unknown): value is Cursor => {
+  if (!isRecord(value)) return false;
+  return (
+    value.version === 2 &&
+    typeof value.expiresAt === "number" &&
+    Number.isSafeInteger(value.expiresAt) &&
+    typeof value.filters === "string" &&
+    typeof value.reached === "number" &&
+    Number.isSafeInteger(value.reached) &&
+    typeof value.rank === "number" &&
+    Number.isFinite(value.rank) &&
+    typeof value.evidenceRank === "number" &&
+    Number.isFinite(value.evidenceRank) &&
+    typeof value.opportunityRank === "number" &&
+    Number.isFinite(value.opportunityRank) &&
+    typeof value.freshness === "string" &&
+    typeof value.name === "string" &&
+    typeof value.profileId === "string"
+  );
+};
+
+const facetValues = (values: string[]) => {
+  const unique = new Map<string, string>();
+  for (const value of values) {
+    const normalized = value.trim().toLocaleLowerCase();
+    if (normalized !== "" && !unique.has(normalized))
+      unique.set(normalized, value);
+  }
+  return [...unique.values()].sort((left, right) => left.localeCompare(right));
 };
 
 const normalizeList = (values: string[] | undefined) =>

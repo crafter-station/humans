@@ -10,6 +10,14 @@ type Database =
 
 export type CreditEntryKind = "grant" | "charge" | "refund";
 
+export class CreditOperationError extends Error {
+  constructor(
+    public readonly code: "insufficient_credits" | "idempotency_conflict",
+  ) {
+    super(code);
+  }
+}
+
 /**
  * Applies a credit movement exactly once and returns the resulting balance.
  * Debits lock the Organization account and can never take it below zero.
@@ -57,7 +65,7 @@ export const applyCreditEntry = (
         existing.amount !== signedAmount ||
         existing.referenceId !== (input.referenceId ?? null)
       )
-        throw new Error("idempotency_conflict");
+        throw new CreditOperationError("idempotency_conflict");
       const [account] = await tx
         .select()
         .from(creditAccounts)
@@ -86,7 +94,7 @@ export const applyCreditEntry = (
         ),
       )
       .returning();
-    if (!account) throw new Error("insufficient_credits");
+    if (!account) throw new CreditOperationError("insufficient_credits");
     return { entry: inserted, balance: account.balance, applied: true };
   });
 
@@ -100,3 +108,20 @@ export const getCreditBalance = async (
     .where(eq(creditAccounts.organizationId, organizationId));
   return account?.balance ?? 0;
 };
+
+/** Charges one Credit after a search page has completed successfully. */
+export const chargeSearchPage = (
+  database: Database,
+  input: {
+    organizationId: string;
+    idempotencyKey: string;
+    requestFingerprint: string;
+  },
+) =>
+  applyCreditEntry(database, {
+    organizationId: input.organizationId,
+    idempotencyKey: input.idempotencyKey,
+    kind: "charge",
+    amount: 1,
+    referenceId: `profile-search:${input.requestFingerprint}`,
+  });

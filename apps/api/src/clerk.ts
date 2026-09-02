@@ -15,11 +15,59 @@ export type SessionIdentity = {
   organizationId: string | null;
 };
 
+export type ApiScope = "profiles:read" | "contacts:reveal";
+
+export type ApiKeyIdentity = {
+  keyId: string;
+  memberId: string;
+  organizationId: string;
+  scopes: ApiScope[];
+};
+
+export type OrganizationApiKey = {
+  id: string;
+  name: string;
+  description: string | null;
+  scopes: string[];
+  revoked: boolean;
+  expired: boolean;
+  expiration: number | null;
+  createdAt: number;
+};
+
+export type CreatedOrganizationApiKey = OrganizationApiKey & {
+  secret: string;
+};
+
 export type IdentityBoundary = {
   authenticate(
     request: Request,
     bindings: Bindings,
   ): Promise<SessionIdentity | null>;
+  authenticateApiKey(
+    request: Request,
+    bindings: Bindings,
+  ): Promise<ApiKeyIdentity | null>;
+  createOrganizationApiKey(
+    input: {
+      memberId: string;
+      organizationId: string;
+      name: string;
+      description?: string;
+      scopes: ApiScope[];
+      secondsUntilExpiration?: number;
+    },
+    bindings: Bindings,
+  ): Promise<CreatedOrganizationApiKey>;
+  listOrganizationApiKeys(
+    organizationId: string,
+    bindings: Bindings,
+  ): Promise<OrganizationApiKey[]>;
+  revokeOrganizationApiKey(
+    organizationId: string,
+    apiKeyId: string,
+    bindings: Bindings,
+  ): Promise<OrganizationApiKey | null>;
   verifyWebhook(
     request: Request,
     bindings: Bindings,
@@ -75,6 +123,74 @@ export const clerkIdentityBoundary: IdentityBoundary = {
 
     const auth = state.toAuth();
     return { memberId: auth.userId, organizationId: auth.orgId ?? null };
+  },
+
+  async authenticateApiKey(request, bindings) {
+    const clerk = createClerkClient({ secretKey: bindings.CLERK_SECRET_KEY });
+    const state = await clerk
+      .authenticateRequest(request, { acceptsToken: "api_key" })
+      .catch(() => null);
+    if (state === null || !state.isAuthenticated) return null;
+
+    const auth = state.toAuth();
+    const claims = auth.claims as Record<string, unknown> | null;
+    const memberId = claims?.humansMemberId;
+    const scopes = auth.scopes.filter(isApiScope);
+    if (
+      !auth.subject.startsWith("org_") ||
+      typeof memberId !== "string" ||
+      memberId === "" ||
+      scopes.length === 0
+    ) {
+      return null;
+    }
+    return {
+      keyId: auth.id,
+      memberId,
+      organizationId: auth.subject,
+      scopes,
+    };
+  },
+
+  async createOrganizationApiKey(input, bindings) {
+    const clerk = createClerkClient({ secretKey: bindings.CLERK_SECRET_KEY });
+    const apiKey = await clerk.apiKeys.create({
+      name: input.name,
+      subject: input.organizationId,
+      description: input.description,
+      scopes: input.scopes,
+      claims: { humansMemberId: input.memberId },
+      createdBy: input.memberId,
+      secondsUntilExpiration: input.secondsUntilExpiration,
+    });
+    if (!apiKey.secret) throw new Error("Clerk did not return an API key secret");
+    return { ...organizationApiKey(apiKey), secret: apiKey.secret };
+  },
+
+  async listOrganizationApiKeys(organizationId, bindings) {
+    const clerk = createClerkClient({ secretKey: bindings.CLERK_SECRET_KEY });
+    const result = await clerk.apiKeys.list({
+      subject: organizationId,
+      includeInvalid: true,
+      limit: 500,
+    });
+    return result.data.map(organizationApiKey);
+  },
+
+  async revokeOrganizationApiKey(organizationId, apiKeyId, bindings) {
+    const clerk = createClerkClient({ secretKey: bindings.CLERK_SECRET_KEY });
+    const keys = await clerk.apiKeys.list({
+      subject: organizationId,
+      includeInvalid: true,
+      limit: 500,
+    });
+    if (!keys.data.some((key) => key.id === apiKeyId)) return null;
+    return organizationApiKey(
+      await clerk.apiKeys.revoke({
+        apiKeyId,
+        revocationReason: "Revoked by an Organization admin",
+      }),
+    );
   },
 
   async verifyWebhook(request, bindings) {
@@ -382,3 +498,26 @@ export const clerkIdentityBoundary: IdentityBoundary = {
     };
   },
 };
+
+const isApiScope = (scope: string): scope is ApiScope =>
+  scope === "profiles:read" || scope === "contacts:reveal";
+
+const organizationApiKey = (apiKey: {
+  id: string;
+  name: string;
+  description: string | null;
+  scopes: string[];
+  revoked: boolean;
+  expired: boolean;
+  expiration: number | null;
+  createdAt: number;
+}): OrganizationApiKey => ({
+  id: apiKey.id,
+  name: apiKey.name,
+  description: apiKey.description,
+  scopes: apiKey.scopes,
+  revoked: apiKey.revoked,
+  expired: apiKey.expired,
+  expiration: apiKey.expiration,
+  createdAt: apiKey.createdAt,
+});

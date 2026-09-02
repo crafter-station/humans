@@ -4,7 +4,7 @@
   "type": "module",
   "private": true,
   "exports": {
-    ".": "./src/service.ts",
+    ".": "./src/service/index.ts",
     "./import-profiles": "./src/import-profiles.ts",
     "./profile-control": "./src/profile-control.ts",
     "./credits": "./src/credits.ts",
@@ -12,7 +12,8 @@
     "./neon": "./src/neon.ts",
     "./search-profiles": "./src/search-profiles.ts",
     "./saved-lists": "./src/saved-lists.ts",
-    "./schema": "./src/schema.ts"
+    "./schema": "./src/schema/index.ts",
+    "./charged-search": "./src/charged-search.ts"
   },
   "scripts": {
     "db:generate": "node ./scripts/generate-migrations.mjs",

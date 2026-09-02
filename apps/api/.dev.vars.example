@@ -2,4 +2,9 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/humans
 CLERK_PUBLISHABLE_KEY=pk_test_replace_me
 CLERK_SECRET_KEY=sk_test_replace_me
 CLERK_WEBHOOK_SIGNING_SECRET=whsec_replace_me
-OPENAI_API_KEY=sk-replace_me
+
+# Optional. Enables natural-language search.
+# OPENAI_API_KEY=sk-replace_me
+
+# Optional. Falls back to CLERK_SECRET_KEY when omitted.
+# SEARCH_CURSOR_SECRET=replace-with-a-dedicated-random-secret
