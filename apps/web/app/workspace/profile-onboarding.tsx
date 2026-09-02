@@ -49,12 +49,14 @@ export function ProfileOnboarding() {
     return () => controller.abort();
   }, [searchParams]);
 
-  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+  const submit = async (
+    event: React.SyntheticEvent<HTMLFormElement, SubmitEvent>,
+  ) => {
     event.preventDefault();
     setMessage(null);
     const data = new FormData(
       event.currentTarget,
-      (event.nativeEvent as SubmitEvent).submitter,
+      event.nativeEvent.submitter,
     );
     const skills = String(data.get("skills") ?? "")
       .split(",")

@@ -258,7 +258,7 @@ export const clerkIdentityBoundary: IdentityBoundary = {
   async verifyGitHub(memberId, bindings) {
     const clerk = createClerkClient({ secretKey: bindings.CLERK_SECRET_KEY });
     const [tokens, member] = await Promise.all([
-      clerk.users.getUserOauthAccessToken(memberId, "oauth_github"),
+      clerk.users.getUserOauthAccessToken(memberId, "github"),
       clerk.users.getUser(memberId),
     ]);
     const token = tokens.data[0]?.token;

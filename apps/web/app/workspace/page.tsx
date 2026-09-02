@@ -1,11 +1,14 @@
 import { OrganizationSwitcher, UserButton } from "@clerk/nextjs";
+import { auth } from "@clerk/nextjs/server";
 import { Suspense } from "react";
 
 import { WorkspaceProvisioner } from "./workspace-provisioner";
 import { ProfileOnboarding } from "./profile-onboarding";
 import styles from "./workspace.module.css";
 
-export default function WorkspacePage() {
+export default async function WorkspacePage() {
+  await auth.protect();
+
   return (
     <main className={styles.page}>
       <WorkspaceProvisioner />
