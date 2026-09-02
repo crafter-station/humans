@@ -9,6 +9,7 @@
     "./profile-control": "./src/profile-control.ts",
     "./neon": "./src/neon.ts",
     "./search-profiles": "./src/search-profiles.ts",
+    "./saved-lists": "./src/saved-lists.ts",
     "./schema": "./src/schema.ts"
   },
   "scripts": {

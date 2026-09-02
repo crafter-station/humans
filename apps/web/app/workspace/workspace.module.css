@@ -320,6 +320,16 @@
   font: 650 0.9rem/1.2 inherit;
   cursor: pointer;
 }
+:global(.saveButton), :global(.savedNote button) {
+  padding: 7px 10px;
+  color: #17221b;
+  background: #b8dc79;
+  border: 0;
+  cursor: pointer;
+}
+:global(.savedNote) { display: grid; gap: 10px; margin: 20px 0; }
+:global(.savedNote label) { display: grid; gap: 8px; color: #9ba59d; font-size: .75rem; }
+:global(.savedNote textarea) { min-height: 90px; padding: 10px; color: #f4f1e6; background: #17221b; border: 1px solid #536258; resize: vertical; }
 :global(.skillList),
 :global(.panelSkills) {
   display: flex;

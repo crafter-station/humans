@@ -1,7 +1,12 @@
 import { createRoute, OpenAPIHono, z } from "@hono/zod-openapi";
-import { Database, makeDatabaseLayer } from "@humans/database";
+import {
+  Database,
+  makeDatabaseLayer,
+  type makeDatabaseService,
+} from "@humans/database";
 import { Scalar } from "@scalar/hono-api-reference";
 import { Effect } from "effect";
+import type { Context } from "hono";
 
 import { clerkIdentityBoundary, type IdentityBoundary } from "./clerk";
 
@@ -354,6 +359,179 @@ export const createApp = (
       context.header("Cache-Control", "private, no-store");
       context.header("X-Robots-Tag", "noindex, nofollow");
       return context.json({ profile }, 200);
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+
+  const savedListInput = z.object({ name: z.string().trim().min(1).max(120) });
+  type AppContext = Context<{ Bindings: Bindings }>;
+  const savedListContext = async (context: AppContext) => {
+    const session = await identity.authenticate(context.req.raw, context.env);
+    if (session === null || session.organizationId === null) return null;
+    return {
+      memberId: session.memberId,
+      organizationId: session.organizationId,
+    };
+  };
+  const runSavedList = <A>(
+    context: AppContext,
+    effect: (
+      database: ReturnType<typeof makeDatabaseService>,
+    ) => Effect.Effect<A, unknown>,
+  ) =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const database = yield* Database;
+        return yield* effect(database);
+      }).pipe(Effect.provide(databaseLayer(context.env))),
+    );
+
+  app.get("/v1/saved-lists", async (context) => {
+    const actor = await savedListContext(context);
+    if (actor === null) return unauthorized(context);
+    try {
+      return context.json(
+        {
+          lists: await runSavedList(context, (database) =>
+            database.listSavedLists(actor.memberId, actor.organizationId),
+          ),
+        },
+        200,
+      );
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+  app.post("/v1/saved-lists", async (context) => {
+    const actor = await savedListContext(context);
+    if (actor === null) return unauthorized(context);
+    const input = savedListInput.safeParse(
+      await context.req.json().catch(() => null),
+    );
+    if (!input.success)
+      return context.json(
+        { error: { code: "invalid_list", message: "A list name is required" } },
+        400,
+      );
+    try {
+      return context.json(
+        {
+          list: await runSavedList(context, (database) =>
+            database.createSavedList(
+              actor.memberId,
+              actor.organizationId,
+              input.data.name,
+            ),
+          ),
+        },
+        201,
+      );
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+  app.patch("/v1/saved-lists/:listId", async (context) => {
+    const actor = await savedListContext(context);
+    if (actor === null) return unauthorized(context);
+    const input = savedListInput.safeParse(
+      await context.req.json().catch(() => null),
+    );
+    if (!input.success)
+      return context.json(
+        { error: { code: "invalid_list", message: "A list name is required" } },
+        400,
+      );
+    try {
+      return context.json(
+        {
+          list: await runSavedList(context, (database) =>
+            database.renameSavedList(
+              actor.memberId,
+              actor.organizationId,
+              context.req.param("listId"),
+              input.data.name,
+            ),
+          ),
+        },
+        200,
+      );
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+  app.delete("/v1/saved-lists/:listId", async (context) => {
+    const actor = await savedListContext(context);
+    if (actor === null) return unauthorized(context);
+    try {
+      await runSavedList(context, (database) =>
+        database.deleteSavedList(
+          actor.memberId,
+          actor.organizationId,
+          context.req.param("listId"),
+        ),
+      );
+      return context.body(null, 204);
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+  app.put("/v1/saved-lists/:listId/entries/:profileId", async (context) => {
+    const actor = await savedListContext(context);
+    if (actor === null) return unauthorized(context);
+    try {
+      await runSavedList(context, (database) =>
+        database.addSavedListEntry(
+          actor.memberId,
+          actor.organizationId,
+          context.req.param("listId"),
+          context.req.param("profileId"),
+        ),
+      );
+      return context.body(null, 204);
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+  app.delete("/v1/saved-lists/:listId/entries/:profileId", async (context) => {
+    const actor = await savedListContext(context);
+    if (actor === null) return unauthorized(context);
+    try {
+      await runSavedList(context, (database) =>
+        database.removeSavedListEntry(
+          actor.memberId,
+          actor.organizationId,
+          context.req.param("listId"),
+          context.req.param("profileId"),
+        ),
+      );
+      return context.body(null, 204);
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+  app.patch("/v1/saved-lists/:listId/entries/:profileId", async (context) => {
+    const actor = await savedListContext(context);
+    if (actor === null) return unauthorized(context);
+    const input = z
+      .object({ note: z.string().max(5000) })
+      .safeParse(await context.req.json().catch(() => null));
+    if (!input.success)
+      return context.json(
+        { error: { code: "invalid_note", message: "The note is invalid" } },
+        400,
+      );
+    try {
+      await runSavedList(context, (database) =>
+        database.updateSavedListEntryNote(
+          actor.memberId,
+          actor.organizationId,
+          context.req.param("listId"),
+          context.req.param("profileId"),
+          input.data.note,
+        ),
+      );
+      return context.body(null, 204);
     } catch {
       return serviceUnavailable(context);
     }

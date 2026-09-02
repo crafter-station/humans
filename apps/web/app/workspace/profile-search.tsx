@@ -19,6 +19,11 @@ type SearchResult = {
 };
 
 type ProfileDetail = SearchResult & { links: string[] };
+type SavedList = {
+  id: string;
+  name: string;
+  entries: Array<{ profileId: string; profileName: string; note: string }>;
+};
 
 export function ProfileSearch({
   onCreateProfile,
@@ -31,11 +36,43 @@ export function ProfileSearch({
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [profile, setProfile] = useState<ProfileDetail | null>(null);
   const [message, setMessage] = useState("Searching protected Profiles...");
+  const [lists, setLists] = useState<SavedList[]>([]);
   const searchRequestParameters = new URLSearchParams(searchParams);
   searchRequestParameters.delete("profile");
   searchRequestParameters.delete("view");
   const requestKey = searchRequestParameters.toString();
   const selectedProfileId = searchParams.get("profile");
+  const refreshLists = () =>
+    fetch("/api/saved-lists", { cache: "no-store" })
+      .then((response) => response.json())
+      .then((data: { lists: SavedList[] }) => setLists(data.lists));
+
+  useEffect(() => {
+    void refreshLists();
+  }, []);
+
+  const createList = async () => {
+    const name = window.prompt("Name this shared Saved List");
+    if (!name?.trim()) return;
+    await fetch("/api/saved-lists", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    await refreshLists();
+  };
+  const toggleSaved = async (profileId: string) => {
+    const list = lists[0];
+    if (list === undefined) {
+      await createList();
+      return;
+    }
+    const saved = list.entries.some((entry) => entry.profileId === profileId);
+    await fetch(`/api/saved-lists/${list.id}/entries/${profileId}`, {
+      method: saved ? "DELETE" : "PUT",
+    });
+    await refreshLists();
+  };
 
   useEffect(() => {
     const controller = new AbortController();
@@ -123,6 +160,9 @@ export function ProfileSearch({
         </div>
         <button className="profileLink" onClick={onCreateProfile}>
           Manage my Profile
+        </button>
+        <button className="profileLink" onClick={createList}>
+          New Saved List
         </button>
       </div>
 
@@ -226,6 +266,7 @@ export function ProfileSearch({
               <th>Company</th>
               <th>Status</th>
               <th>Freshness</th>
+              <th>Saved</th>
             </tr>
           </thead>
           <tbody>
@@ -258,6 +299,23 @@ export function ProfileSearch({
                     {relativeDate(result.freshness)} · {result.evidence}
                   </span>
                 </td>
+                <td>
+                  <button
+                    className="saveButton"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void toggleSaved(result.profileId);
+                    }}
+                  >
+                    {lists.some((list) =>
+                      list.entries.some(
+                        (entry) => entry.profileId === result.profileId,
+                      ),
+                    )
+                      ? "Saved"
+                      : "+ Save"}
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>
@@ -269,9 +327,9 @@ export function ProfileSearch({
         )}
         {nextCursor !== null && (
           <button
-              onClick={() =>
-                updateParameters({ cursor: nextCursor, profile: null }, true)
-              }
+            onClick={() =>
+              updateParameters({ cursor: nextCursor, profile: null }, true)
+            }
           >
             Next page
           </button>
@@ -297,7 +355,12 @@ export function ProfileSearch({
             {profile?.profileId !== selectedProfileId ? (
               <p>Loading Profile...</p>
             ) : (
-              <ProfilePanel profile={profile} />
+              <ProfilePanel
+                profile={profile}
+                lists={lists}
+                onToggle={toggleSaved}
+                onRefresh={refreshLists}
+              />
             )}
           </aside>
         </div>
@@ -306,7 +369,32 @@ export function ProfileSearch({
   );
 }
 
-function ProfilePanel({ profile }: { profile: ProfileDetail }) {
+function ProfilePanel({
+  profile,
+  lists,
+  onToggle,
+  onRefresh,
+}: {
+  profile: ProfileDetail;
+  lists: SavedList[];
+  onToggle: (profileId: string) => Promise<void>;
+  onRefresh: () => Promise<void>;
+}) {
+  const entry = lists
+    .flatMap((list) => list.entries.map((entry) => ({ ...entry, list })))
+    .find((entry) => entry.profileId === profile.profileId);
+  const saveNote = async (form: FormData) => {
+    if (entry === undefined) return;
+    await fetch(
+      `/api/saved-lists/${entry.list.id}/entries/${profile.profileId}`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ note: String(form.get("note") ?? "") }),
+      },
+    );
+    await onRefresh();
+  };
   return (
     <>
       <p className="eyebrow">{profile.evidence} evidence</p>
@@ -314,6 +402,25 @@ function ProfilePanel({ profile }: { profile: ProfileDetail }) {
       <p className="panelHeadline">
         {profile.headline ?? profile.primaryRole ?? "Builder"}
       </p>
+      <button
+        className="saveButton"
+        onClick={() => void onToggle(profile.profileId)}
+      >
+        {entry === undefined ? "+ Save to list" : "Remove from list"}
+      </button>
+      {entry !== undefined && (
+        <form action={saveNote} className="savedNote">
+          <label>
+            Team note
+            <textarea
+              name="note"
+              defaultValue={entry.note}
+              placeholder="Add context for your teammates"
+            />
+          </label>
+          <button type="submit">Save note</button>
+        </form>
+      )}
       <dl>
         <div>
           <dt>Current residence</dt>

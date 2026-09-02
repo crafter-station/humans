@@ -19,6 +19,15 @@ import {
   searchProfiles,
   type ProfileSearchFilters,
 } from "./search-profiles";
+import {
+  addSavedListEntry,
+  createSavedList,
+  deleteSavedList,
+  listSavedLists,
+  removeSavedListEntry,
+  renameSavedList,
+  updateSavedListEntryNote,
+} from "./saved-lists";
 
 type DrizzleDatabase =
   | NeonDatabase<typeof import("./schema")>
@@ -162,6 +171,54 @@ export class Database extends Context.Service<
       Awaited<ReturnType<typeof getSearchableProfile>>,
       DatabaseUnavailable
     >;
+    readonly listSavedLists: (
+      memberId: string,
+      organizationId: string,
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof listSavedLists>>,
+      DatabaseUnavailable
+    >;
+    readonly createSavedList: (
+      memberId: string,
+      organizationId: string,
+      name: string,
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof createSavedList>>,
+      DatabaseUnavailable
+    >;
+    readonly renameSavedList: (
+      memberId: string,
+      organizationId: string,
+      listId: string,
+      name: string,
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof renameSavedList>>,
+      DatabaseUnavailable
+    >;
+    readonly deleteSavedList: (
+      memberId: string,
+      organizationId: string,
+      listId: string,
+    ) => Effect.Effect<void, DatabaseUnavailable>;
+    readonly addSavedListEntry: (
+      memberId: string,
+      organizationId: string,
+      listId: string,
+      profileId: string,
+    ) => Effect.Effect<void, DatabaseUnavailable>;
+    readonly removeSavedListEntry: (
+      memberId: string,
+      organizationId: string,
+      listId: string,
+      profileId: string,
+    ) => Effect.Effect<void, DatabaseUnavailable>;
+    readonly updateSavedListEntryNote: (
+      memberId: string,
+      organizationId: string,
+      listId: string,
+      profileId: string,
+      note: string,
+    ) => Effect.Effect<void, DatabaseUnavailable>;
   }
 >()("@humans/database/Database") {}
 
@@ -550,16 +607,75 @@ export const makeDatabaseService = (
       catch: (cause) => new DatabaseUnavailable({ cause }),
     }).pipe(Effect.withSpan("Database.getSearchableProfile"));
 
+  const saved = <A>(name: string, operation: () => Promise<A>) =>
+    Effect.tryPromise({
+      try: operation,
+      catch: (cause) => new DatabaseUnavailable({ cause }),
+    }).pipe(Effect.withSpan(name));
+
   return Database.of({
     check,
+    addSavedListEntry: (memberId, organizationId, listId, profileId) =>
+      saved("Database.addSavedListEntry", () =>
+        addSavedListEntry(
+          database,
+          memberId,
+          organizationId,
+          listId,
+          profileId,
+        ),
+      ),
+    createSavedList: (memberId, organizationId, name) =>
+      saved("Database.createSavedList", () =>
+        createSavedList(database, memberId, organizationId, name),
+      ),
+    deleteSavedList: (memberId, organizationId, listId) =>
+      saved("Database.deleteSavedList", () =>
+        deleteSavedList(database, memberId, organizationId, listId),
+      ),
     disableProfileSearchability,
     getSearchableProfile: getSearchResult,
     getProfile,
     getWorkspace,
+    listSavedLists: (memberId, organizationId) =>
+      saved("Database.listSavedLists", () =>
+        listSavedLists(database, memberId, organizationId),
+      ),
     projectClerkEvent,
     provisionWorkspace,
+    removeSavedListEntry: (memberId, organizationId, listId, profileId) =>
+      saved("Database.removeSavedListEntry", () =>
+        removeSavedListEntry(
+          database,
+          memberId,
+          organizationId,
+          listId,
+          profileId,
+        ),
+      ),
+    renameSavedList: (memberId, organizationId, listId, name) =>
+      saved("Database.renameSavedList", () =>
+        renameSavedList(database, memberId, organizationId, listId, name),
+      ),
     saveProfile,
     searchProfiles: search,
+    updateSavedListEntryNote: (
+      memberId,
+      organizationId,
+      listId,
+      profileId,
+      note,
+    ) =>
+      saved("Database.updateSavedListEntryNote", () =>
+        updateSavedListEntryNote(
+          database,
+          memberId,
+          organizationId,
+          listId,
+          profileId,
+          note,
+        ),
+      ),
   });
 };
 
