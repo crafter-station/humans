@@ -31,6 +31,10 @@ export function ProfileSearch({
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [profile, setProfile] = useState<ProfileDetail | null>(null);
   const [message, setMessage] = useState("Searching protected Profiles...");
+  const [interpretationError, setInterpretationError] = useState<string | null>(
+    null,
+  );
+  const [interpreting, setInterpreting] = useState(false);
   const searchRequestParameters = new URLSearchParams(searchParams);
   searchRequestParameters.delete("profile");
   searchRequestParameters.delete("view");
@@ -100,6 +104,55 @@ export function ProfileSearch({
     router.replace(`/workspace?${parameters}`, { scroll: false });
   };
 
+  const interpretQuery = async (form: FormData) => {
+    setInterpreting(true);
+    setInterpretationError(null);
+    const response = await fetch("/api/search/interpret", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ query: String(form.get("naturalQuery") ?? "") }),
+    });
+    const payload = (await response.json()) as {
+      filters?: {
+        query?: string;
+        roles?: string[];
+        skills?: string[];
+        currentResidences?: string[];
+        companies?: string[];
+        seniorities?: string[];
+        minimumExperience?: number;
+        opportunityStatuses?: string[];
+      };
+      error?: { message: string };
+    };
+    setInterpreting(false);
+    if (!response.ok || !payload.filters) {
+      setInterpretationError(
+        payload.error?.message ??
+          "We could not interpret that query. Try adding a role, skill, or location.",
+      );
+      return;
+    }
+    const filters = payload.filters;
+    const parameters = new URLSearchParams({
+      view: "search",
+      interpreted: "true",
+    });
+    const values: Record<string, string | undefined> = {
+      q: filters.query,
+      role: filters.roles?.join(","),
+      skill: filters.skills?.join(","),
+      residence: filters.currentResidences?.join(","),
+      company: filters.companies?.join(","),
+      seniority: filters.seniorities?.join(","),
+      experience: filters.minimumExperience?.toString(),
+      opportunityStatus: filters.opportunityStatuses?.join(","),
+    };
+    for (const [name, value] of Object.entries(values))
+      if (value) parameters.set(name, value);
+    router.replace(`/workspace?${parameters}`, { scroll: false });
+  };
+
   const updateParameters = (
     changes: Record<string, string | null>,
     addHistoryEntry = false,
@@ -125,6 +178,49 @@ export function ProfileSearch({
           Manage my Profile
         </button>
       </div>
+
+      <form action={interpretQuery} className="naturalSearch">
+        <label>
+          Describe who you want to find
+          <input
+            name="naturalQuery"
+            required
+            minLength={3}
+            maxLength={500}
+            placeholder="Senior TypeScript engineers in Colombia"
+          />
+        </label>
+        <button disabled={interpreting}>
+          {interpreting ? "Interpreting…" : "Interpret query"}
+        </button>
+      </form>
+      {interpretationError && (
+        <p className="interpretationError" role="alert">
+          {interpretationError}
+        </p>
+      )}
+      {searchParams.get("interpreted") === "true" && (
+        <div className="interpretedFilters" aria-label="Inferred filters">
+          <strong>Inferred filters</strong>
+          {[
+            "q",
+            "role",
+            "skill",
+            "residence",
+            "company",
+            "seniority",
+            "experience",
+            "opportunityStatus",
+          ].map((name) =>
+            searchParams.get(name) ? (
+              <span key={name}>
+                {name}: {searchParams.get(name)}
+              </span>
+            ) : null,
+          )}
+          <span>Edit any field below before searching again.</span>
+        </div>
+      )}
 
       <form action={applyFilters} className="searchFilters">
         <label className="wideFilter">
@@ -269,9 +365,9 @@ export function ProfileSearch({
         )}
         {nextCursor !== null && (
           <button
-              onClick={() =>
-                updateParameters({ cursor: nextCursor, profile: null }, true)
-              }
+            onClick={() =>
+              updateParameters({ cursor: nextCursor, profile: null }, true)
+            }
           >
             Next page
           </button>
