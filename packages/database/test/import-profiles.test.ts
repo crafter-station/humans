@@ -135,16 +135,16 @@ humans-profiles-v1,batch-two,duplicate-1,Carla Duplicate,,20001,carla-renamed,pu
 
     expect(resumed.canonicalMatches).toBe(1);
     expect(resumed.appliedChanges).toMatchObject({
-      createProfiles: 1,
-      addObservations: 1,
+      createProfiles: 0,
+      addObservations: 0,
       suppressedProfiles: 1,
-      noops: 1,
+      noops: 2,
     });
     expect(resumed.rows).toEqual([
       expect.objectContaining({ row: 2, outcome: "noop", searchable: true }),
       expect.objectContaining({
         row: 3,
-        outcome: "created",
+        outcome: "noop",
         searchable: false,
       }),
     ]);

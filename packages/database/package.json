@@ -6,6 +6,7 @@
   "exports": {
     ".": "./src/service.ts",
     "./import-profiles": "./src/import-profiles.ts",
+    "./profile-control": "./src/profile-control.ts",
     "./neon": "./src/neon.ts",
     "./schema": "./src/schema.ts"
   },
