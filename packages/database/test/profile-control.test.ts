@@ -97,6 +97,28 @@ describe("Profile control", () => {
     ).toBe("member-auto");
   });
 
+  it("does not suggest or transfer Profiles that are already controlled", async () => {
+    await createMember("member-owner");
+    await createMember("member-thief");
+    const profile = await createImportedProfile("507");
+    await requestProfileClaim(database, {
+      profileId: profile.profileId,
+      memberId: "member-owner",
+      oauthGithubAccountId: "507",
+    });
+
+    await expect(
+      findClaimCandidates(database, { githubAccountId: "507" }),
+    ).resolves.toEqual([]);
+    await expect(
+      requestProfileClaim(database, {
+        profileId: profile.profileId,
+        memberId: "member-thief",
+        oauthGithubAccountId: "507",
+      }),
+    ).rejects.toThrow("profile_already_claimed");
+  });
+
   it("queues unverifiable claims for review and prevents claim collisions", async () => {
     await createMember("member-review");
     await createMember("member-collision");
@@ -226,7 +248,9 @@ describe("Profile control", () => {
           .where(eq(schema.profiles.profileId, profile.profileId))
       )[0],
     ).toMatchObject({ searchable: false, searchabilityReason: "disputed" });
-    await reviewProfileRequest(database, request.id, true);
+    expect(
+      await reviewProfileRequest(database, request.id, true),
+    ).toMatchObject({ id: request.id, status: "confirmed" });
     const csv = `contract_version,source,source_record_id,name,current_company,github_account_id,github_login,qualifying_evidence,adult_confirmed,professional_links\nhumans-profiles-v1,reimport,505,Restored Name,,505,remove-me,owned_repository,true,https://github.com/remove-me`;
     const report = await importProfiles(database, csv, { dryRun: false });
     expect(report.appliedChanges.createProfiles).toBe(0);
@@ -249,6 +273,36 @@ describe("Profile control", () => {
         .select()
         .from(schema.profileRequests)
         .where(eq(schema.profileRequests.profileId, profile.profileId)),
-    ).toHaveLength(0);
+    ).toEqual([expect.objectContaining({ status: "confirmed" })]);
+  });
+
+  it("restores the exact Searchability state after rejecting a request", async () => {
+    await createMember("member-dispute");
+    const profile = await createImportedProfile("508");
+    await requestProfileClaim(database, {
+      profileId: profile.profileId,
+      memberId: "member-dispute",
+      oauthGithubAccountId: "508",
+    });
+    await setProfileSearchability(database, "member-dispute", true);
+    const request = await submitPublicProfileRequest(database, {
+      profileId: profile.profileId,
+      kind: "correction",
+      requesterEmail: "person@example.com",
+      details: "The company is wrong",
+    });
+
+    await reviewProfileRequest(database, request.id, false);
+    expect(
+      (
+        await database
+          .select()
+          .from(schema.profiles)
+          .where(eq(schema.profiles.profileId, profile.profileId))
+      )[0],
+    ).toMatchObject({
+      searchable: true,
+      searchabilityReason: "member_opt_in",
+    });
   });
 });
