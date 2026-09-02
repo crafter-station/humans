@@ -176,6 +176,7 @@ export const createGitHubEnrichmentStages = (
 
   const account = async (input: GitHubEnrichmentInput) => {
     let run = await getRun(input, "account");
+    if (run.status === "succeeded") return run;
     try {
       let accountEvidence = await dependencies.store.loadCheckpoint<
         Collected<GitHubUser>
@@ -213,6 +214,7 @@ export const createGitHubEnrichmentStages = (
 
   const repositories = async (input: GitHubEnrichmentInput) => {
     let run = await getRun(input, "repositories");
+    if (run.status === "succeeded") return run;
     try {
       const accountEvidence = await dependencies.store.loadCheckpoint<
         Collected<GitHubUser>
@@ -293,6 +295,7 @@ export const createGitHubEnrichmentStages = (
 
   const normalization = async (input: GitHubEnrichmentInput) => {
     let run = await getRun(input, "normalization");
+    if (run.status === "succeeded") return run;
     try {
       const accountEvidence = await dependencies.store.loadCheckpoint<
         Collected<GitHubUser>
@@ -338,6 +341,7 @@ export const createGitHubEnrichmentStages = (
 
   const persistence = async (input: GitHubEnrichmentInput) => {
     let run = await getRun(input, "persistence");
+    if (run.status === "succeeded") return run;
     try {
       const persisted = await dependencies.store.loadCheckpoint<boolean>(
         run.id,

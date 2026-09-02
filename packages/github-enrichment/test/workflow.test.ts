@@ -509,4 +509,29 @@ describe("GitHub enrichment workflow", () => {
       finishedAt: "2026-09-01T00:00:00.000Z",
     });
   });
+
+  it("does not reopen a succeeded run after its snapshots expire", async () => {
+    const store = new MemoryStore();
+    let currentTime = fixedNow();
+    const provider = makeProvider();
+    const workflow = createGitHubEnrichmentWorkflow({
+      provider,
+      normalizer,
+      store,
+      now: () => currentTime,
+    });
+    const input = {
+      profileId: "profile-1",
+      githubLogin: "ada",
+      runId: "already-complete",
+    };
+
+    const completed = await workflow(input);
+    store.checkpoints.clear();
+    currentTime = new Date("2026-11-01T00:00:00.000Z");
+
+    await expect(workflow(input)).resolves.toEqual(completed);
+    expect(provider.getUser).toHaveBeenCalledTimes(1);
+    expect(store.run?.finishedAt).toBe("2026-09-01T00:00:00.000Z");
+  });
 });
