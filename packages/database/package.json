@@ -7,6 +7,7 @@
     ".": "./src/service.ts",
     "./import-profiles": "./src/import-profiles.ts",
     "./profile-control": "./src/profile-control.ts",
+    "./credits": "./src/credits.ts",
     "./neon": "./src/neon.ts",
     "./search-profiles": "./src/search-profiles.ts",
     "./schema": "./src/schema.ts"
