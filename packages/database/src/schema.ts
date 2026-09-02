@@ -142,6 +142,10 @@ export const profileRequests = pgTable("profile_requests", {
   kind: text("kind").notNull(),
   requesterEmail: text("requester_email").notNull(),
   details: text("details").notNull(),
+  previousSearchable: boolean("previous_searchable").notNull().default(false),
+  previousSearchabilityReason: text("previous_searchability_reason")
+    .notNull()
+    .default("approved_import"),
   status: text("status").notNull().default("pending"),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()

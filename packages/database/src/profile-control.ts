@@ -1,4 +1,4 @@
-import { and, desc, eq, isNull, ne } from "drizzle-orm";
+import { and, desc, eq, isNull, ne, or } from "drizzle-orm";
 import type { NeonDatabase } from "drizzle-orm/neon-serverless";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
@@ -31,10 +31,16 @@ export const findClaimCandidates = (
     .from(profiles)
     .where(
       identity.githubLogin === undefined
-        ? eq(profiles.githubAccountId, identity.githubAccountId)
+        ? and(
+            eq(profiles.githubAccountId, identity.githubAccountId),
+            isNull(profiles.memberId),
+            ne(profiles.searchabilityReason, "operator_suppression"),
+          )
         : and(
             eq(profiles.githubAccountId, identity.githubAccountId),
             eq(profiles.githubLogin, identity.githubLogin),
+            isNull(profiles.memberId),
+            ne(profiles.searchabilityReason, "operator_suppression"),
           ),
     )
     .limit(5);
@@ -54,6 +60,8 @@ export const requestProfileClaim = (
       .where(eq(profiles.profileId, input.profileId))
       .limit(1);
     if (!profile) throw new Error("profile_not_found");
+    if (profile.memberId !== null && profile.memberId !== input.memberId)
+      throw new Error("profile_already_claimed");
     const [collision] = await tx
       .select()
       .from(profileClaims)
@@ -94,6 +102,10 @@ export const requestProfileClaim = (
           and(
             eq(profiles.profileId, input.profileId),
             eq(profiles.githubAccountId, input.oauthGithubAccountId),
+            or(
+              isNull(profiles.memberId),
+              eq(profiles.memberId, input.memberId),
+            ),
           ),
         )
         .returning();
@@ -293,11 +305,21 @@ export const submitPublicProfileRequest = (
   },
 ) =>
   database.transaction(async (tx) => {
+    const [profile] = await tx
+      .select()
+      .from(profiles)
+      .where(eq(profiles.profileId, input.profileId))
+      .limit(1);
+    if (!profile) throw new Error("profile_not_found");
     const [request] = await tx
       .insert(profileRequests)
-      .values(input)
+      .values({
+        ...input,
+        previousSearchable: profile.searchable,
+        previousSearchabilityReason: profile.searchabilityReason,
+      })
       .returning();
-    const [profile] = await tx
+    await tx
       .update(profiles)
       .set({
         searchable: false,
@@ -306,7 +328,6 @@ export const submitPublicProfileRequest = (
       })
       .where(eq(profiles.profileId, input.profileId))
       .returning();
-    if (!profile) throw new Error("profile_not_found");
     return request!;
   });
 
@@ -362,16 +383,12 @@ export const reviewProfileRequest = (
       await tx
         .delete(profileClaims)
         .where(eq(profileClaims.profileId, profile.profileId));
-      await tx
-        .delete(profileRequests)
-        .where(eq(profileRequests.profileId, profile.profileId));
     } else if (!confirmed) {
       await tx
         .update(profiles)
         .set({
-          searchable: profile.memberId === null,
-          searchabilityReason:
-            profile.memberId === null ? "approved_import" : "member_opt_out",
+          searchable: request.previousSearchable,
+          searchabilityReason: request.previousSearchabilityReason,
           updatedAt: new Date(),
         })
         .where(eq(profiles.profileId, profile.profileId));
