@@ -6,12 +6,13 @@ import {
   type ProvisionedWorkspace,
 } from "@humans/database";
 import * as schema from "@humans/database/schema";
+import { applyCreditEntry } from "@humans/database/credits";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 import { Webhook } from "standardwebhooks";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { createApp } from "../src/app";
 import {
@@ -27,6 +28,7 @@ describe("Humans API", () => {
   } = {};
   let app: ReturnType<typeof createApp>;
   let identity: FakeIdentity;
+  let database: ReturnType<typeof drizzle<typeof schema>>;
 
   beforeAll(async () => {
     resources.container = await new PostgreSqlContainer(
@@ -36,7 +38,7 @@ describe("Humans API", () => {
       connectionString: resources.container.getConnectionUri(),
     });
 
-    const database = drizzle(resources.pool, { schema });
+    database = drizzle(resources.pool, { schema });
     await migrate(database, {
       migrationsFolder: fileURLToPath(
         new URL("../../../packages/database/drizzle", import.meta.url),
@@ -459,6 +461,99 @@ describe("Humans API", () => {
         name: "Signed Member",
       },
     });
+  });
+
+  it("previews and purchases Contact Reveals without logging values", async () => {
+    await database.insert(schema.members).values([
+      { clerkId: "reveal_owner", name: "Reveal Owner" },
+      { clerkId: "reveal_member", name: "Reveal Member" },
+    ]);
+    await database.insert(schema.organizations).values({
+      clerkId: "reveal_organization",
+      name: "Reveal Organization",
+    });
+    await database.insert(schema.organizationMemberships).values({
+      clerkId: "reveal_membership",
+      memberId: "reveal_member",
+      organizationId: "reveal_organization",
+      role: "org:member",
+    });
+    await database.insert(schema.profiles).values({
+      profileId: "reveal_profile",
+      memberId: "reveal_owner",
+      name: "Reveal Profile",
+      githubAccountId: "reveal_github",
+      githubLogin: "reveal-profile",
+      eligibilityBasis: "owned_repository",
+      adultAttested: true,
+      searchable: true,
+      searchabilityReason: "member_opt_in",
+    });
+    await database.insert(schema.profileObservations).values({
+      id: "reveal_observation",
+      profileId: "reveal_profile",
+      field: "contact-detail",
+      value: {
+        type: "professional-email",
+        value: "private@company.example",
+      },
+      source: "tikhub",
+      sourceRecordId: "api_reveal_source",
+      pipelineVersion: "tikhub-v1",
+      confidence: 0.97,
+    });
+    await applyCreditEntry(database, {
+      organizationId: "reveal_organization",
+      idempotencyKey: "api:grant",
+      kind: "grant",
+      amount: 10,
+    });
+    identity.sessions.set("reveal_session", {
+      memberId: "reveal_member",
+      organizationId: "reveal_organization",
+    });
+
+    const previewResponse = await app.request("/v1/profiles/reveal_profile", {
+      headers: { authorization: "Bearer reveal_session" },
+    });
+    expect(previewResponse.status).toBe(200);
+    expect(previewResponse.headers.get("cache-control")).toBe(
+      "private, no-store",
+    );
+    await expect(previewResponse.json()).resolves.toMatchObject({
+      profile: {
+        contactDetails: [
+          {
+            maskedValue: "p***@c***.example",
+            price: 5,
+            previouslyPurchased: false,
+            sourceCategory: "professional-network",
+            type: "professional-email",
+          },
+        ],
+      },
+    });
+
+    const log = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const purchaseResponse = await app.request(
+      "/v1/profiles/reveal_profile/contact-reveals/email",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer reveal_session",
+          "Idempotency-Key": "api:reveal",
+        },
+      },
+    );
+    expect(purchaseResponse.status).toBe(200);
+    await expect(purchaseResponse.json()).resolves.toMatchObject({
+      reveal: { price: 5, value: "private@company.example" },
+    });
+    expect(JSON.stringify(log.mock.calls)).not.toContain(
+      "private@company.example",
+    );
+    expect(JSON.stringify(log.mock.calls)).not.toContain("p***@c***.example");
+    log.mockRestore();
   });
 });
 

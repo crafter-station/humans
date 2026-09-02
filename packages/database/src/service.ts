@@ -6,6 +6,7 @@ import { Context, Effect, Layer, Schema } from "effect";
 import {
   clerkWebhookEvents,
   clerkProjectionVersions,
+  contactDetailSuppressions,
   members,
   memberStatements,
   organizationMemberships,
@@ -28,6 +29,16 @@ import {
   renameSavedList,
   updateSavedListEntryNote,
 } from "./saved-lists";
+import {
+  ContactRevealError,
+  type ContactDetailType,
+  getOrganizationContactRevealPolicy,
+  listContactDetails,
+  purchaseContactReveal,
+  reportInvalidContactDetail,
+  setContactDetailSuppression,
+  setOrganizationContactRevealPolicy,
+} from "./contact-reveals";
 
 type DrizzleDatabase =
   | NeonDatabase<typeof import("./schema")>
@@ -108,6 +119,9 @@ export type MemberProfile = ProfileInput & {
     "owned_repository" | "public_contribution" | "private_attestation";
   searchabilityReason:
     "member_opt_in" | "member_opt_out" | "operator_suppression";
+  contactSuppressions: Array<
+    "professional-email" | "direct-professional-phone"
+  >;
 };
 
 export class DatabaseUnavailable extends Schema.TaggedError<DatabaseUnavailable>()(
@@ -130,6 +144,11 @@ export class ProfileRejected extends Schema.TaggedError<ProfileRejected>()(
 export class SearchRejected extends Schema.TaggedError<SearchRejected>()(
   "SearchRejected",
   {},
+) {}
+
+export class ContactRevealRejected extends Schema.TaggedError<ContactRevealRejected>()(
+  "ContactRevealRejected",
+  { reason: Schema.String },
 ) {}
 
 export class Database extends Context.Service<
@@ -170,6 +189,57 @@ export class Database extends Context.Service<
     ) => Effect.Effect<
       Awaited<ReturnType<typeof getSearchableProfile>>,
       DatabaseUnavailable
+    >;
+    readonly listContactDetails: (
+      memberId: string,
+      organizationId: string,
+      profileId: string,
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof listContactDetails>>,
+      DatabaseUnavailable | ContactRevealRejected
+    >;
+    readonly purchaseContactReveal: (input: {
+      memberId: string;
+      organizationId: string;
+      profileId: string;
+      type: ContactDetailType;
+      idempotencyKey: string;
+      observationId?: string;
+    }) => Effect.Effect<
+      Awaited<ReturnType<typeof purchaseContactReveal>>,
+      DatabaseUnavailable | ContactRevealRejected
+    >;
+    readonly reportInvalidContactDetail: (input: {
+      memberId: string;
+      organizationId: string;
+      observationId: string;
+      reason: "bounced-email" | "wrong-phone";
+    }) => Effect.Effect<
+      Awaited<ReturnType<typeof reportInvalidContactDetail>>,
+      DatabaseUnavailable | ContactRevealRejected
+    >;
+    readonly setContactDetailSuppression: (
+      memberId: string,
+      type: ContactDetailType,
+      suppressed: boolean,
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof setContactDetailSuppression>>,
+      DatabaseUnavailable | ContactRevealRejected
+    >;
+    readonly setOrganizationContactRevealPolicy: (
+      memberId: string,
+      organizationId: string,
+      membersCanReveal: boolean,
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof setOrganizationContactRevealPolicy>>,
+      DatabaseUnavailable | ContactRevealRejected
+    >;
+    readonly getOrganizationContactRevealPolicy: (
+      memberId: string,
+      organizationId: string,
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof getOrganizationContactRevealPolicy>>,
+      DatabaseUnavailable | ContactRevealRejected
     >;
     readonly listSavedLists: (
       memberId: string,
@@ -418,7 +488,7 @@ export const makeDatabaseService = (
           .limit(1);
         if (profile === undefined) return null;
 
-        const [links, statements] = await Promise.all([
+        const [links, statements, suppressions] = await Promise.all([
           database
             .select({ url: professionalLinks.url })
             .from(professionalLinks)
@@ -431,9 +501,13 @@ export const makeDatabaseService = (
             .from(memberStatements)
             .where(eq(memberStatements.profileId, profile.profileId))
             .orderBy(desc(memberStatements.collectedAt)),
+          database
+            .select({ type: contactDetailSuppressions.type })
+            .from(contactDetailSuppressions)
+            .where(eq(contactDetailSuppressions.profileId, profile.profileId)),
         ]);
 
-        return profileResult(profile, links, statements);
+        return profileResult(profile, links, statements, suppressions);
       },
       catch: (cause) => new DatabaseUnavailable({ cause }),
     }).pipe(Effect.withSpan("Database.getProfile"));
@@ -550,6 +624,7 @@ export const makeDatabaseService = (
             githubLogin: github.login,
             eligibilityBasis,
             searchabilityReason,
+            contactSuppressions: existing?.contactSuppressions ?? [],
           };
         },
         catch: (cause) =>
@@ -613,6 +688,15 @@ export const makeDatabaseService = (
       catch: (cause) => new DatabaseUnavailable({ cause }),
     }).pipe(Effect.withSpan(name));
 
+  const contact = <A>(name: string, operation: () => Promise<A>) =>
+    Effect.tryPromise({
+      try: operation,
+      catch: (cause) =>
+        cause instanceof ContactRevealError
+          ? new ContactRevealRejected({ reason: cause.code })
+          : new DatabaseUnavailable({ cause }),
+    }).pipe(Effect.withSpan(name));
+
   return Database.of({
     check,
     addSavedListEntry: (memberId, organizationId, listId, profileId) =>
@@ -635,6 +719,14 @@ export const makeDatabaseService = (
       ),
     disableProfileSearchability,
     getSearchableProfile: getSearchResult,
+    getOrganizationContactRevealPolicy: (memberId, organizationId) =>
+      contact("Database.getOrganizationContactRevealPolicy", () =>
+        getOrganizationContactRevealPolicy(database, memberId, organizationId),
+      ),
+    listContactDetails: (memberId, organizationId, profileId) =>
+      contact("Database.listContactDetails", () =>
+        listContactDetails(database, memberId, organizationId, profileId),
+      ),
     getProfile,
     getWorkspace,
     listSavedLists: (memberId, organizationId) =>
@@ -643,6 +735,14 @@ export const makeDatabaseService = (
       ),
     projectClerkEvent,
     provisionWorkspace,
+    purchaseContactReveal: (input) =>
+      contact("Database.purchaseContactReveal", () =>
+        purchaseContactReveal(database, input),
+      ),
+    reportInvalidContactDetail: (input) =>
+      contact("Database.reportInvalidContactDetail", () =>
+        reportInvalidContactDetail(database, input),
+      ),
     removeSavedListEntry: (memberId, organizationId, listId, profileId) =>
       saved("Database.removeSavedListEntry", () =>
         removeSavedListEntry(
@@ -659,6 +759,23 @@ export const makeDatabaseService = (
       ),
     saveProfile,
     searchProfiles: search,
+    setContactDetailSuppression: (memberId, type, suppressed) =>
+      contact("Database.setContactDetailSuppression", () =>
+        setContactDetailSuppression(database, memberId, type, suppressed),
+      ),
+    setOrganizationContactRevealPolicy: (
+      memberId,
+      organizationId,
+      membersCanReveal,
+    ) =>
+      contact("Database.setOrganizationContactRevealPolicy", () =>
+        setOrganizationContactRevealPolicy(
+          database,
+          memberId,
+          organizationId,
+          membersCanReveal,
+        ),
+      ),
     updateSavedListEntryNote: (
       memberId,
       organizationId,
@@ -707,6 +824,7 @@ const profileResult = (
   profile: typeof profiles.$inferSelect,
   links: Array<{ url: string }>,
   statements: Array<{ field: string; value: unknown }>,
+  suppressions: Array<{ type: string }>,
 ): MemberProfile => ({
   memberId: profile.memberId!,
   name: profile.name,
@@ -728,6 +846,12 @@ const profileResult = (
     profile.eligibilityBasis as MemberProfile["eligibilityBasis"],
   searchabilityReason:
     profile.searchabilityReason as MemberProfile["searchabilityReason"],
+  contactSuppressions: suppressions
+    .map(({ type }) => type)
+    .filter(
+      (type): type is MemberProfile["contactSuppressions"][number] =>
+        type === "professional-email" || type === "direct-professional-phone",
+    ),
 });
 
 export const makeDatabaseLayer = (

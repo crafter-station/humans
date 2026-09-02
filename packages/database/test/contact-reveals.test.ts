@@ -4,23 +4,26 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
-  invalidateContactDetail,
+  contactRevealLogFields,
+  listContactDetails,
+  purchaseContactReveal,
   recordVerifiedContactDetail,
-  revealContactDetail,
+  reportInvalidContactDetail,
+  setContactDetailSuppression,
+  setOrganizationContactRevealPolicy,
 } from "../src/contact-reveals";
 import { applyCreditEntry, getCreditBalance } from "../src/credits";
 import * as schema from "../src/schema";
 
-describe("Organization-scoped Contact Reveals", () => {
+describe("Contact Reveals", () => {
   const resources: {
     container?: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
     pool?: Pool;
   } = {};
   let database: ReturnType<typeof drizzle<typeof schema>>;
-  let profileId: string;
 
   beforeAll(async () => {
     resources.container = await new PostgreSqlContainer(
@@ -33,38 +36,22 @@ describe("Organization-scoped Contact Reveals", () => {
     await migrate(database, {
       migrationsFolder: fileURLToPath(new URL("../drizzle", import.meta.url)),
     });
-    await database
-      .insert(schema.members)
-      .values([{ clerkId: "member_reveals" }, { clerkId: "member_outsider" }]);
-    await database.insert(schema.organizations).values([
-      { clerkId: "organization_reveals", name: "Reveals" },
-      { clerkId: "organization_other", name: "Other" },
-    ]);
-    await database.insert(schema.organizationMemberships).values({
-      clerkId: "membership_reveals",
-      memberId: "member_reveals",
-      organizationId: "organization_reveals",
-      role: "member",
-    });
-    const [profile] = await database
-      .insert(schema.profiles)
-      .values({
-        name: "Ada",
-        githubAccountId: "github_contact_ada",
-        githubLogin: "ada",
-        eligibilityBasis: "owned_repository",
-        adultAttested: true,
-        searchable: true,
-        searchabilityReason: "approved_import",
-      })
-      .returning();
-    profileId = profile!.profileId;
-    await applyCreditEntry(database, {
-      organizationId: "organization_reveals",
-      idempotencyKey: "grant:reveals",
-      kind: "grant",
-      amount: 5,
-    });
+  });
+
+  beforeEach(async () => {
+    await database.delete(schema.reenrichmentOutbox);
+    await database.delete(schema.contactDetailInvalidations);
+    await database.delete(schema.contactRevealRequests);
+    await database.delete(schema.contactReveals);
+    await database.delete(schema.contactDetailSuppressions);
+    await database.delete(schema.creditLedgerEntries);
+    await database.delete(schema.creditAccounts);
+    await database.delete(schema.profileObservations);
+    await database.delete(schema.profiles);
+    await database.delete(schema.organizationMemberships);
+    await database.delete(schema.organizations);
+    await database.delete(schema.members);
+    await seed();
   });
 
   afterAll(async () => {
@@ -72,12 +59,95 @@ describe("Organization-scoped Contact Reveals", () => {
     await resources.container?.stop();
   });
 
-  it("accepts only provider-verified professional Contact Details", async () => {
+  const seed = async () => {
+    await database.insert(schema.members).values([
+      { clerkId: "member_owner", name: "Owner" },
+      { clerkId: "member_one", name: "One" },
+      { clerkId: "member_two", name: "Two" },
+      { clerkId: "member_admin", name: "Admin" },
+    ]);
+    await database.insert(schema.organizations).values([
+      { clerkId: "organization_one", name: "One" },
+      { clerkId: "organization_two", name: "Two" },
+    ]);
+    await database.insert(schema.organizationMemberships).values([
+      {
+        clerkId: "membership_one",
+        memberId: "member_one",
+        organizationId: "organization_one",
+        role: "org:member",
+      },
+      {
+        clerkId: "membership_admin",
+        memberId: "member_admin",
+        organizationId: "organization_one",
+        role: "org:admin",
+      },
+      {
+        clerkId: "membership_two",
+        memberId: "member_two",
+        organizationId: "organization_two",
+        role: "org:member",
+      },
+    ]);
+    await database.insert(schema.profiles).values({
+      profileId: "profile_one",
+      memberId: "member_owner",
+      name: "Profile One",
+      githubAccountId: "github_one",
+      githubLogin: "one",
+      eligibilityBasis: "owned_repository",
+      adultAttested: true,
+      searchable: true,
+      searchabilityReason: "member_opt_in",
+    });
+    await database.insert(schema.profileObservations).values([
+      {
+        id: "email_observation",
+        profileId: "profile_one",
+        field: "contact-detail",
+        value: { type: "professional-email", value: "alex@example.com" },
+        source: "tikhub",
+        sourceRecordId: "email_source",
+        pipelineVersion: "tikhub-v1",
+        confidence: 0.98,
+        collectedAt: new Date("2026-08-25T12:00:00Z"),
+      },
+      {
+        id: "phone_observation",
+        profileId: "profile_one",
+        field: "contact-detail",
+        value: {
+          type: "direct-professional-phone",
+          value: "+57 300 555 1212",
+        },
+        source: "tikhub",
+        sourceRecordId: "phone_source",
+        pipelineVersion: "tikhub-v1",
+        confidence: 0.94,
+        collectedAt: new Date("2026-08-24T12:00:00Z"),
+      },
+    ]);
+    await applyCreditEntry(database, {
+      organizationId: "organization_one",
+      idempotencyKey: "grant:one",
+      kind: "grant",
+      amount: 20,
+    });
+    await applyCreditEntry(database, {
+      organizationId: "organization_two",
+      idempotencyKey: "grant:two",
+      kind: "grant",
+      amount: 20,
+    });
+  };
+
+  it("stores only provider-verified professional Contact Detail Observations", async () => {
     await expect(
       recordVerifiedContactDetail(database, {
-        profileId,
+        profileId: "profile_one",
         kind: "phone",
-        value: "+51 555 0100",
+        value: "+57 300 555 0100",
         source: "provider",
         sourceRecordId: "switchboard",
         category: "professional",
@@ -86,53 +156,377 @@ describe("Organization-scoped Contact Reveals", () => {
         verifiedAt: new Date(),
       }),
     ).rejects.toThrow("contact_detail_not_eligible");
+
+    await expect(
+      recordVerifiedContactDetail(database, {
+        profileId: "profile_one",
+        kind: "email",
+        value: "verified@example.com",
+        source: "provider",
+        sourceRecordId: "verified-email",
+        category: "professional",
+        verification: "provider-verified",
+        verifiedAt: new Date("2026-09-01T00:00:00Z"),
+      }),
+    ).resolves.toMatchObject({
+      field: "contact-detail",
+      value: {
+        type: "professional-email",
+        value: "verified@example.com",
+      },
+      confidence: 1,
+    });
   });
 
-  it("charges once and shares an active reveal only inside its Organization", async () => {
-    const detail = await recordVerifiedContactDetail(database, {
-      profileId,
-      kind: "email",
-      value: "ada@example.com",
-      source: "provider",
-      sourceRecordId: "work-email",
-      category: "professional",
-      verification: "provider-verified",
-      verifiedAt: new Date("2026-09-01T00:00:00Z"),
-    });
-    const input = {
-      memberId: "member_reveals",
-      organizationId: "organization_reveals",
-      contactDetailId: detail.id,
-    };
-    const results = await Promise.all([
-      revealContactDetail(database, input),
-      revealContactDetail(database, input),
+  it("previews masked professional details and charges concurrent reveals once", async () => {
+    const previews = await listContactDetails(
+      database,
+      "member_one",
+      "organization_one",
+      "profile_one",
+    );
+    expect(previews).toEqual([
+      {
+        observationId: "email_observation",
+        type: "professional-email",
+        maskedValue: "a***@e***.com",
+        sourceCategory: "professional-network",
+        collectedAt: "2026-08-25T12:00:00.000Z",
+        confidence: 0.98,
+        price: 5,
+        previouslyPurchased: false,
+      },
+      {
+        observationId: "phone_observation",
+        type: "direct-professional-phone",
+        maskedValue: "+**********12",
+        sourceCategory: "professional-network",
+        collectedAt: "2026-08-24T12:00:00.000Z",
+        confidence: 0.94,
+        price: 10,
+        previouslyPurchased: false,
+      },
     ]);
 
-    expect(results.filter(({ charged }) => charged)).toHaveLength(1);
-    expect(results[0]?.detail.value).toBe("ada@example.com");
-    expect(await getCreditBalance(database, "organization_reveals")).toBe(4);
-    await expect(
-      revealContactDetail(database, {
-        ...input,
-        memberId: "member_outsider",
-        organizationId: "organization_other",
+    const results = await Promise.all([
+      purchaseContactReveal(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+        profileId: "profile_one",
+        type: "professional-email",
+        idempotencyKey: "reveal:one",
       }),
-    ).rejects.toThrow("contact_detail_unavailable");
-
-    const invalidated = await invalidateContactDetail(database, detail.id);
-    expect(invalidated.refundedReveals).toBe(1);
-    expect(await getCreditBalance(database, "organization_reveals")).toBe(5);
-    await expect(revealContactDetail(database, input)).rejects.toThrow(
-      "contact_detail_unavailable",
-    );
+      purchaseContactReveal(database, {
+        memberId: "member_admin",
+        organizationId: "organization_one",
+        profileId: "profile_one",
+        type: "professional-email",
+        idempotencyKey: "reveal:concurrent",
+      }),
+    ]);
+    expect(results.map(({ value }) => value)).toEqual([
+      "alex@example.com",
+      "alex@example.com",
+    ]);
+    expect(results.reduce((total, result) => total + result.price, 0)).toBe(5);
+    expect(await getCreditBalance(database, "organization_one")).toBe(15);
     expect(
       await database
         .select()
         .from(schema.creditLedgerEntries)
-        .where(
-          eq(schema.creditLedgerEntries.referenceId, results[0]!.reveal.id),
-        ),
+        .where(eq(schema.creditLedgerEntries.kind, "reservation")),
+    ).toHaveLength(1);
+
+    const reopened = await listContactDetails(
+      database,
+      "member_one",
+      "organization_one",
+      "profile_one",
+    );
+    expect(reopened[0]).toMatchObject({
+      value: "alex@example.com",
+      previouslyPurchased: true,
+    });
+    const isolated = await listContactDetails(
+      database,
+      "member_two",
+      "organization_two",
+      "profile_one",
+    );
+    expect(isolated[0]).not.toHaveProperty("value");
+  });
+
+  it("rejects insufficient Credits without leaving a purchase or reservation", async () => {
+    await expect(
+      purchaseContactReveal(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+        profileId: "profile_one",
+        type: "direct-professional-phone",
+        idempotencyKey: "reveal:phone:first",
+      }),
+    ).resolves.toMatchObject({ price: 10 });
+    await expect(
+      purchaseContactReveal(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+        profileId: "profile_one",
+        type: "professional-email",
+        idempotencyKey: "reveal:email:first",
+      }),
+    ).resolves.toMatchObject({ price: 5 });
+    await expect(
+      purchaseContactReveal(database, {
+        memberId: "member_two",
+        organizationId: "organization_two",
+        profileId: "profile_one",
+        type: "direct-professional-phone",
+        idempotencyKey: "reveal:phone:two",
+      }),
+    ).resolves.toMatchObject({ price: 10 });
+    await applyCreditEntry(database, {
+      organizationId: "organization_two",
+      idempotencyKey: "charge:remainder",
+      kind: "charge",
+      amount: 10,
+    });
+    await expect(
+      purchaseContactReveal(database, {
+        memberId: "member_two",
+        organizationId: "organization_two",
+        profileId: "profile_one",
+        type: "professional-email",
+        idempotencyKey: "reveal:insufficient",
+      }),
+    ).rejects.toThrow("insufficient_credits");
+    expect(
+      await database
+        .select()
+        .from(schema.contactReveals)
+        .where(eq(schema.contactReveals.idempotencyKey, "reveal:insufficient")),
+    ).toHaveLength(0);
+  });
+
+  it("binds idempotent replay to the originally purchased Observation", async () => {
+    const input = {
+      memberId: "member_one",
+      organizationId: "organization_one",
+      profileId: "profile_one",
+      type: "professional-email" as const,
+      idempotencyKey: "replay:original",
+    };
+    await expect(purchaseContactReveal(database, input)).resolves.toMatchObject(
+      {
+        observationId: "email_observation",
+        value: "alex@example.com",
+        price: 5,
+      },
+    );
+    await database.insert(schema.profileObservations).values({
+      id: "new_email_observation",
+      profileId: "profile_one",
+      field: "contact-detail",
+      value: { type: "professional-email", value: "new@example.com" },
+      source: "tikhub",
+      sourceRecordId: "new_email_source",
+      pipelineVersion: "tikhub-v2",
+      confidence: 0.99,
+      collectedAt: new Date("2026-09-01T12:00:00Z"),
+    });
+    await expect(purchaseContactReveal(database, input)).resolves.toMatchObject(
+      {
+        observationId: "email_observation",
+        value: "alex@example.com",
+        price: 0,
+      },
+    );
+    await expect(
+      purchaseContactReveal(database, {
+        ...input,
+        idempotencyKey: "replay:new-detail",
+        observationId: "new_email_observation",
+      }),
+    ).resolves.toMatchObject({
+      observationId: "new_email_observation",
+      value: "new@example.com",
+      price: 5,
+    });
+  });
+
+  it("reserves Credits again before retrying a released reveal", async () => {
+    await purchaseContactReveal(database, {
+      memberId: "member_one",
+      organizationId: "organization_one",
+      profileId: "profile_one",
+      type: "professional-email",
+      idempotencyKey: "released:first",
+    });
+    const [reveal] = await database
+      .update(schema.contactReveals)
+      .set({ status: "released" })
+      .where(eq(schema.contactReveals.idempotencyKey, "released:first"))
+      .returning();
+    await database
+      .update(schema.contactRevealRequests)
+      .set({ status: "released" })
+      .where(eq(schema.contactRevealRequests.idempotencyKey, "released:first"));
+    await applyCreditEntry(database, {
+      organizationId: "organization_one",
+      idempotencyKey: "released:first:simulated-release",
+      kind: "refund",
+      amount: 5,
+      referenceId: reveal!.id,
+    });
+    await expect(
+      purchaseContactReveal(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+        profileId: "profile_one",
+        type: "professional-email",
+        idempotencyKey: "released:retry",
+      }),
+    ).resolves.toMatchObject({ price: 5, value: "alex@example.com" });
+    expect(await getCreditBalance(database, "organization_one")).toBe(15);
+    await expect(
+      purchaseContactReveal(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+        profileId: "profile_one",
+        type: "professional-email",
+        idempotencyKey: "released:first",
+      }),
+    ).rejects.toThrow("invalid_contact_detail");
+  });
+
+  it("lets admins restrict Member purchases while retaining admin access", async () => {
+    await setOrganizationContactRevealPolicy(
+      database,
+      "member_admin",
+      "organization_one",
+      false,
+    );
+    await expect(
+      purchaseContactReveal(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+        profileId: "profile_one",
+        type: "professional-email",
+        idempotencyKey: "restricted:member",
+      }),
+    ).rejects.toThrow("forbidden");
+    await expect(
+      purchaseContactReveal(database, {
+        memberId: "member_admin",
+        organizationId: "organization_one",
+        profileId: "profile_one",
+        type: "professional-email",
+        idempotencyKey: "restricted:admin",
+      }),
+    ).resolves.toMatchObject({ value: "alex@example.com" });
+  });
+
+  it("removes purchased access immediately when the controlling Member suppresses a type", async () => {
+    await purchaseContactReveal(database, {
+      memberId: "member_one",
+      organizationId: "organization_one",
+      profileId: "profile_one",
+      type: "professional-email",
+      idempotencyKey: "owner:suppression",
+    });
+    await setContactDetailSuppression(
+      database,
+      "member_owner",
+      "professional-email",
+      true,
+    );
+    const details = await listContactDetails(
+      database,
+      "member_one",
+      "organization_one",
+      "profile_one",
+    );
+    expect(details.map(({ type }) => type)).toEqual([
+      "direct-professional-phone",
+    ]);
+  });
+
+  it("suppresses invalid details, refunds every purchaser once, and queues re-enrichment", async () => {
+    await purchaseContactReveal(database, {
+      memberId: "member_one",
+      organizationId: "organization_one",
+      profileId: "profile_one",
+      type: "professional-email",
+      idempotencyKey: "invalid:one",
+    });
+    await purchaseContactReveal(database, {
+      memberId: "member_two",
+      organizationId: "organization_two",
+      profileId: "profile_one",
+      type: "professional-email",
+      idempotencyKey: "invalid:two",
+    });
+    await expect(
+      reportInvalidContactDetail(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+        observationId: "email_observation",
+        reason: "wrong-phone",
+      }),
+    ).rejects.toThrow("invalid_contact_detail");
+    expect(
+      await reportInvalidContactDetail(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+        observationId: "email_observation",
+        reason: "bounced-email",
+      }),
+    ).toEqual({ refunded: true });
+    expect(
+      await reportInvalidContactDetail(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+        observationId: "email_observation",
+        reason: "bounced-email",
+      }),
+    ).toEqual({ refunded: false });
+    expect(await getCreditBalance(database, "organization_one")).toBe(20);
+    expect(await getCreditBalance(database, "organization_two")).toBe(20);
+    expect(
+      await database.select().from(schema.reenrichmentOutbox),
+    ).toHaveLength(1);
+    expect(
+      await database
+        .select()
+        .from(schema.creditLedgerEntries)
+        .where(eq(schema.creditLedgerEntries.kind, "refund")),
     ).toHaveLength(2);
+    expect(
+      await listContactDetails(
+        database,
+        "member_one",
+        "organization_one",
+        "profile_one",
+      ),
+    ).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ observationId: "email_observation" }),
+      ]),
+    );
+  });
+
+  it("never includes Contact Detail values in structured log fields", () => {
+    const serialized = JSON.stringify(
+      contactRevealLogFields({
+        memberId: "member_one",
+        organizationId: "organization_one",
+        profileId: "profile_one",
+        observationId: "email_observation",
+        type: "professional-email",
+        result: "finalized",
+      }),
+    );
+    expect(serialized).not.toContain("alex@example.com");
+    expect(serialized).not.toContain("a***@e***.com");
+    expect(serialized).not.toContain("+57 300 555 1212");
   });
 });

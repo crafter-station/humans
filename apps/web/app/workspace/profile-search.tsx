@@ -2,6 +2,7 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
+import { useAuth } from "@clerk/nextjs";
 
 type SearchResult = {
   profileId: string;
@@ -18,7 +19,21 @@ type SearchResult = {
   evidence: "member" | "strong" | "supported";
 };
 
-type ProfileDetail = SearchResult & { links: string[] };
+type ContactDetail = {
+  observationId: string;
+  type: "professional-email" | "direct-professional-phone";
+  maskedValue: string;
+  value?: string;
+  sourceCategory: string;
+  collectedAt: string;
+  confidence: number;
+  price: 5 | 10;
+  previouslyPurchased: boolean;
+};
+type ProfileDetail = SearchResult & {
+  links: string[];
+  contactDetails: ContactDetail[];
+};
 type SavedList = {
   id: string;
   name: string;
@@ -31,6 +46,7 @@ export function ProfileSearch({
   onCreateProfile: () => void;
 }) {
   const router = useRouter();
+  const { orgRole } = useAuth();
   const searchParams = useSearchParams();
   const [results, setResults] = useState<SearchResult[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
@@ -41,6 +57,7 @@ export function ProfileSearch({
     null,
   );
   const [interpreting, setInterpreting] = useState(false);
+  const [membersCanReveal, setMembersCanReveal] = useState(true);
   const searchRequestParameters = new URLSearchParams(searchParams);
   searchRequestParameters.delete("profile");
   searchRequestParameters.delete("view");
@@ -54,6 +71,21 @@ export function ProfileSearch({
   useEffect(() => {
     void refreshLists();
   }, []);
+
+  useEffect(() => {
+    if (orgRole !== "org:admin") return;
+    const controller = new AbortController();
+    void fetch("/api/contact-reveals/organization/contact-reveal-policy", {
+      cache: "no-store",
+      signal: controller.signal,
+    })
+      .then((response) => response.json())
+      .then((result: { policy?: { membersCanReveal: boolean } }) => {
+        if (result.policy) setMembersCanReveal(result.policy.membersCanReveal);
+      })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [orgRole]);
 
   const createList = async () => {
     const name = window.prompt("Name this shared Saved List");
@@ -76,6 +108,18 @@ export function ProfileSearch({
       method: saved ? "DELETE" : "PUT",
     });
     await refreshLists();
+  };
+  const toggleRevealPolicy = async () => {
+    const next = !membersCanReveal;
+    const response = await fetch(
+      "/api/contact-reveals/organization/contact-reveal-policy",
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ membersCanReveal: next }),
+      },
+    );
+    if (response.ok) setMembersCanReveal(next);
   };
 
   useEffect(() => {
@@ -217,6 +261,13 @@ export function ProfileSearch({
         <button className="profileLink" onClick={createList}>
           New Saved List
         </button>
+        {orgRole === "org:admin" && (
+          <button className="profileLink" onClick={toggleRevealPolicy}>
+            {membersCanReveal
+              ? "Restrict reveals to admins"
+              : "Allow all Members to reveal"}
+          </button>
+        )}
       </div>
 
       <form action={interpretQuery} className="naturalSearch">
@@ -452,6 +503,7 @@ export function ProfileSearch({
               <p>Loading Profile...</p>
             ) : (
               <ProfilePanel
+                key={profile.profileId}
                 profile={profile}
                 lists={lists}
                 onToggle={toggleSaved}
@@ -476,6 +528,9 @@ function ProfilePanel({
   onToggle: (profileId: string) => Promise<void>;
   onRefresh: () => Promise<void>;
 }) {
+  const [contactDetails, setContactDetails] = useState(profile.contactDetails);
+  const [contactMessage, setContactMessage] = useState<string | null>(null);
+  const [pendingContact, setPendingContact] = useState<string | null>(null);
   const entry = lists
     .flatMap((list) => list.entries.map((entry) => ({ ...entry, list })))
     .find((entry) => entry.profileId === profile.profileId);
@@ -490,6 +545,82 @@ function ProfilePanel({
       },
     );
     await onRefresh();
+  };
+  const reveal = async (detail: ContactDetail) => {
+    setPendingContact(detail.observationId);
+    setContactMessage(null);
+    const type = detail.type === "professional-email" ? "email" : "phone";
+    const response = await fetch(
+      `/api/contact-reveals/profiles/${profile.profileId}/contact-reveals/${type}`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "Idempotency-Key": crypto.randomUUID(),
+        },
+        body: JSON.stringify({ observationId: detail.observationId }),
+      },
+    );
+    const result = (await response.json()) as {
+      reveal?: {
+        observationId: string;
+        value: string;
+        previouslyPurchased: boolean;
+      };
+      error?: { message: string };
+    };
+    setPendingContact(null);
+    if (!response.ok || !result.reveal) {
+      setContactMessage(
+        result.error?.message ?? "The Contact Detail could not be revealed.",
+      );
+      return;
+    }
+    setContactDetails((current) =>
+      current.map((item) =>
+        item.observationId === result.reveal!.observationId
+          ? {
+              ...item,
+              value: result.reveal!.value,
+              previouslyPurchased: true,
+            }
+          : item,
+      ),
+    );
+    setContactMessage(
+      result.reveal.previouslyPurchased
+        ? "This Organization already owned this Contact Reveal. No Credits were charged."
+        : `Contact Reveal purchased for ${detail.price} Credits.`,
+    );
+  };
+  const reportInvalid = async (detail: ContactDetail) => {
+    setPendingContact(detail.observationId);
+    const response = await fetch(
+      `/api/contact-reveals/contact-details/${detail.observationId}/report`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          reason:
+            detail.type === "professional-email"
+              ? "bounced-email"
+              : "wrong-phone",
+        }),
+      },
+    );
+    setPendingContact(null);
+    if (!response.ok) {
+      setContactMessage("The invalid Contact Detail report could not be sent.");
+      return;
+    }
+    setContactDetails((current) =>
+      current.filter(
+        ({ observationId }) => observationId !== detail.observationId,
+      ),
+    );
+    setContactMessage(
+      "The Contact Detail was suppressed, its purchases refunded, and re-enrichment queued.",
+    );
   };
   return (
     <>
@@ -548,6 +679,76 @@ function ProfilePanel({
           <span key={skill}>{skill}</span>
         ))}
       </div>
+      <section className="contactDetails" aria-labelledby="contact-heading">
+        <div className="contactHeading">
+          <p className="eyebrow">Credit-backed access</p>
+          <h3 id="contact-heading">Professional Contact Details</h3>
+        </div>
+        {contactDetails.length === 0 ? (
+          <p className="contactEmpty">No verified professional details.</p>
+        ) : (
+          contactDetails.map((detail) => (
+            <article className="contactCard" key={detail.observationId}>
+              <div>
+                <span className="contactType">
+                  {detail.type === "professional-email"
+                    ? "Verified professional email"
+                    : "Verified direct professional phone"}
+                </span>
+                <strong>{detail.value ?? detail.maskedValue}</strong>
+              </div>
+              <dl>
+                <div>
+                  <dt>Source</dt>
+                  <dd>{detail.sourceCategory}</dd>
+                </div>
+                <div>
+                  <dt>Freshness</dt>
+                  <dd>{relativeDate(detail.collectedAt)}</dd>
+                </div>
+                <div>
+                  <dt>Confidence</dt>
+                  <dd>{Math.round(detail.confidence * 100)}%</dd>
+                </div>
+                <div>
+                  <dt>Price</dt>
+                  <dd>
+                    {detail.previouslyPurchased
+                      ? "Previously purchased · 0 Credits"
+                      : `${detail.price} Credits`}
+                  </dd>
+                </div>
+              </dl>
+              {detail.value ? (
+                <button
+                  className="contactReport"
+                  disabled={pendingContact === detail.observationId}
+                  onClick={() => void reportInvalid(detail)}
+                >
+                  {detail.type === "professional-email"
+                    ? "Report bounced email"
+                    : "Report wrong phone"}
+                </button>
+              ) : (
+                <button
+                  className="contactReveal"
+                  disabled={pendingContact === detail.observationId}
+                  onClick={() => void reveal(detail)}
+                >
+                  {pendingContact === detail.observationId
+                    ? "Reserving Credits..."
+                    : `Reveal for ${detail.price} Credits`}
+                </button>
+              )}
+            </article>
+          ))
+        )}
+        {contactMessage && (
+          <p className="contactMessage" role="status">
+            {contactMessage}
+          </p>
+        )}
+      </section>
       {profile.links.map((link) => (
         <a
           className="professionalLink"

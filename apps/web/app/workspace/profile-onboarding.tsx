@@ -9,6 +9,9 @@ type Profile = {
   name: string;
   githubLogin: string;
   searchable: boolean;
+  contactSuppressions: Array<
+    "professional-email" | "direct-professional-phone"
+  >;
 };
 
 export function ProfileOnboarding() {
@@ -18,14 +21,27 @@ export function ProfileOnboarding() {
   );
   const [profile, setProfile] = useState<Profile | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [contactSuppressions, setContactSuppressions] = useState({
+    email: false,
+    phone: false,
+  });
 
   useEffect(() => {
     const controller = new AbortController();
     void fetch("/api/profile", { signal: controller.signal })
       .then((response) => response.json())
       .then((result: { profile: Profile | null }) => {
-        if (result.profile !== null && searchParams.get("view") !== "search") {
+        if (result.profile !== null) {
           setProfile(result.profile);
+          setContactSuppressions({
+            email:
+              result.profile.contactSuppressions.includes("professional-email"),
+            phone: result.profile.contactSuppressions.includes(
+              "direct-professional-phone",
+            ),
+          });
+        }
+        if (result.profile !== null && searchParams.get("view") !== "search") {
           setChoice("profile");
         }
       })
@@ -95,6 +111,26 @@ export function ProfileOnboarding() {
     }
   };
 
+  const toggleContactSuppression = async (type: "email" | "phone") => {
+    const suppressed = !contactSuppressions[type];
+    const response = await fetch(
+      `/api/contact-reveals/profile/contact-suppressions/${type}`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ suppressed }),
+      },
+    );
+    if (!response.ok) {
+      setMessage("Contact Reveal privacy could not be updated.");
+      return;
+    }
+    setContactSuppressions((current) => ({ ...current, [type]: suppressed }));
+    setMessage(
+      `${type === "email" ? "Email" : "Phone"} Contact Reveals are now ${suppressed ? "suppressed" : "available"}.`,
+    );
+  };
+
   if (choice === "choose") {
     return (
       <section className="onboarding">
@@ -141,6 +177,26 @@ export function ProfileOnboarding() {
             Stop appearing in searches
           </button>
         </div>
+      )}
+      {profile !== null && (
+        <section className="contactPrivacy">
+          <div>
+            <p className="eyebrow">Contact privacy</p>
+            <h2>Control purchased access.</h2>
+            <p>
+              Suppression immediately removes existing Organization access to
+              that Contact Detail type.
+            </p>
+          </div>
+          {(["email", "phone"] as const).map((type) => (
+            <button
+              key={type}
+              onClick={() => void toggleContactSuppression(type)}
+            >
+              {contactSuppressions[type] ? "Allow" : "Suppress"} {type} reveals
+            </button>
+          ))}
+        </section>
       )}
       <form onSubmit={submit}>
         <label>

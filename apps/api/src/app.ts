@@ -7,6 +7,10 @@ import {
 import { Scalar } from "@scalar/hono-api-reference";
 import { Effect } from "effect";
 import type { Context } from "hono";
+import {
+  contactRevealLogFields,
+  type ContactDetailType,
+} from "@humans/database/contact-reveals";
 
 import { clerkIdentityBoundary, type IdentityBoundary } from "./clerk";
 import {
@@ -375,18 +379,26 @@ export const createApp = (
 
   app.get("/v1/profiles/:profileId", async (context) => {
     const session = await identity.authenticate(context.req.raw, context.env);
-    if (session === null) return unauthorized(context);
+    if (session === null || session.organizationId === null)
+      return unauthorized(context);
 
     try {
-      const profile = await Effect.runPromise(
+      const result = await Effect.runPromise(
         Effect.gen(function* () {
           const database = yield* Database;
-          return yield* database.getSearchableProfile(
+          const profile = yield* database.getSearchableProfile(
             context.req.param("profileId"),
           );
+          if (profile === null) return null;
+          const contactDetails = yield* database.listContactDetails(
+            session.memberId,
+            session.organizationId!,
+            context.req.param("profileId"),
+          );
+          return { profile: { ...profile, contactDetails } };
         }).pipe(Effect.provide(databaseLayer(context.env))),
       );
-      if (profile === null) {
+      if (result === null) {
         return context.json(
           { error: { code: "not_found", message: "Profile was not found" } },
           404,
@@ -394,9 +406,199 @@ export const createApp = (
       }
       context.header("Cache-Control", "private, no-store");
       context.header("X-Robots-Tag", "noindex, nofollow");
-      return context.json({ profile }, 200);
-    } catch {
-      return serviceUnavailable(context);
+      return context.json(result, 200);
+    } catch (error) {
+      return contactError(context, error);
+    }
+  });
+
+  const contactType = (value: string): ContactDetailType | null =>
+    value === "email"
+      ? "professional-email"
+      : value === "phone"
+        ? "direct-professional-phone"
+        : null;
+  const contactActor = async (context: Context<{ Bindings: Bindings }>) => {
+    const session = await identity.authenticate(context.req.raw, context.env);
+    return session?.organizationId
+      ? { memberId: session.memberId, organizationId: session.organizationId }
+      : null;
+  };
+  const runDatabase = <A>(
+    context: Context<{ Bindings: Bindings }>,
+    effect: (
+      database: ReturnType<typeof makeDatabaseService>,
+    ) => Effect.Effect<A, unknown>,
+  ) =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const database = yield* Database;
+        return yield* effect(database);
+      }).pipe(Effect.provide(databaseLayer(context.env))),
+    );
+
+  app.post(
+    "/v1/profiles/:profileId/contact-reveals/:contactType",
+    async (context) => {
+      const actor = await contactActor(context);
+      if (actor === null) return unauthorized(context);
+      const type = contactType(context.req.param("contactType"));
+      const idempotencyKey = context.req.header("Idempotency-Key")?.trim();
+      const body = z
+        .object({ observationId: z.string().min(1) })
+        .strict()
+        .safeParse(await context.req.json().catch(() => null));
+      if (type === null || !idempotencyKey || idempotencyKey.length > 200)
+        return context.json(
+          {
+            error: {
+              code: "invalid_reveal",
+              message: "A Contact Detail type and idempotency key are required",
+            },
+          },
+          400,
+        );
+      try {
+        const reveal = await runDatabase(context, (database) =>
+          database.purchaseContactReveal({
+            ...actor,
+            profileId: context.req.param("profileId"),
+            type,
+            idempotencyKey,
+            observationId: body.success ? body.data.observationId : undefined,
+          }),
+        );
+        console.info(
+          contactRevealLogFields({
+            ...actor,
+            profileId: context.req.param("profileId"),
+            observationId: reveal.observationId,
+            type,
+            result: reveal.previouslyPurchased ? "reopened" : "finalized",
+          }),
+        );
+        privateContactResponse(context);
+        return context.json({ reveal }, 200);
+      } catch (error) {
+        return contactError(context, error);
+      }
+    },
+  );
+
+  app.post("/v1/contact-details/:observationId/report", async (context) => {
+    const actor = await contactActor(context);
+    if (actor === null) return unauthorized(context);
+    const input = z
+      .object({ reason: z.enum(["bounced-email", "wrong-phone"]) })
+      .strict()
+      .safeParse(await context.req.json().catch(() => null));
+    if (!input.success)
+      return context.json(
+        {
+          error: {
+            code: "invalid_report",
+            message: "A valid report reason is required",
+          },
+        },
+        400,
+      );
+    try {
+      const result = await runDatabase(context, (database) =>
+        database.reportInvalidContactDetail({
+          ...actor,
+          observationId: context.req.param("observationId"),
+          reason: input.data.reason,
+        }),
+      );
+      privateContactResponse(context);
+      return context.json(result, 200);
+    } catch (error) {
+      return contactError(context, error);
+    }
+  });
+
+  app.patch(
+    "/v1/profile/contact-suppressions/:contactType",
+    async (context) => {
+      const session = await identity.authenticate(context.req.raw, context.env);
+      if (session === null) return unauthorized(context);
+      const type = contactType(context.req.param("contactType"));
+      const input = z
+        .object({ suppressed: z.boolean() })
+        .strict()
+        .safeParse(await context.req.json().catch(() => null));
+      if (type === null || !input.success)
+        return context.json(
+          {
+            error: {
+              code: "invalid_suppression",
+              message: "A valid Contact Detail suppression is required",
+            },
+          },
+          400,
+        );
+      try {
+        const result = await runDatabase(context, (database) =>
+          database.setContactDetailSuppression(
+            session.memberId,
+            type,
+            input.data.suppressed,
+          ),
+        );
+        privateContactResponse(context);
+        return context.json(result, 200);
+      } catch (error) {
+        return contactError(context, error);
+      }
+    },
+  );
+
+  app.patch("/v1/organization/contact-reveal-policy", async (context) => {
+    const actor = await contactActor(context);
+    if (actor === null) return unauthorized(context);
+    const input = z
+      .object({ membersCanReveal: z.boolean() })
+      .strict()
+      .safeParse(await context.req.json().catch(() => null));
+    if (!input.success)
+      return context.json(
+        {
+          error: {
+            code: "invalid_policy",
+            message: "A valid Contact Reveal policy is required",
+          },
+        },
+        400,
+      );
+    try {
+      const policy = await runDatabase(context, (database) =>
+        database.setOrganizationContactRevealPolicy(
+          actor.memberId,
+          actor.organizationId,
+          input.data.membersCanReveal,
+        ),
+      );
+      privateContactResponse(context);
+      return context.json({ policy }, 200);
+    } catch (error) {
+      return contactError(context, error);
+    }
+  });
+
+  app.get("/v1/organization/contact-reveal-policy", async (context) => {
+    const actor = await contactActor(context);
+    if (actor === null) return unauthorized(context);
+    try {
+      const policy = await runDatabase(context, (database) =>
+        database.getOrganizationContactRevealPolicy(
+          actor.memberId,
+          actor.organizationId,
+        ),
+      );
+      privateContactResponse(context);
+      return context.json({ policy }, 200);
+    } catch (error) {
+      return contactError(context, error);
     }
   });
 
@@ -631,6 +833,70 @@ const serviceUnavailable = (context: {
     { error: { code: "service_unavailable", message: "Service unavailable" } },
     503,
   );
+
+const privateContactResponse = (context: Context) => {
+  context.header("Cache-Control", "private, no-store");
+  context.header("X-Robots-Tag", "noindex, nofollow");
+};
+
+const contactError = (
+  context: Context<{ Bindings: Bindings }>,
+  error: unknown,
+) => {
+  const reason =
+    typeof error === "object" &&
+    error !== null &&
+    "_tag" in error &&
+    error._tag === "ContactRevealRejected" &&
+    "reason" in error &&
+    typeof error.reason === "string"
+      ? error.reason
+      : null;
+  privateContactResponse(context);
+  if (reason === "forbidden")
+    return context.json(
+      { error: { code: reason, message: "Contact Reveal access is denied" } },
+      403,
+    );
+  if (reason === "not_found")
+    return context.json(
+      {
+        error: {
+          code: reason,
+          message: "No valid Contact Detail was found",
+        },
+      },
+      404,
+    );
+  if (reason === "insufficient_credits")
+    return context.json(
+      {
+        error: {
+          code: reason,
+          message: "The Organization has insufficient Credits",
+        },
+      },
+      402,
+    );
+  if (reason === "idempotency_conflict")
+    return context.json(
+      {
+        error: {
+          code: reason,
+          message: "The idempotency key was already used",
+        },
+      },
+      409,
+    );
+  if (reason === "invalid_contact_detail")
+    return context.json(
+      {
+        error: { code: reason, message: "The Contact Detail is invalid" },
+      },
+      410,
+    );
+  return serviceUnavailable(context);
+};
 
 const invalidSearch = (context: {
   json: (body: z.infer<typeof errorResponse>, status: 400) => Response;
