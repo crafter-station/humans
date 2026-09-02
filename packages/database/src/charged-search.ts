@@ -1,7 +1,11 @@
 import type { NeonDatabase } from "drizzle-orm/neon-serverless";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
-import { chargeSearchPage } from "./credits";
+import {
+  finalizeSearchPage,
+  releaseSearchPage,
+  reserveSearchPage,
+} from "./credits";
 import {
   profileSearchRequestFingerprint,
   searchProfiles,
@@ -12,7 +16,7 @@ type Database =
   | NeonDatabase<typeof import("./schema")>
   | NodePgDatabase<typeof import("./schema")>;
 
-/** Runs search first so invalid or failed searches never consume a Credit. */
+/** Reserves before search, then finalizes or releases the Credit atomically. */
 export const runChargedProfileSearch = async (
   database: Database,
   input: {
@@ -25,20 +29,27 @@ export const runChargedProfileSearch = async (
     cursorSecret?: string;
   },
 ) => {
-  const page = await searchProfiles(database, input.filters, {
-    cursor: input.cursor,
-    pageSize: input.pageSize,
-    now: input.now,
-    cursorSecret: input.cursorSecret,
-  });
   const requestFingerprint = await profileSearchRequestFingerprint(
     input.filters,
     { cursor: input.cursor, pageSize: input.pageSize },
   );
-  const credit = await chargeSearchPage(database, {
+  const operation = {
     organizationId: input.organizationId,
     idempotencyKey: input.idempotencyKey,
     requestFingerprint,
-  });
-  return { page, credit };
+  };
+  const reservation = await reserveSearchPage(database, operation);
+  try {
+    const page = await searchProfiles(database, input.filters, {
+      cursor: input.cursor,
+      pageSize: input.pageSize,
+      now: input.now,
+      cursorSecret: input.cursorSecret,
+    });
+    await finalizeSearchPage(database, operation);
+    return { page, credit: { applied: reservation.applied } };
+  } catch (error) {
+    if (reservation.applied) await releaseSearchPage(database, operation);
+    throw error;
+  }
 };

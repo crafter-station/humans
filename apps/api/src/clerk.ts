@@ -140,7 +140,8 @@ export const clerkIdentityBoundary: IdentityBoundary = {
       !auth.subject.startsWith("org_") ||
       typeof memberId !== "string" ||
       memberId === "" ||
-      scopes.length === 0
+      scopes.length === 0 ||
+      scopes.length !== auth.scopes.length
     ) {
       return null;
     }
@@ -163,7 +164,8 @@ export const clerkIdentityBoundary: IdentityBoundary = {
       createdBy: input.memberId,
       secondsUntilExpiration: input.secondsUntilExpiration,
     });
-    if (!apiKey.secret) throw new Error("Clerk did not return an API key secret");
+    if (!apiKey.secret)
+      throw new Error("Clerk did not return an API key secret");
     return { ...organizationApiKey(apiKey), secret: apiKey.secret };
   },
 
@@ -295,20 +297,20 @@ export const clerkIdentityBoundary: IdentityBoundary = {
     // requests from creating personal Organizations concurrently.
     if (memberships.data.length === 0 && organizationId === undefined) {
       const slug = `personal-${memberId.toLowerCase().replaceAll(/[^a-z0-9]+/g, "-")}`;
-      let organization;
-      try {
-        organization = await clerk.organizations.createOrganization({
+      const organization = await clerk.organizations
+        .createOrganization({
           createdBy: memberId,
           name: `${member.firstName ?? "My"}'s workspace`,
           privateMetadata: { personalOwnerMemberId: memberId },
           slug,
+        })
+        .catch(async () => {
+          const existing = await clerk.organizations.getOrganization({ slug });
+          if (existing.privateMetadata.personalOwnerMemberId !== memberId) {
+            throw new Error("Personal Organization slug is already owned");
+          }
+          return existing;
         });
-      } catch {
-        organization = await clerk.organizations.getOrganization({ slug });
-        if (organization.privateMetadata.personalOwnerMemberId !== memberId) {
-          throw new Error("Personal Organization slug is already owned");
-        }
-      }
 
       return {
         member: {

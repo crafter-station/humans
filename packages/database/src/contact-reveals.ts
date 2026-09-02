@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, notExists, sql } from "drizzle-orm";
 import type { NeonDatabase } from "drizzle-orm/neon-serverless";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
@@ -14,6 +14,7 @@ import {
   profileObservations,
   profiles,
   reenrichmentOutbox,
+  suppressionRecords,
 } from "./schema";
 
 type Database =
@@ -94,6 +95,19 @@ const mask = (type: ContactDetailType, value: string) => {
 
 const sourceCategory = (source: string) =>
   source === "tikhub" ? "professional-network" : "professional-data-provider";
+
+const profileIsNotSuppressed = (database: Database | Transaction) =>
+  notExists(
+    database
+      .select({ id: suppressionRecords.canonicalProviderId })
+      .from(suppressionRecords)
+      .where(
+        and(
+          eq(suppressionRecords.canonicalProvider, "github"),
+          eq(suppressionRecords.canonicalProviderId, profiles.githubAccountId),
+        ),
+      ),
+  );
 
 /** Enforces the provider boundary before storing a Contact Detail Observation. */
 export const recordVerifiedContactDetail = async (
@@ -201,7 +215,11 @@ export const listContactDetails = async (
     .select({ id: profiles.profileId })
     .from(profiles)
     .where(
-      and(eq(profiles.profileId, profileId), eq(profiles.searchable, true)),
+      and(
+        eq(profiles.profileId, profileId),
+        eq(profiles.searchable, true),
+        profileIsNotSuppressed(database),
+      ),
     )
     .limit(1);
   if (!profile) throw new ContactRevealError("not_found");
@@ -325,6 +343,7 @@ export const purchaseContactReveal = async (
             eq(profileObservations.profileId, input.profileId),
             eq(profileObservations.source, "tikhub"),
             eq(profiles.searchable, true),
+            profileIsNotSuppressed(tx),
             isNull(contactDetailInvalidations.observationId),
           ),
         )
@@ -365,6 +384,7 @@ export const purchaseContactReveal = async (
           eq(profileObservations.field, "contact-detail"),
           eq(profileObservations.source, "tikhub"),
           eq(profiles.searchable, true),
+          profileIsNotSuppressed(tx),
           isNull(contactDetailInvalidations.observationId),
         ),
       )

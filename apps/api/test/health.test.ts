@@ -6,10 +6,7 @@ import {
   type ProvisionedWorkspace,
 } from "@humans/database";
 import * as schema from "@humans/database/schema";
-import {
-  applyCreditEntry,
-  getCreditBalance,
-} from "@humans/database/credits";
+import { applyCreditEntry, getCreditBalance } from "@humans/database/credits";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { fileURLToPath } from "node:url";
@@ -95,6 +92,22 @@ describe("Humans API", () => {
     });
     expect(openApi.components.securitySchemes).toHaveProperty(
       "OrganizationApiKey",
+    );
+    expect(
+      openApi.paths["/v1/profiles"].get.responses["200"].content[
+        "application/json"
+      ].schema,
+    ).toBeDefined();
+    expect(
+      openApi.paths["/v1/search"].post.requestBody.content["application/json"]
+        .schema,
+    ).toBeDefined();
+    expect(
+      openApi.paths["/v1/profiles/{profileId}/reveal-email"].post.parameters,
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "Idempotency-Key", in: "header" }),
+      ]),
     );
     expect(JSON.stringify(openApi)).not.toContain("private@company.example");
     expect(JSON.stringify(openApi)).not.toContain("secret_key_1");
@@ -682,19 +695,34 @@ describe("Humans API", () => {
       searchable: true,
       searchabilityReason: "member_opt_in",
     });
-    await database.insert(schema.profileObservations).values({
-      id: "external_email",
-      profileId: "external_profile",
-      field: "contact-detail",
-      value: {
-        type: "professional-email",
-        value: "external@company.example",
+    await database.insert(schema.profileObservations).values([
+      {
+        id: "external_email",
+        profileId: "external_profile",
+        field: "contact-detail",
+        value: {
+          type: "professional-email",
+          value: "external@company.example",
+        },
+        source: "tikhub",
+        sourceRecordId: "external_email_source",
+        pipelineVersion: "tikhub-v1",
+        confidence: 0.99,
       },
-      source: "tikhub",
-      sourceRecordId: "external_email_source",
-      pipelineVersion: "tikhub-v1",
-      confidence: 0.99,
-    });
+      {
+        id: "external_phone",
+        profileId: "external_profile",
+        field: "contact-detail",
+        value: {
+          type: "direct-professional-phone",
+          value: "+57 300 555 0199",
+        },
+        source: "tikhub",
+        sourceRecordId: "external_phone_source",
+        pipelineVersion: "tikhub-v1",
+        confidence: 0.98,
+      },
+    ]);
     await applyCreditEntry(database, {
       organizationId: "external_organization",
       idempotencyKey: "external:grant",
@@ -734,6 +762,23 @@ describe("Humans API", () => {
       },
     });
     expect(broad.status).toBe(422);
+    const disguisedBroad = await app.request("/v1/profiles?role=%2C&q=%20", {
+      headers: {
+        authorization: "Bearer read_key",
+        "Idempotency-Key": "external:disguised-broad",
+      },
+    });
+    expect(disguisedBroad.status).toBe(422);
+    const emptyStructured = await app.request("/v1/search", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer read_key",
+        "content-type": "application/json",
+        "Idempotency-Key": "external:empty-structured",
+      },
+      body: JSON.stringify({ filters: { roles: [] } }),
+    });
+    expect(emptyStructured.status).toBe(422);
 
     const listResponse = await app.request("/v1/profiles?q=External", {
       headers: {
@@ -754,6 +799,19 @@ describe("Humans API", () => {
     });
     expect(replay.status).toBe(200);
     expect(await getCreditBalance(database, "external_organization")).toBe(19);
+    const conflict = await app.request("/v1/profiles?q=Profile", {
+      headers: {
+        authorization: "Bearer read_key",
+        "Idempotency-Key": "external:list",
+      },
+    });
+    expect(conflict.status).toBe(409);
+    await expect(conflict.json()).resolves.toEqual({
+      error: {
+        code: "idempotency_conflict",
+        message: "The idempotency key was already used",
+      },
+    });
 
     const facets = await app.request("/v1/search/facets", {
       headers: { authorization: "Bearer read_key" },
@@ -765,6 +823,47 @@ describe("Humans API", () => {
       headers: { authorization: "Bearer read_key" },
     });
     expect(detail.status).toBe(200);
+    const missingDetail = await app.request("/v1/profiles/missing_profile", {
+      headers: { authorization: "Bearer read_key" },
+    });
+    expect(missingDetail.status).toBe(404);
+    await expect(missingDetail.json()).resolves.toEqual({
+      error: { code: "not_found", message: "Profile was not found" },
+    });
+
+    await database.insert(schema.members).values({
+      clerkId: "empty_credit_member",
+      name: "Empty Credit Member",
+    });
+    await database.insert(schema.organizations).values({
+      clerkId: "empty_credit_organization",
+      name: "Empty Credit Organization",
+    });
+    await database.insert(schema.organizationMemberships).values({
+      clerkId: "empty_credit_membership",
+      memberId: "empty_credit_member",
+      organizationId: "empty_credit_organization",
+      role: "org:member",
+    });
+    identity.apiKeySessions.set("empty_credit_key", {
+      keyId: "empty_credit_key_id",
+      memberId: "empty_credit_member",
+      organizationId: "empty_credit_organization",
+      scopes: ["profiles:read"],
+    });
+    const insufficientCredits = await app.request("/v1/profiles?q=External", {
+      headers: {
+        authorization: "Bearer empty_credit_key",
+        "Idempotency-Key": "external:no-credits",
+      },
+    });
+    expect(insufficientCredits.status).toBe(402);
+    await expect(insufficientCredits.json()).resolves.toEqual({
+      error: {
+        code: "insufficient_credits",
+        message: "The Organization has insufficient Credits",
+      },
+    });
 
     const forbiddenReveal = await app.request(
       "/v1/profiles/external_profile/reveal-email",
@@ -792,6 +891,39 @@ describe("Humans API", () => {
       reveal: { value: "external@company.example", price: 5 },
     });
     expect(await getCreditBalance(database, "external_organization")).toBe(14);
+    const reopenedReveal = await app.request(
+      "/v1/profiles/external_profile/reveal-email",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer reveal_key",
+          "Idempotency-Key": "external:reveal:reopened",
+        },
+      },
+    );
+    await expect(reopenedReveal.json()).resolves.toMatchObject({
+      reveal: { value: "external@company.example", price: 0 },
+    });
+    const phoneReveal = await app.request(
+      "/v1/profiles/external_profile/reveal-phone",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer reveal_key",
+          "Idempotency-Key": "external:reveal:phone",
+        },
+      },
+    );
+    expect(phoneReveal.status).toBe(200);
+    await expect(phoneReveal.json()).resolves.toMatchObject({
+      reveal: { value: "+57 300 555 0199", price: 10 },
+    });
+    await applyCreditEntry(database, {
+      organizationId: "external_organization",
+      idempotencyKey: "external:natural-grant",
+      kind: "grant",
+      amount: 20,
+    });
 
     const naturalApp = createApp(
       () => makeDatabaseLayer(database),
@@ -826,10 +958,7 @@ describe("Humans API", () => {
     expect(naturalLimit.headers.get("ratelimit-limit")).toBe("10");
     expect(naturalLimit.headers.get("retry-after")).not.toBeNull();
 
-    const rateLimitApp = createApp(
-      () => makeDatabaseLayer(database),
-      identity,
-    );
+    const rateLimitApp = createApp(() => makeDatabaseLayer(database), identity);
     for (let request = 0; request < 60; request += 1) {
       const response = await rateLimitApp.request("/v1/search/facets", {
         headers: { authorization: "Bearer read_key" },
@@ -841,6 +970,16 @@ describe("Humans API", () => {
     });
     expect(organizationLimit.status).toBe(429);
     expect(organizationLimit.headers.get("ratelimit-limit")).toBe("60");
+
+    await database.insert(schema.suppressionRecords).values({
+      canonicalProvider: "github",
+      canonicalProviderId: "external_github",
+      reason: "removal_request",
+    });
+    const suppressed = await app.request("/v1/profiles/external_profile", {
+      headers: { authorization: "Bearer read_key" },
+    });
+    expect(suppressed.status).toBe(404);
   });
 });
 
@@ -880,7 +1019,10 @@ class FakeIdentity implements IdentityBoundary {
   readonly github = new Map<string, GitHubVerification>();
   readonly sessions = new Map<string, SessionIdentity>();
   readonly apiKeySessions = new Map<string, ApiKeyIdentity>();
-  readonly apiKeys = new Map<string, OrganizationApiKey & { secret?: string }>();
+  readonly apiKeys = new Map<
+    string,
+    OrganizationApiKey & { secret?: string }
+  >();
   readonly organizations = new Map<string, ProvisionedWorkspace>();
   personalOrganizationsCreated = 0;
 
@@ -891,7 +1033,9 @@ class FakeIdentity implements IdentityBoundary {
 
   async authenticateApiKey(request: Request) {
     const token = request.headers.get("authorization")?.replace("Bearer ", "");
-    return token === undefined ? null : (this.apiKeySessions.get(token) ?? null);
+    return token === undefined
+      ? null
+      : (this.apiKeySessions.get(token) ?? null);
   }
 
   async createOrganizationApiKey(input: {

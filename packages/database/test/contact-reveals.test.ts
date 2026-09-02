@@ -47,6 +47,7 @@ describe("Contact Reveals", () => {
     await database.delete(schema.creditLedgerEntries);
     await database.delete(schema.creditAccounts);
     await database.delete(schema.profileObservations);
+    await database.delete(schema.suppressionRecords);
     await database.delete(schema.profiles);
     await database.delete(schema.organizationMemberships);
     await database.delete(schema.organizations);
@@ -448,6 +449,33 @@ describe("Contact Reveals", () => {
     expect(details.map(({ type }) => type)).toEqual([
       "direct-professional-phone",
     ]);
+  });
+
+  it("blocks Contact Details when the Profile has a Suppression Record", async () => {
+    await database.insert(schema.suppressionRecords).values({
+      canonicalProvider: "github",
+      canonicalProviderId: "github_one",
+      reason: "removal_request",
+    });
+
+    await expect(
+      listContactDetails(
+        database,
+        "member_one",
+        "organization_one",
+        "profile_one",
+      ),
+    ).rejects.toThrow("not_found");
+    await expect(
+      purchaseContactReveal(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+        profileId: "profile_one",
+        type: "professional-email",
+        idempotencyKey: "suppressed:profile",
+      }),
+    ).rejects.toThrow("not_found");
+    expect(await getCreditBalance(database, "organization_one")).toBe(20);
   });
 
   it("suppresses invalid details, refunds every purchaser once, and queues re-enrichment", async () => {

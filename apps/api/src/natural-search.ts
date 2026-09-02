@@ -22,7 +22,9 @@ export const interpretedFiltersSchema = z
   })
   .strict()
   .refine((filters) =>
-    Object.values(filters).some((value) => value !== undefined),
+    Object.values(filters).some((value) =>
+      Array.isArray(value) ? value.length > 0 : value !== undefined,
+    ),
   );
 
 export type InterpretedFilters = z.infer<typeof interpretedFiltersSchema>;

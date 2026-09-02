@@ -32,6 +32,12 @@ export type Bindings = {
   DATABASE_URL: string;
   SEARCH_CURSOR_SECRET?: string;
   OPENAI_API_KEY?: string;
+  ORGANIZATION_RATE_LIMITER?: RateLimitBinding;
+  NATURAL_SEARCH_RATE_LIMITER?: RateLimitBinding;
+};
+
+type RateLimitBinding = {
+  limit(input: { key: string }): Promise<{ success: boolean }>;
 };
 
 type DatabaseLayer = ReturnType<typeof makeDatabaseLayer>;
@@ -96,12 +102,72 @@ const documentedProfile = z
   })
   .openapi("Profile");
 
+const documentedProfilePage = z
+  .object({
+    results: z.array(documentedProfile),
+    nextCursor: z.string().nullable(),
+  })
+  .openapi("ProfilePage");
+
+const documentedFacets = z
+  .object({
+    facets: z.object({
+      roles: z.array(z.string()),
+      skills: z.array(z.string()),
+      currentResidences: z.array(z.string()),
+      companies: z.array(z.string()),
+      seniorities: z.array(z.string()),
+      opportunityStatuses: z.array(z.enum(["open", "not_open", "unspecified"])),
+    }),
+  })
+  .openapi("SearchFacets");
+
+const documentedReveal = z
+  .object({
+    reveal: z.object({
+      observationId: z.string(),
+      type: z.enum(["professional-email", "direct-professional-phone"]),
+      value: z.string(),
+      price: z.union([z.literal(0), z.literal(5), z.literal(10)]),
+      previouslyPurchased: z.boolean(),
+    }),
+  })
+  .openapi("ContactReveal");
+
+const documentedProfileResponse = z
+  .object({ profile: documentedProfile })
+  .openapi("ProfileResponse");
+
+const jsonResponse = (description: string, schema: z.ZodType) => ({
+  description,
+  content: { "application/json": { schema } },
+  headers: {
+    "RateLimit-Limit": { schema: { type: "integer" } },
+    "RateLimit-Remaining": { schema: { type: "integer" } },
+    "RateLimit-Reset": { schema: { type: "integer" } },
+  },
+});
+
+const idempotencyParameter = {
+  name: "Idempotency-Key",
+  in: "header",
+  required: true,
+  schema: { type: "string", maxLength: 200 },
+} as const;
+
+const profileIdParameter = {
+  name: "profileId",
+  in: "path",
+  required: true,
+  schema: { type: "string" },
+} as const;
+
 const externalResponses = {
-  401: { description: "Authentication failed" },
-  403: { description: "The API key lacks a required scope" },
-  422: { description: "Request validation failed" },
-  429: { description: "The Organization rate limit was exceeded" },
-  503: { description: "A required service is unavailable" },
+  401: jsonResponse("Authentication failed", errorResponse),
+  403: jsonResponse("The API key lacks a required scope", errorResponse),
+  422: jsonResponse("Request validation failed", errorResponse),
+  429: jsonResponse("The Organization rate limit was exceeded", errorResponse),
+  503: jsonResponse("A required service is unavailable", errorResponse),
 } as const;
 
 const externalApiPaths = {
@@ -112,7 +178,37 @@ const externalApiPaths = {
       description:
         "Requires profiles:read. Each successful page costs one Credit.",
       security: [{ OrganizationApiKey: [] }],
-      responses: { 200: { description: "A bounded Profile page" }, ...externalResponses },
+      parameters: [
+        idempotencyParameter,
+        { name: "q", in: "query", schema: { type: "string" } },
+        { name: "role", in: "query", schema: { type: "string" } },
+        { name: "skill", in: "query", schema: { type: "string" } },
+        { name: "residence", in: "query", schema: { type: "string" } },
+        { name: "company", in: "query", schema: { type: "string" } },
+        { name: "seniority", in: "query", schema: { type: "string" } },
+        { name: "experience", in: "query", schema: { type: "integer" } },
+        {
+          name: "opportunityStatus",
+          in: "query",
+          schema: { type: "string" },
+        },
+        { name: "cursor", in: "query", schema: { type: "string" } },
+        {
+          name: "pageSize",
+          in: "query",
+          schema: { type: "integer", minimum: 1, maximum: 100 },
+        },
+      ],
+      responses: {
+        200: jsonResponse("A bounded Profile page", documentedProfilePage),
+        400: jsonResponse("The cursor is invalid or expired", errorResponse),
+        402: jsonResponse(
+          "The Organization has insufficient Credits",
+          errorResponse,
+        ),
+        409: jsonResponse("The idempotency key conflicts", errorResponse),
+        ...externalResponses,
+      },
     },
   },
   "/v1/profiles/{profileId}": {
@@ -121,17 +217,10 @@ const externalApiPaths = {
       summary: "Read a Profile",
       description: "Requires profiles:read and costs zero Credits.",
       security: [{ OrganizationApiKey: [] }],
-      parameters: [
-        {
-          name: "profileId",
-          in: "path",
-          required: true,
-          schema: { type: "string" },
-        },
-      ],
+      parameters: [profileIdParameter],
       responses: {
-        200: { description: "The requested Profile" },
-        404: { description: "Profile not found" },
+        200: jsonResponse("The requested Profile", documentedProfileResponse),
+        404: jsonResponse("Profile not found", errorResponse),
         ...externalResponses,
       },
     },
@@ -142,7 +231,10 @@ const externalApiPaths = {
       summary: "List Profile search facets",
       description: "Requires profiles:read and costs zero Credits.",
       security: [{ OrganizationApiKey: [] }],
-      responses: { 200: { description: "Available search facets" }, ...externalResponses },
+      responses: {
+        200: jsonResponse("Available search facets", documentedFacets),
+        ...externalResponses,
+      },
     },
   },
   "/v1/search": {
@@ -152,7 +244,46 @@ const externalApiPaths = {
       description:
         "Requires profiles:read. Each successful page costs one Credit. Natural-language searches have a separate limit of 10 per minute.",
       security: [{ OrganizationApiKey: [] }],
-      responses: { 200: { description: "A bounded Profile page" }, ...externalResponses },
+      parameters: [idempotencyParameter],
+      requestBody: {
+        required: true,
+        content: {
+          "application/json": {
+            schema: {
+              oneOf: [
+                {
+                  type: "object",
+                  required: ["query"],
+                  properties: {
+                    query: { type: "string", minLength: 4, maxLength: 500 },
+                    cursor: { type: "string" },
+                    pageSize: { type: "integer", minimum: 1, maximum: 100 },
+                  },
+                },
+                {
+                  type: "object",
+                  required: ["filters"],
+                  properties: {
+                    filters: { type: "object" },
+                    cursor: { type: "string" },
+                    pageSize: { type: "integer", minimum: 1, maximum: 100 },
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+      responses: {
+        200: jsonResponse("A bounded Profile page", documentedProfilePage),
+        400: jsonResponse("The cursor is invalid or expired", errorResponse),
+        402: jsonResponse(
+          "The Organization has insufficient Credits",
+          errorResponse,
+        ),
+        409: jsonResponse("The idempotency key conflicts", errorResponse),
+        ...externalResponses,
+      },
     },
   },
   "/v1/profiles/{profileId}/reveal-email": {
@@ -162,7 +293,25 @@ const externalApiPaths = {
       description:
         "Requires profiles:read and contacts:reveal. A new purchase costs five Credits and requires Idempotency-Key.",
       security: [{ OrganizationApiKey: [] }],
-      responses: { 200: { description: "The Contact Reveal" }, ...externalResponses },
+      parameters: [profileIdParameter, idempotencyParameter],
+      requestBody: {
+        content: {
+          "application/json": {
+            schema: z.object({ observationId: z.string().optional() }),
+          },
+        },
+      },
+      responses: {
+        200: jsonResponse("The Contact Reveal", documentedReveal),
+        402: jsonResponse(
+          "The Organization has insufficient Credits",
+          errorResponse,
+        ),
+        404: jsonResponse("No valid Contact Detail was found", errorResponse),
+        409: jsonResponse("The idempotency key conflicts", errorResponse),
+        410: jsonResponse("The Contact Detail is invalid", errorResponse),
+        ...externalResponses,
+      },
     },
   },
   "/v1/profiles/{profileId}/reveal-phone": {
@@ -172,7 +321,25 @@ const externalApiPaths = {
       description:
         "Requires profiles:read and contacts:reveal. A new purchase costs ten Credits and requires Idempotency-Key.",
       security: [{ OrganizationApiKey: [] }],
-      responses: { 200: { description: "The Contact Reveal" }, ...externalResponses },
+      parameters: [profileIdParameter, idempotencyParameter],
+      requestBody: {
+        content: {
+          "application/json": {
+            schema: z.object({ observationId: z.string().optional() }),
+          },
+        },
+      },
+      responses: {
+        200: jsonResponse("The Contact Reveal", documentedReveal),
+        402: jsonResponse(
+          "The Organization has insufficient Credits",
+          errorResponse,
+        ),
+        404: jsonResponse("No valid Contact Detail was found", errorResponse),
+        409: jsonResponse("The idempotency key conflicts", errorResponse),
+        410: jsonResponse("The Contact Detail is invalid", errorResponse),
+        ...externalResponses,
+      },
     },
   },
 } as const;
@@ -220,18 +387,24 @@ const externalListQuery = z
     cursor: z.string().optional(),
     pageSize: z.coerce.number().int().min(1).max(100).optional(),
   })
-  .refine((query) =>
-    [
-      query.q,
-      query.role,
-      query.skill,
-      query.residence,
-      query.company,
-      query.seniority,
-      query.experience,
-      query.opportunityStatus,
-    ].some((value) => value !== undefined && value !== ""),
-  );
+  .refine((query) => {
+    const opportunityStatuses = list(query.opportunityStatus).filter(
+      (status) =>
+        status === "open" || status === "not_open" || status === "unspecified",
+    );
+    return (
+      query.experience !== undefined ||
+      [
+        query.q,
+        query.role,
+        query.skill,
+        query.residence,
+        query.company,
+        query.seniority,
+      ].some((value) => list(value).length > 0) ||
+      opportunityStatuses.length > 0
+    );
+  });
 
 const checkHealth = Effect.fn("checkHealth")(function* () {
   const database = yield* Database;
@@ -271,7 +444,7 @@ export const createApp = (
   });
 
   app.post("/webhooks/clerk", async (context) => {
-    let event;
+    let event: Awaited<ReturnType<IdentityBoundary["verifyWebhook"]>>;
     try {
       event = await identity.verifyWebhook(context.req.raw, context.env);
     } catch {
@@ -399,12 +572,13 @@ export const createApp = (
 
   const organizationAdmin = async (context: AppContext) => {
     const session = await identity.authenticate(context.req.raw, context.env);
-    if (session?.organizationId === null || session === null) return null;
+    if (session === null || session.organizationId === null) return null;
+    const admin = { ...session, organizationId: session.organizationId };
     const workspace = await runDatabase(context, (database) =>
-      database.getWorkspace(session.memberId, session.organizationId!),
+      database.getWorkspace(admin.memberId, admin.organizationId),
     );
     return workspace.role === "org:admin" || workspace.role === "admin"
-      ? session
+      ? admin
       : false;
   };
 
@@ -422,7 +596,7 @@ export const createApp = (
           ...input.data,
           scopes: [...new Set(input.data.scopes)] as ApiScope[],
           memberId: admin.memberId,
-          organizationId: admin.organizationId!,
+          organizationId: admin.organizationId,
         },
         context.env,
       );
@@ -441,7 +615,7 @@ export const createApp = (
       if (admin === null) return unauthorized(context);
       if (admin === false) return forbidden(context);
       const apiKeys = await identity.listOrganizationApiKeys(
-        admin.organizationId!,
+        admin.organizationId,
         context.env,
       );
       privateResponse(context);
@@ -459,7 +633,7 @@ export const createApp = (
       if (admin === null) return unauthorized(context);
       if (admin === false) return forbidden(context);
       const apiKey = await identity.revokeOrganizationApiKey(
-        admin.organizationId!,
+        admin.organizationId,
         context.req.param("apiKeyId"),
         context.env,
       );
@@ -599,13 +773,14 @@ export const createApp = (
       if (!input.success || !idempotencyKey || idempotencyKey.length > 200)
         return validationError(context, "invalid_search");
 
-      const interpretation =
-        "query" in input.data
-          ? await (naturalSearch ??= new NaturalSearchInterpreter(
-              naturalSearchDecoder ??
-                ((prompt) => decodeNaturalSearch(prompt, context.env)),
-            )).interpret(input.data.query)
-          : null;
+      let interpretation = null;
+      if ("query" in input.data) {
+        naturalSearch ??= new NaturalSearchInterpreter(
+          naturalSearchDecoder ??
+            ((prompt) => decodeNaturalSearch(prompt, context.env)),
+        );
+        interpretation = await naturalSearch.interpret(input.data.query);
+      }
       const filters =
         interpretation?.filters ??
         ("filters" in input.data ? input.data.filters : {});
@@ -637,6 +812,7 @@ export const createApp = (
     const session = await identity.authenticate(context.req.raw, context.env);
     if (session === null || session.organizationId === null)
       return unauthorized(context);
+    const organizationId = session.organizationId;
     const parsed = z
       .object({
         q: z.string().optional(),
@@ -658,7 +834,7 @@ export const createApp = (
         Effect.gen(function* () {
           const database = yield* Database;
           return yield* database.searchProfilesWithCredit({
-            organizationId: session.organizationId!,
+            organizationId,
             idempotencyKey:
               context.req.header("Idempotency-Key") ?? crypto.randomUUID(),
             filters: {
@@ -736,6 +912,7 @@ export const createApp = (
           };
     if (session === null || session.organizationId === null)
       return unauthorized(context);
+    const organizationId = session.organizationId;
 
     try {
       const result = await Effect.runPromise(
@@ -747,7 +924,7 @@ export const createApp = (
           if (profile === null) return null;
           const contactDetails = yield* database.listContactDetails(
             session.memberId,
-            session.organizationId!,
+            organizationId,
             context.req.param("profileId"),
           );
           return { profile: { ...profile, contactDetails } };
@@ -814,18 +991,18 @@ export const createApp = (
       throw error;
     }
 
-    const generalLimit = takeRateLimit(
-      organizationRequests,
+    const generalLimit = await enforceRateLimit(
+      context.env?.ORGANIZATION_RATE_LIMITER,
+      takeRateLimit(organizationRequests, actor.organizationId, 60),
       actor.organizationId,
-      60,
     );
     setRateLimitHeaders(context, generalLimit);
     if (!generalLimit.allowed) return rateLimited(context, generalLimit);
     if (naturalLanguage) {
-      const naturalLimit = takeRateLimit(
-        naturalSearchRequests,
+      const naturalLimit = await enforceRateLimit(
+        context.env?.NATURAL_SEARCH_RATE_LIMITER,
+        takeRateLimit(naturalSearchRequests, actor.organizationId, 10),
         actor.organizationId,
-        10,
       );
       setRateLimitHeaders(context, naturalLimit);
       if (!naturalLimit.allowed) return rateLimited(context, naturalLimit);
@@ -867,19 +1044,17 @@ export const createApp = (
           observationId: input.data.observationId,
         }),
       );
-      console.info(
-        {
-          ...contactRevealLogFields({
-            memberId: actor.memberId,
-            organizationId: actor.organizationId,
-            profileId,
-            observationId: reveal.observationId,
-            type,
-            result: reveal.previouslyPurchased ? "reopened" : "finalized",
-          }),
-          apiKeyId: actor.keyId,
-        },
-      );
+      console.info({
+        ...contactRevealLogFields({
+          memberId: actor.memberId,
+          organizationId: actor.organizationId,
+          profileId,
+          observationId: reveal.observationId,
+          type,
+          result: reveal.previouslyPurchased ? "reopened" : "finalized",
+        }),
+        apiKeyId: actor.keyId,
+      });
       privateResponse(context);
       return context.json({ reveal }, 200);
     } catch (error) {
@@ -1233,6 +1408,10 @@ export const createApp = (
   });
 
   app.openAPIRegistry.register("Profile", documentedProfile);
+  app.openAPIRegistry.register("ProfilePage", documentedProfilePage);
+  app.openAPIRegistry.register("SearchFacets", documentedFacets);
+  app.openAPIRegistry.register("ContactReveal", documentedReveal);
+  app.openAPIRegistry.register("ProfileResponse", documentedProfileResponse);
   app.openAPIRegistry.register("Error", errorResponse);
   app.openAPIRegistry.registerComponent(
     "securitySchemes",
@@ -1335,10 +1514,7 @@ const validationError = (
   },
   code: string,
 ) =>
-  context.json(
-    { error: { code, message: "Request validation failed" } },
-    422,
-  );
+  context.json({ error: { code, message: "Request validation failed" } }, 422);
 
 type RateLimitResult = {
   allowed: boolean;
@@ -1366,6 +1542,18 @@ const takeRateLimit = (
     remaining: Math.max(0, limit - requests.length),
     reset: Math.ceil(((requests[0] ?? now) + 60_000) / 1000),
   };
+};
+
+const enforceRateLimit = async (
+  binding: RateLimitBinding | undefined,
+  local: RateLimitResult,
+  key: string,
+): Promise<RateLimitResult> => {
+  if (binding === undefined || !local.allowed) return local;
+  const distributed = await binding.limit({ key });
+  return distributed.success
+    ? local
+    : { ...local, allowed: false, remaining: 0 };
 };
 
 const setRateLimitHeaders = (context: Context, limit: RateLimitResult) => {
@@ -1561,7 +1749,7 @@ const taggedReason = (error: unknown) =>
   "reason" in error &&
   typeof error.reason === "string"
     ? error.reason
-      : null;
+    : null;
 
 const taggedErrorReason = (error: unknown, tag: string) =>
   typeof error === "object" &&
