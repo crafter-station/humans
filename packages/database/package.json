@@ -8,6 +8,7 @@
     "./import-profiles": "./src/import-profiles.ts",
     "./profile-control": "./src/profile-control.ts",
     "./credits": "./src/credits.ts",
+    "./contact-reveals": "./src/contact-reveals.ts",
     "./neon": "./src/neon.ts",
     "./search-profiles": "./src/search-profiles.ts",
     "./saved-lists": "./src/saved-lists.ts",
