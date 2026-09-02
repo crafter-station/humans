@@ -259,6 +259,11 @@ describe("Humans API", () => {
         message: "Authentication is required",
       },
     });
+
+    const search = await app.request("/v1/profiles/search");
+    expect(search.status).toBe(401);
+    const detail = await app.request("/v1/profiles/any-profile");
+    expect(detail.status).toBe(401);
   });
 
   it("creates an eligible Profile only after explicit Member opt-in", async () => {

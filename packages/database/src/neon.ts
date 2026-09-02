@@ -5,7 +5,10 @@ import { Effect, Layer } from "effect";
 import { Database, makeDatabaseService } from "./service";
 import * as schema from "./schema";
 
-export const makeNeonDatabaseLayer = (databaseUrl: string) =>
+export const makeNeonDatabaseLayer = (
+  databaseUrl: string,
+  searchCursorSecret?: string,
+) =>
   Layer.effect(
     Database,
     Effect.acquireRelease(
@@ -13,7 +16,7 @@ export const makeNeonDatabaseLayer = (databaseUrl: string) =>
       (pool) => Effect.promise(() => pool.end()),
     ).pipe(
       Effect.map((pool) =>
-        makeDatabaseService(drizzle(pool, { schema })),
+        makeDatabaseService(drizzle(pool, { schema }), searchCursorSecret),
       ),
     ),
   );

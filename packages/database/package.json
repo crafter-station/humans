@@ -8,6 +8,7 @@
     "./import-profiles": "./src/import-profiles.ts",
     "./profile-control": "./src/profile-control.ts",
     "./neon": "./src/neon.ts",
+    "./search-profiles": "./src/search-profiles.ts",
     "./schema": "./src/schema.ts"
   },
   "scripts": {

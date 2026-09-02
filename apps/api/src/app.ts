@@ -10,6 +10,7 @@ export type Bindings = {
   CLERK_SECRET_KEY: string;
   CLERK_WEBHOOK_SIGNING_SECRET: string;
   DATABASE_URL: string;
+  SEARCH_CURSOR_SECRET?: string;
 };
 
 type DatabaseLayer = ReturnType<typeof makeDatabaseLayer>;
@@ -278,6 +279,86 @@ export const createApp = (
     }
   });
 
+  app.get("/v1/profiles/search", async (context) => {
+    const session = await identity.authenticate(context.req.raw, context.env);
+    if (session === null) return unauthorized(context);
+    const parsed = z
+      .object({
+        q: z.string().optional(),
+        role: z.string().optional(),
+        skill: z.string().optional(),
+        residence: z.string().optional(),
+        company: z.string().optional(),
+        seniority: z.string().optional(),
+        experience: z.coerce.number().int().min(0).optional(),
+        opportunityStatus: z.string().optional(),
+        cursor: z.string().optional(),
+        pageSize: z.coerce.number().int().min(1).max(100).optional(),
+      })
+      .safeParse(context.req.query());
+    if (!parsed.success) return invalidSearch(context);
+
+    try {
+      const page = await Effect.runPromise(
+        Effect.gen(function* () {
+          const database = yield* Database;
+          return yield* database.searchProfiles(
+            {
+              query: parsed.data.q,
+              roles: list(parsed.data.role),
+              skills: list(parsed.data.skill),
+              currentResidences: list(parsed.data.residence),
+              companies: list(parsed.data.company),
+              seniorities: list(parsed.data.seniority),
+              minimumExperience: parsed.data.experience,
+              opportunityStatuses: list(parsed.data.opportunityStatus).filter(
+                (status): status is "open" | "not_open" | "unspecified" =>
+                  status === "open" ||
+                  status === "not_open" ||
+                  status === "unspecified",
+              ),
+            },
+            { cursor: parsed.data.cursor, pageSize: parsed.data.pageSize },
+          );
+        }).pipe(Effect.provide(databaseLayer(context.env))),
+      );
+      context.header("Cache-Control", "private, no-store");
+      context.header("X-Robots-Tag", "noindex, nofollow");
+      return context.json(page, 200);
+    } catch (error) {
+      return tagged(error, "SearchRejected")
+        ? invalidSearch(context)
+        : serviceUnavailable(context);
+    }
+  });
+
+  app.get("/v1/profiles/:profileId", async (context) => {
+    const session = await identity.authenticate(context.req.raw, context.env);
+    if (session === null) return unauthorized(context);
+
+    try {
+      const profile = await Effect.runPromise(
+        Effect.gen(function* () {
+          const database = yield* Database;
+          return yield* database.getSearchableProfile(
+            context.req.param("profileId"),
+          );
+        }).pipe(Effect.provide(databaseLayer(context.env))),
+      );
+      if (profile === null) {
+        return context.json(
+          { error: { code: "not_found", message: "Profile was not found" } },
+          404,
+        );
+      }
+      context.header("Cache-Control", "private, no-store");
+      context.header("X-Robots-Tag", "noindex, nofollow");
+      return context.json({ profile }, 200);
+    } catch {
+      return serviceUnavailable(context);
+    }
+  });
+
   app.doc31("/openapi.json", {
     openapi: "3.1.0",
     info: {
@@ -337,6 +418,20 @@ const serviceUnavailable = (context: {
     503,
   );
 
+const invalidSearch = (context: {
+  json: (body: z.infer<typeof errorResponse>, status: 400) => Response;
+}) =>
+  context.json(
+    { error: { code: "invalid_search", message: "Search request is invalid" } },
+    400,
+  );
+
+const list = (value: string | undefined) =>
+  value
+    ?.split(",")
+    .map((item) => item.trim())
+    .filter(Boolean) ?? [];
+
 const taggedReason = (error: unknown) =>
   typeof error === "object" &&
   error !== null &&
@@ -346,3 +441,9 @@ const taggedReason = (error: unknown) =>
   typeof error.reason === "string"
     ? error.reason
     : null;
+
+const tagged = (error: unknown, tag: string) =>
+  typeof error === "object" &&
+  error !== null &&
+  "_tag" in error &&
+  error._tag === tag;

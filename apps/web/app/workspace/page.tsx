@@ -1,4 +1,5 @@
 import { OrganizationSwitcher, UserButton } from "@clerk/nextjs";
+import { Suspense } from "react";
 
 import { WorkspaceProvisioner } from "./workspace-provisioner";
 import { ProfileOnboarding } from "./profile-onboarding";
@@ -15,7 +16,9 @@ export default function WorkspacePage() {
           <UserButton />
         </div>
       </header>
-      <ProfileOnboarding />
+      <Suspense fallback={null}>
+        <ProfileOnboarding />
+      </Suspense>
     </main>
   );
 }

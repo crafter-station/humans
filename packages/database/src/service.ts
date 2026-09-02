@@ -13,6 +13,12 @@ import {
   professionalLinks,
   profiles,
 } from "./schema";
+import {
+  getSearchableProfile,
+  InvalidSearchCursor,
+  searchProfiles,
+  type ProfileSearchFilters,
+} from "./search-profiles";
 
 type DrizzleDatabase =
   | NeonDatabase<typeof import("./schema")>
@@ -112,6 +118,11 @@ export class ProfileRejected extends Schema.TaggedError<ProfileRejected>()(
   { reason: Schema.String },
 ) {}
 
+export class SearchRejected extends Schema.TaggedError<SearchRejected>()(
+  "SearchRejected",
+  {},
+) {}
+
 export class Database extends Context.Service<
   Database,
   {
@@ -138,10 +149,26 @@ export class Database extends Context.Service<
     readonly disableProfileSearchability: (
       memberId: string,
     ) => Effect.Effect<MemberProfile, DatabaseUnavailable | ProfileRejected>;
+    readonly searchProfiles: (
+      filters: ProfileSearchFilters,
+      options?: { cursor?: string; pageSize?: number },
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof searchProfiles>>,
+      DatabaseUnavailable | SearchRejected
+    >;
+    readonly getSearchableProfile: (
+      profileId: string,
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof getSearchableProfile>>,
+      DatabaseUnavailable
+    >;
   }
 >()("@humans/database/Database") {}
 
-export const makeDatabaseService = (database: DrizzleDatabase) => {
+export const makeDatabaseService = (
+  database: DrizzleDatabase,
+  searchCursorSecret = "local-search-cursor",
+) => {
   const check = Effect.tryPromise({
     try: async () => {
       await database.execute(sql`select null::vector`);
@@ -501,14 +528,38 @@ export const makeDatabaseService = (database: DrizzleDatabase) => {
       return profile;
     }).pipe(Effect.withSpan("Database.disableProfileSearchability"));
 
+  const search = (
+    filters: ProfileSearchFilters,
+    options?: { cursor?: string; pageSize?: number },
+  ) =>
+    Effect.tryPromise({
+      try: () =>
+        searchProfiles(database, filters, {
+          ...options,
+          cursorSecret: searchCursorSecret,
+        }),
+      catch: (cause) =>
+        cause instanceof InvalidSearchCursor
+          ? new SearchRejected()
+          : new DatabaseUnavailable({ cause }),
+    }).pipe(Effect.withSpan("Database.searchProfiles"));
+
+  const getSearchResult = (profileId: string) =>
+    Effect.tryPromise({
+      try: () => getSearchableProfile(database, profileId),
+      catch: (cause) => new DatabaseUnavailable({ cause }),
+    }).pipe(Effect.withSpan("Database.getSearchableProfile"));
+
   return Database.of({
     check,
     disableProfileSearchability,
+    getSearchableProfile: getSearchResult,
     getProfile,
     getWorkspace,
     projectClerkEvent,
     provisionWorkspace,
     saveProfile,
+    searchProfiles: search,
   });
 };
 
@@ -563,8 +614,10 @@ const profileResult = (
     profile.searchabilityReason as MemberProfile["searchabilityReason"],
 });
 
-export const makeDatabaseLayer = (database: DrizzleDatabase) =>
-  Layer.succeed(Database, makeDatabaseService(database));
+export const makeDatabaseLayer = (
+  database: DrizzleDatabase,
+  searchCursorSecret?: string,
+) => Layer.succeed(Database, makeDatabaseService(database, searchCursorSecret));
 
 const upsertOrganization = async (
   database: Parameters<Parameters<DrizzleDatabase["transaction"]>[0]>[0],

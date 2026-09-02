@@ -1,6 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
+
+import { ProfileSearch } from "./profile-search";
 
 type Profile = {
   name: string;
@@ -9,8 +12,9 @@ type Profile = {
 };
 
 export function ProfileOnboarding() {
+  const searchParams = useSearchParams();
   const [choice, setChoice] = useState<"choose" | "search" | "profile">(
-    "choose",
+    searchParams.get("view") === "search" ? "search" : "choose",
   );
   const [profile, setProfile] = useState<Profile | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -20,14 +24,14 @@ export function ProfileOnboarding() {
     void fetch("/api/profile", { signal: controller.signal })
       .then((response) => response.json())
       .then((result: { profile: Profile | null }) => {
-        if (result.profile !== null) {
+        if (result.profile !== null && searchParams.get("view") !== "search") {
           setProfile(result.profile);
           setChoice("profile");
         }
       })
       .catch(() => undefined);
     return () => controller.abort();
-  }, []);
+  }, [searchParams]);
 
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -116,24 +120,15 @@ export function ProfileOnboarding() {
   }
 
   if (choice === "search") {
-    return (
-      <section className="onboarding">
-        <p className="eyebrow">Protected workspace</p>
-        <h1>You are ready to search.</h1>
-        <p className="lede">
-          You do not have a searchable Profile. Search tools will arrive here
-          next.
-        </p>
-        <button className="textAction" onClick={() => setChoice("profile")}>
-          Create a Profile instead
-        </button>
-      </section>
-    );
+    return <ProfileSearch onCreateProfile={() => setChoice("profile")} />;
   }
 
   return (
     <section className="onboarding profileFlow">
       <p className="eyebrow">Profile onboarding</p>
+      <button className="profileLink" onClick={() => setChoice("search")}>
+        Search the directory
+      </button>
       <h1>
         {profile === null
           ? "Show what you build."
