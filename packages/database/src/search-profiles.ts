@@ -238,30 +238,67 @@ const loadDocuments = async (
   if (rows.length === 0) return [];
   const profileIds = rows.map(({ profileId: id }) => id);
   const statements = await database
-    .select()
+    .select({
+      profileId: memberStatements.profileId,
+      field: memberStatements.field,
+      value: memberStatements.value,
+      collectedAt: memberStatements.collectedAt,
+    })
     .from(memberStatements)
     .where(inArray(memberStatements.profileId, profileIds))
     .orderBy(desc(memberStatements.collectedAt));
   const observations = await database
-    .select()
+    .select({
+      profileId: profileObservations.profileId,
+      field: profileObservations.field,
+      value: profileObservations.value,
+      source: profileObservations.source,
+      confidence: profileObservations.confidence,
+      collectedAt: profileObservations.collectedAt,
+    })
     .from(profileObservations)
     .where(inArray(profileObservations.profileId, profileIds))
     .orderBy(desc(profileObservations.collectedAt));
   const links = await database
-    .select()
+    .select({
+      profileId: professionalLinks.profileId,
+      url: professionalLinks.url,
+    })
     .from(professionalLinks)
     .where(inArray(professionalLinks.profileId, profileIds));
 
+  const statementsByProfile = new Map<string, (typeof statements)[number][]>();
+  for (const statement of statements) {
+    const ownStatements = statementsByProfile.get(statement.profileId) ?? [];
+    ownStatements.push(statement);
+    statementsByProfile.set(statement.profileId, ownStatements);
+  }
+  const observationsByProfile = new Map<
+    string,
+    (typeof observations)[number][]
+  >();
+  for (const observation of observations) {
+    const ownObservations =
+      observationsByProfile.get(observation.profileId) ?? [];
+    ownObservations.push(observation);
+    observationsByProfile.set(observation.profileId, ownObservations);
+  }
+  const linksByProfile = new Map<string, (typeof links)[number][]>();
+  for (const link of links) {
+    const ownLinks = linksByProfile.get(link.profileId) ?? [];
+    ownLinks.push(link);
+    linksByProfile.set(link.profileId, ownLinks);
+  }
+
   return rows.map((profile): SearchDocument => {
-    const ownStatements = statements.filter(
-      (statement) => statement.profileId === profile.profileId,
-    );
-    const ownObservations = observations.filter(
+    const ownStatements = statementsByProfile.get(profile.profileId) ?? [];
+    const ownObservations = (
+      observationsByProfile.get(profile.profileId) ?? []
+    ).filter(
       (observation) =>
-        observation.profileId === profile.profileId &&
-        (!observation.source.startsWith("github") ||
-          now.getTime() - observation.collectedAt.getTime() <=
-            30 * 24 * 60 * 60 * 1000),
+        !observation.source.startsWith("github") ||
+        now.getTime() - observation.collectedAt.getTime() <=
+          30 * 24 * 60 * 60 * 1000,
     );
     const { values, confidenceByField, memberFields } = effectiveValues(
       ownStatements,
@@ -316,17 +353,24 @@ const loadDocuments = async (
         ) === "open"
           ? 1
           : 0,
-      links: links
-        .filter((link) => link.profileId === profile.profileId)
-        .map(({ url }) => url),
+      links: (linksByProfile.get(profile.profileId) ?? []).map(
+        ({ url }) => url,
+      ),
       rank: 0,
     };
   });
 };
 
 const effectiveValues = (
-  statements: Array<typeof memberStatements.$inferSelect>,
-  observations: Array<typeof profileObservations.$inferSelect>,
+  statements: Array<
+    Pick<typeof memberStatements.$inferSelect, "field" | "value">
+  >,
+  observations: Array<
+    Pick<
+      typeof profileObservations.$inferSelect,
+      "field" | "value" | "source" | "confidence"
+    >
+  >,
 ) => {
   const values: Record<string, unknown> = {};
   const confidenceByField = new Map<string, number>();
