@@ -3,7 +3,7 @@
   "name": "humans-api-local",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-31",
-  "placement": { "mode": "smart" },
+  "placement": { "region": "aws:us-east-1" },
   "ratelimits": [
     {
       "name": "ORGANIZATION_RATE_LIMITER",
