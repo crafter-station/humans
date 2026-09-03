@@ -11,17 +11,28 @@ branches, API credentials, webhook secrets, or encryption/signing secrets.
 
 | Service | Local | Preview | Production |
 | --- | --- | --- | --- |
-| Clerk instance ID | Local development instance | | |
-| Neon project and branch | | | |
-| Trigger.dev project/environment | Development | Staging | Production |
-| Cloudflare Worker | `humans-api-local` | `humans-api-preview` | `humans-api-production` |
-| Vercel project/environment | Local | Preview | Production |
-| Polar organization/environment | Sandbox | Sandbox | Production |
-| OpenAI credential ID | | | |
-| GitHub credential ID | | | |
-| TikHub credential ID | | | |
-| Deepline credential ID | | | |
-| Sentry project/environment | Local | Preview | Production |
+| Clerk instance ID | Local development instance | `ins_3InRqXS3sKxXPyqqiOMQ75PhGQx` | `ins_3InStOBNOMbj1uRVtQCN0GLX3tt` |
+| Clerk webhook endpoint | Local listener | `ep_3InUXE23pr40O0RjqGLbf2nlKWi` | `ep_3InUe0OhgKQtJXkVkkSNi7LVmIN` |
+| Neon project and branch | Local database | `autumn-base-48692547` / `br-silent-heart-audvpz7y` | `autumn-base-48692547` / `br-spring-haze-autqf4gr` |
+| Trigger.dev project/environment | `proj_umusurvkybxuonbiopal` / Development | `proj_umusurvkybxuonbiopal` / Staging | `proj_umusurvkybxuonbiopal` / Production |
+| Cloudflare Worker | `humans-api-local` | `humans-api-preview` / `d011be97-1b8c-4600-8ac7-5724a2a55b95` | `humans-api-production` / `6ce29841-eff4-4605-a00a-8ac1a1b696ca` |
+| Vercel project/environment | Local | `prj_1rRwDoknIk65eWIHIScwyuuHDthI` / Preview / `dpl_6kpu7sXEZukyEpLCEREbiB3oH2U5` | `prj_1rRwDoknIk65eWIHIScwyuuHDthI` / Production / `dpl_AjaXzBaBodtu15qGWWdoSAirmF3J` |
+| Polar organization/environment | Sandbox | Pending / Sandbox | Pending / Production |
+| OpenAI credential ID | Local credential | Pending | Pending |
+| GitHub enrichment credential ID | Local credential | Pending | Pending |
+| GitHub sign-in OAuth app | Clerk shared development credential | Clerk shared development credential | `cuevaio/Humans` / application `3833647` |
+| TikHub credential ID | Local credential | Pending | Pending |
+| Deepline credential ID | Local credential | Pending | Pending |
+| Sentry project/environment | Local | Pending / Preview | Pending / Production |
+
+The production web application is `https://humans.crafter.run`. The HTTP API,
+MCP endpoint, Scalar documentation, and OpenAPI contract are available at
+`https://api.humans.crafter.run`. Spaceship DNS points both hostnames to Vercel;
+the API hostname is host-gated at the Vercel edge and rewritten to the production
+Cloudflare Worker. The API continues to execute entirely on Cloudflare Workers,
+without delegating or modifying the parent `crafter.run` nameservers. Staging
+uses the Clerk development instance; production uses the Clerk production
+instance.
 
 Before deployment, verify every populated preview identifier differs from its
 production counterpart. A credential ID may be its dashboard label or last four
@@ -48,9 +59,10 @@ Vercel requires `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`,
 `HUMANS_API_URL`, and `HUMANS_PROXY_SECRET` in separate Preview and Production
 scopes. Configure `apps/web` as the Vercel project root.
 
-Trigger.dev requires a distinct `TRIGGER_PROJECT_REF` and provider credentials
-for each environment. Polar webhooks and Clerk webhooks must target only the
-Worker URL from their own environment.
+Trigger.dev uses one dedicated `TRIGGER_PROJECT_REF`; its Development, Staging,
+and Production environments require separate database and provider credentials.
+Polar webhooks and Clerk webhooks must target only the Worker URL from their own
+environment.
 
 ## Release procedure
 
@@ -131,10 +143,29 @@ sanitized fixture.
 - [ ] No inferred or unverified Contact Detail shipped.
 - [ ] No externally accessible or indexable Profile shipped.
 
-Release commit: __________
+Release commit: `939e889`
 
-Preview evidence: __________
+Preview evidence: Vercel `dpl_6kpu7sXEZukyEpLCEREbiB3oH2U5`; Worker code
+`8e7f59e9-37ee-4677-a9f2-5c472a35afba`, with rotated-secret version
+`d011be97-1b8c-4600-8ac7-5724a2a55b95`; health, OpenAPI, and docs returned
+`200`; unauthenticated Profile and MCP requests returned `401`. A disposable
+Member and Organization completed Organization API-key list, create, protected
+HTTP, MCP `list_search_facets`, and revoke checks; the revoked key returned
+`401`. The exposed Preview Clerk and web-proxy credentials were rotated and the
+retired Clerk key was rejected.
 
-Production evidence: __________
+Production evidence: Vercel `dpl_AjaXzBaBodtu15qGWWdoSAirmF3J`; Worker
+`6ce29841-eff4-4605-a00a-8ac1a1b696ca`; Vercel certificate
+`cert_tsCUhrgR628SZSgsMzc4RdZB` covers the web hostname, while
+`cert_RXIyHRmGUm3ACkiDJqCjb0VR` and `cert_Htwkez7nFvuHNceXjKcy6FWn` cover the
+API hostname. Health, OpenAPI, and docs returned `200`; unauthenticated Profile
+and MCP requests returned `401`. GitHub sign-in, Clerk callback,
+Organization creation/selection, and authenticated workspace reads completed.
+A short-lived Organization API key completed list, create, protected HTTP, MCP
+`list_search_facets`, and revoke checks through `api.humans.crafter.run`; the
+revoked key returned `401`. The root response includes private/no-cache and
+no-index headers, and `robots.txt` disallows all crawlers.
 
-Verified by and date: __________
+Verified by and date: automated release verification, 2026-09-02. Trigger.dev
+task deployment, Polar, Sentry, the representative import journey, and live
+provider checks remain pending.
