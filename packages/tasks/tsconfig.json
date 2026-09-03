@@ -1,9 +1,17 @@
 {
   "extends": "@repo/typescript-config/base.json",
   "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
     "noEmit": true,
     "rootDir": ".",
     "types": ["node"]
   },
-  "include": ["trigger.config.ts", "src/**/*.ts"]
+  "include": [
+    "trigger.config.ts",
+    "trigger.tikhub.config.ts",
+    "scripts/**/*.ts",
+    "src/**/*.ts",
+    "test/**/*.ts"
+  ]
 }

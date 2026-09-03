@@ -1,0 +1,55 @@
+{
+  "code": 200,
+  "request_id": "req_sanitized_linkedin_profile_01",
+  "message": "Request successful. This request will incur a charge.",
+  "message_zh": "Request successful.",
+  "support": "Discord: https://discord.example.invalid",
+  "time": "2026-09-01 00:00:00",
+  "time_stamp": 1788220800,
+  "time_zone": "America/Los_Angeles",
+  "docs": "https://docs.tikhub.io/452347395e0",
+  "cache_message": null,
+  "cache_message_zh": null,
+  "cache_url": null,
+  "router": "/api/v1/linkedin/web_v2/get_user_profile",
+  "params": {
+    "url": "https://www.linkedin.com/in/ada-lovelace"
+  },
+  "data": {
+    "id": "ada-lovelace",
+    "name": "Ada Lovelace",
+    "position": "Staff Software Engineer",
+    "current_company": {
+      "company_id": "analytical-engines",
+      "link": "https://www.linkedin.com/company/analytical-engines",
+      "location": "Lima, Peru",
+      "name": "Analytical Engines"
+    },
+    "current_company_company_id": "analytical-engines",
+    "current_company_name": "Analytical Engines",
+    "experience": [
+      {
+        "company": "Analytical Engines",
+        "company_id": "analytical-engines",
+        "title": "Staff Software Engineer",
+        "start_date": "Jan 2022",
+        "end_date": "Present",
+        "url": "https://www.linkedin.com/company/analytical-engines"
+      }
+    ],
+    "education": [
+      {
+        "title": "Universidad Nacional",
+        "field": "Computer Science",
+        "start_year": "2017",
+        "end_year": "2021",
+        "url": "https://www.linkedin.com/school/universidad-nacional"
+      }
+    ],
+    "url": "https://www.linkedin.com/in/ada-lovelace",
+    "input_url": "https://www.linkedin.com/in/ada-lovelace",
+    "linkedin_id": "ada-lovelace",
+    "linkedin_num_id": "123456789",
+    "timestamp": "2026-09-01T00:00:00.000Z"
+  }
+}

@@ -18,6 +18,11 @@ export type SessionIdentity = {
   botProtectionVerified?: boolean;
 };
 
+export type LinkedInVerification = {
+  providerUserId: string;
+  username: string;
+};
+
 export type ApiScope = "profiles:read" | "contacts:reveal";
 
 export type ApiKeyIdentity = {
@@ -89,6 +94,10 @@ export type IdentityBoundary = {
     memberId: string,
     bindings: Bindings,
   ): Promise<GitHubVerification>;
+  verifyLinkedIn(
+    memberId: string,
+    bindings: Bindings,
+  ): Promise<LinkedInVerification | null>;
 };
 
 const memberProjection = (data: {
@@ -117,6 +126,24 @@ const organizationProjection = (data: {
   name: data.name,
   slug: data.slug ?? null,
 });
+
+const listAllClerkPages = async <Resource>(
+  pageSize: number,
+  listPage: (
+    offset: number,
+  ) => Promise<{ data: Resource[]; totalCount: number }>,
+): Promise<Resource[]> => {
+  const resources: Resource[] = [];
+  let offset = 0;
+  let totalCount: number;
+  do {
+    const page = await listPage(offset);
+    resources.push(...page.data);
+    totalCount = page.totalCount;
+    offset += pageSize;
+  } while (offset < totalCount);
+  return resources;
+};
 
 export const clerkIdentityBoundary: IdentityBoundary = {
   async authenticate(request, bindings) {
@@ -193,22 +220,28 @@ export const clerkIdentityBoundary: IdentityBoundary = {
 
   async listOrganizationApiKeys(organizationId, bindings) {
     const clerk = createClerkClient({ secretKey: bindings.CLERK_SECRET_KEY });
-    const result = await clerk.apiKeys.list({
-      subject: organizationId,
-      includeInvalid: true,
-      limit: 100,
-    });
-    return result.data.map(organizationApiKey);
+    const keys = await listAllClerkPages(100, (offset) =>
+      clerk.apiKeys.list({
+        subject: organizationId,
+        includeInvalid: true,
+        limit: 100,
+        offset,
+      }),
+    );
+    return keys.map(organizationApiKey);
   },
 
   async revokeOrganizationApiKey(organizationId, apiKeyId, bindings) {
     const clerk = createClerkClient({ secretKey: bindings.CLERK_SECRET_KEY });
-    const keys = await clerk.apiKeys.list({
-      subject: organizationId,
-      includeInvalid: true,
-      limit: 100,
-    });
-    if (!keys.data.some((key) => key.id === apiKeyId)) return null;
+    const keys = await listAllClerkPages(100, (offset) =>
+      clerk.apiKeys.list({
+        subject: organizationId,
+        includeInvalid: true,
+        limit: 100,
+        offset,
+      }),
+    );
+    if (!keys.some((key) => key.id === apiKeyId)) return null;
     return organizationApiKey(
       await clerk.apiKeys.revoke({
         apiKeyId,
@@ -219,12 +252,15 @@ export const clerkIdentityBoundary: IdentityBoundary = {
 
   async revokeMemberSessions(memberId, bindings) {
     const clerk = createClerkClient({ secretKey: bindings.CLERK_SECRET_KEY });
-    const sessions = await clerk.sessions.getSessionList({
-      userId: memberId,
-      limit: 500,
-    });
+    const sessions = await listAllClerkPages(500, (offset) =>
+      clerk.sessions.getSessionList({
+        userId: memberId,
+        limit: 500,
+        offset,
+      }),
+    );
     await Promise.all(
-      sessions.data.map((session) =>
+      sessions.map((session) =>
         clerk.sessions.revokeSession(session.id).then(() => undefined),
       ),
     );
@@ -232,13 +268,16 @@ export const clerkIdentityBoundary: IdentityBoundary = {
 
   async revokeAllOrganizationApiKeys(organizationId, bindings) {
     const clerk = createClerkClient({ secretKey: bindings.CLERK_SECRET_KEY });
-    const keys = await clerk.apiKeys.list({
-      subject: organizationId,
-      includeInvalid: false,
-      limit: 500,
-    });
+    const keys = await listAllClerkPages(100, (offset) =>
+      clerk.apiKeys.list({
+        subject: organizationId,
+        includeInvalid: false,
+        limit: 100,
+        offset,
+      }),
+    );
     await Promise.all(
-      keys.data.map((key) =>
+      keys.map((key) =>
         clerk.apiKeys
           .revoke({
             apiKeyId: key.id,
@@ -539,6 +578,7 @@ export const clerkIdentityBoundary: IdentityBoundary = {
           ),
         ]
       : [];
+    const latestPublicContribution = publicContributionDates.sort().at(-1);
 
     return {
       accountId: String(account.id),
@@ -546,12 +586,31 @@ export const clerkIdentityBoundary: IdentityBoundary = {
       accountType: account.type,
       ownsNonForkRepository,
       contributedPubliclySince:
-        publicContributionDates.length > 0
-          ? new Date(publicContributionDates.sort().at(-1)!)
+        latestPublicContribution !== undefined
+          ? new Date(latestPublicContribution)
           : null,
       ownershipVerified: true,
       knownMinor: member.privateMetadata.knownMinor === true,
     };
+  },
+
+  async verifyLinkedIn(memberId, bindings) {
+    const clerk = createClerkClient({ secretKey: bindings.CLERK_SECRET_KEY });
+    const member = await clerk.users.getUser(memberId);
+    const account = member.externalAccounts.find((externalAccount) => {
+      const provider = externalAccount.provider.replace(/^oauth_/, "");
+      return (
+        (provider === "linkedin" || provider === "linkedin_oidc") &&
+        externalAccount.verification?.status === "verified" &&
+        externalAccount.username?.trim()
+      );
+    });
+    return account?.username
+      ? {
+          providerUserId: account.providerUserId,
+          username: account.username,
+        }
+      : null;
   },
 };
 

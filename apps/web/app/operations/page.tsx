@@ -1,4 +1,23 @@
 import { auth, currentUser } from "@clerk/nextjs/server";
+import { Button } from "@repo/ui/components/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@repo/ui/components/card";
+import { Input } from "@repo/ui/components/input";
+import { NativeSelect } from "@repo/ui/components/native-select";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@repo/ui/components/table";
+import { Textarea } from "@repo/ui/components/textarea";
 import { revalidatePath } from "next/cache";
 import { notFound } from "next/navigation";
 
@@ -18,6 +37,7 @@ type Overview = {
   suppressions: Item[];
   abuse: { signals: Item[]; suspensions: Item[] };
   reconciliations: Item[];
+  creditUsageDeadLetters: Item[];
   auditTrail: Item[];
 };
 
@@ -46,30 +66,98 @@ const operatorRequest = async (path: string, body?: unknown) => {
   return response.json();
 };
 
+const optionalText = (formData: FormData, name: string) => {
+  const value = String(formData.get(name) ?? "").trim();
+  return value || undefined;
+};
+
+const optionalList = (formData: FormData, name: string) => {
+  const value = optionalText(formData, name);
+  return value
+    ?.split(/[\n,]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+};
+
 async function reviewClaim(formData: FormData) {
   "use server";
   await operatorRequest(`/claims/${formData.get("id")}/review`, {
     approved: formData.get("decision") === "approve",
     reason: formData.get("reason"),
+    evidenceReference: formData.get("evidenceReference") || undefined,
   });
   revalidatePath("/operations");
 }
 
 async function reviewRequest(formData: FormData) {
   "use server";
+  const approved = formData.get("decision") === "confirm";
   await operatorRequest(`/profile-requests/${formData.get("id")}/review`, {
-    approved: formData.get("decision") === "confirm",
+    approved,
     reason: formData.get("reason"),
     correction:
-      formData.get("kind") === "correction"
-        ? Object.fromEntries(
-            ["name", "currentCompany", "githubAccountId", "githubLogin"]
-              .map((key) => [key, formData.get(key)])
-              .filter(([, fieldValue]) => fieldValue !== ""),
-          )
+      approved && formData.get("kind") === "correction"
+        ? {
+            name: optionalText(formData, "name"),
+            currentCompany:
+              formData.get("clearCurrentCompany") === "on"
+                ? null
+                : optionalText(formData, "currentCompany"),
+            headline:
+              formData.get("clearHeadline") === "on"
+                ? null
+                : optionalText(formData, "headline"),
+            currentResidence:
+              formData.get("clearCurrentResidence") === "on"
+                ? null
+                : optionalText(formData, "currentResidence"),
+            roles:
+              formData.get("clearRoles") === "on"
+                ? []
+                : optionalList(formData, "roles"),
+            skills:
+              formData.get("clearSkills") === "on"
+                ? []
+                : optionalList(formData, "skills"),
+            seniority:
+              formData.get("clearSeniority") === "on"
+                ? null
+                : optionalText(formData, "seniority"),
+            experienceYears:
+              formData.get("clearExperienceYears") === "on"
+                ? null
+                : optionalText(formData, "experienceYears") === undefined
+                  ? undefined
+                  : Number(optionalText(formData, "experienceYears")),
+            opportunityStatus: optionalText(formData, "opportunityStatus"),
+            professionalLinks: optionalList(formData, "professionalLinks"),
+            invalidContactObservationIds: optionalList(
+              formData,
+              "invalidContactObservationIds",
+            ),
+          }
         : undefined,
   });
   revalidatePath("/operations");
+}
+
+async function verifyRequest(formData: FormData) {
+  "use server";
+  await operatorRequest(`/profile-requests/${formData.get("id")}/verify`, {
+    reason: formData.get("reason"),
+    verificationMethod: formData.get("verificationMethod"),
+    evidenceReference: formData.get("evidenceReference"),
+  });
+  revalidatePath("/operations");
+}
+
+async function processRequest(formData: FormData) {
+  "use server";
+  if (formData.get("decision") === "verify") {
+    await verifyRequest(formData);
+    return;
+  }
+  await reviewRequest(formData);
 }
 
 async function suppressProfile(formData: FormData) {
@@ -95,6 +183,15 @@ async function adjustCredits(formData: FormData) {
     organizationId: formData.get("organizationId"),
     amount: Number(formData.get("amount")),
     idempotencyKey: formData.get("idempotencyKey"),
+    reason: formData.get("reason"),
+  });
+  revalidatePath("/operations");
+}
+
+async function redriveCreditUsage(formData: FormData) {
+  "use server";
+  await operatorRequest("/credit-usage/redrive", {
+    ids: [formData.get("id")],
     reason: formData.get("reason"),
   });
   revalidatePath("/operations");
@@ -133,24 +230,24 @@ function DataTable({ rows, columns }: { rows: Item[]; columns: string[] }) {
     return <p className={styles.empty}>Nothing waiting.</p>;
   return (
     <div className={styles.tableWrap}>
-      <table>
-        <thead>
-          <tr>
+      <Table className={styles.dataTable}>
+        <TableHeader>
+          <TableRow>
             {columns.map((column) => (
-              <th key={column}>{column}</th>
+              <TableHead key={column}>{column}</TableHead>
             ))}
-          </tr>
-        </thead>
-        <tbody>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
           {rows.map((row, index) => (
-            <tr key={String(row.id ?? `${index}`)}>
+            <TableRow key={String(row.id ?? `${index}`)}>
               {columns.map((column) => (
-                <td key={column}>{value(row, column)}</td>
+                <TableCell key={column}>{value(row, column)}</TableCell>
               ))}
-            </tr>
+            </TableRow>
           ))}
-        </tbody>
-      </table>
+        </TableBody>
+      </Table>
     </div>
   );
 }
@@ -245,8 +342,12 @@ export default async function OperationsPage() {
             <DecisionForm
               key={String(request.id)}
               item={request}
-              action={reviewRequest}
-              decisions={["confirm", "reject"]}
+              action={processRequest}
+              decisions={
+                request.status === "awaiting_verification"
+                  ? ["verify", "dismiss"]
+                  : ["confirm", "reject"]
+              }
             />
           ))}
           {overview.requests.length === 0 && (
@@ -257,13 +358,13 @@ export default async function OperationsPage() {
 
       <Section title="Suppression Records">
         <form action={suppressProfile} className={styles.actionForm}>
-          <input
+          <Input
             name="canonicalProviderId"
             placeholder="GitHub account ID"
             required
           />
-          <input name="reason" placeholder="Reason" required />
-          <button type="submit">Suppress Profile</button>
+          <Input name="reason" placeholder="Reason" required />
+          <Button type="submit">Suppress Profile</Button>
         </form>
         <DataTable
           rows={overview.suppressions}
@@ -279,12 +380,12 @@ export default async function OperationsPage() {
       <section className={styles.split}>
         <Section title="Abuse signals">
           <form action={revokeAccess} className={styles.actionForm}>
-            <select name="kind">
+            <NativeSelect name="kind">
               <option value="member">Member sessions</option>
               <option value="organization">Organization keys</option>
-            </select>
-            <input name="principalId" placeholder="Principal ID" required />
-            <button type="submit">Revoke access</button>
+            </NativeSelect>
+            <Input name="principalId" placeholder="Principal ID" required />
+            <Button type="submit">Revoke access</Button>
           </form>
           <DataTable
             rows={overview.abuse.signals}
@@ -300,14 +401,14 @@ export default async function OperationsPage() {
         </Section>
         <Section title="Active suspensions">
           <form action={suspendPrincipal} className={styles.actionForm}>
-            <select name="principalType">
+            <NativeSelect name="principalType">
               <option value="member">Member</option>
               <option value="organization">Organization</option>
               <option value="api_key">API key</option>
-            </select>
-            <input name="principalId" placeholder="Principal ID" required />
-            <input name="reason" placeholder="Reason" required />
-            <button type="submit">Suspend</button>
+            </NativeSelect>
+            <Input name="principalId" placeholder="Principal ID" required />
+            <Input name="reason" placeholder="Reason" required />
+            <Button type="submit">Suspend</Button>
           </form>
           <DataTable
             rows={overview.abuse.suspensions}
@@ -325,20 +426,20 @@ export default async function OperationsPage() {
 
       <Section title="Credit reconciliation">
         <form action={adjustCredits} className={styles.actionForm}>
-          <input
+          <Input
             type="hidden"
             name="idempotencyKey"
             value={crypto.randomUUID()}
           />
-          <input name="organizationId" placeholder="Organization ID" required />
-          <input
+          <Input name="organizationId" placeholder="Organization ID" required />
+          <Input
             name="amount"
             type="number"
             placeholder="Credit adjustment"
             required
           />
-          <input name="reason" placeholder="Adjustment reason" required />
-          <button type="submit">Adjust Credits</button>
+          <Input name="reason" placeholder="Adjustment reason" required />
+          <Button type="submit">Adjust Credits</Button>
         </form>
         {overview.reconciliations.map((item) => (
           <form
@@ -346,19 +447,34 @@ export default async function OperationsPage() {
             className={styles.queueItem}
             key={String(item.id)}
           >
-            <input type="hidden" name="id" value={String(item.id)} />
+            <Input type="hidden" name="id" value={String(item.id)} />
             <code>
               {value(item, "organizationId")} / local{" "}
               {value(item, "localCredits")} / Polar{" "}
               {value(item, "polarCredits")}
             </code>
-            <input name="reason" placeholder="Retry reason" required />
-            <button type="submit">Queue retry</button>
+            <Input name="reason" placeholder="Retry reason" required />
+            <Button type="submit">Queue retry</Button>
           </form>
         ))}
         {overview.reconciliations.length === 0 && (
           <p className={styles.empty}>No reconciliation differences.</p>
         )}
+        {overview.creditUsageDeadLetters.map((item) => (
+          <form
+            action={redriveCreditUsage}
+            className={styles.queueItem}
+            key={String(item.id)}
+          >
+            <Input type="hidden" name="id" value={String(item.id)} />
+            <code>
+              Failed usage {value(item, "id")} / attempts{" "}
+              {value(item, "attempts")} / {value(item, "lastErrorCode")}
+            </code>
+            <Input name="reason" placeholder="Redrive reason" required />
+            <Button type="submit">Redrive usage</Button>
+          </form>
+        ))}
       </Section>
       <Section title="Operator audit trail">
         <DataTable
@@ -381,8 +497,12 @@ export default async function OperationsPage() {
 function Metric({ label, count }: { label: string; count: number }) {
   return (
     <article>
-      <strong>{count}</strong>
-      <span>{label}</span>
+      <Card className={styles.metricCard}>
+        <CardContent>
+          <strong>{count}</strong>
+          <span>{label}</span>
+        </CardContent>
+      </Card>
     </article>
   );
 }
@@ -397,12 +517,20 @@ function Section({
   children: React.ReactNode;
 }) {
   return (
-    <section className={styles.panel}>
-      <div className={styles.panelHead}>
-        <h2>{title}</h2>
-        {note && <p>{note}</p>}
-      </div>
-      {children}
+    <section className={styles.panelSection}>
+      <Card className={styles.panel}>
+        <CardHeader className={styles.panelHead}>
+          <CardTitle>
+            <h2>{title}</h2>
+          </CardTitle>
+          {note && (
+            <CardDescription>
+              <p>{note}</p>
+            </CardDescription>
+          )}
+        </CardHeader>
+        <CardContent className={styles.panelContent}>{children}</CardContent>
+      </Card>
     </section>
   );
 }
@@ -416,27 +544,147 @@ function DecisionForm({
   action: (data: FormData) => Promise<void>;
   decisions: string[];
 }) {
+  const formId = String(item.id);
+
   return (
     <form action={action} className={styles.queueItem}>
-      <input type="hidden" name="id" value={String(item.id)} />
-      <input type="hidden" name="kind" value={String(item.kind ?? "claim")} />
+      <Input type="hidden" name="id" value={String(item.id)} />
+      <Input type="hidden" name="kind" value={String(item.kind ?? "claim")} />
       <code>
         {value(item, "profileId")} / {value(item, "memberId")}
       </code>
-      <input name="reason" placeholder="Decision reason" required />
+      {item.status !== undefined && <span>{value(item, "status")}</span>}
+      {item.githubAccountId !== undefined && (
+        <span>Claimant GitHub ID: {value(item, "githubAccountId")}</span>
+      )}
+      {item.requesterEmail !== undefined && (
+        <span>Requester: {value(item, "requesterEmail")}</span>
+      )}
+      {item.details !== undefined && <p>{value(item, "details")}</p>}
+      <Input name="reason" placeholder="Decision reason" required />
+      {item.kind === undefined && (
+        <Input
+          name="evidenceReference"
+          placeholder="Evidence reference for approval"
+        />
+      )}
+      {item.status === "awaiting_verification" && (
+        <>
+          <Input
+            name="verificationMethod"
+            placeholder="Verification method"
+            required
+          />
+          <Input
+            name="evidenceReference"
+            placeholder="Verification evidence reference"
+            required
+          />
+        </>
+      )}
       {item.kind === "correction" && (
         <div className={styles.correctionFields}>
-          <input name="name" placeholder="Corrected name" />
-          <input name="currentCompany" placeholder="Corrected company" />
-          <input name="githubAccountId" placeholder="Corrected GitHub ID" />
-          <input name="githubLogin" placeholder="Corrected GitHub login" />
+          <Input name="name" placeholder="Corrected name" />
+          <Input name="currentCompany" placeholder="Corrected company" />
+          <label htmlFor={`${formId}-clear-current-company`}>
+            <Input
+              id={`${formId}-clear-current-company`}
+              name="clearCurrentCompany"
+              type="checkbox"
+            />{" "}
+            Clear company
+          </label>
+          <Input name="headline" placeholder="Corrected headline" />
+          <label htmlFor={`${formId}-clear-headline`}>
+            <Input
+              id={`${formId}-clear-headline`}
+              name="clearHeadline"
+              type="checkbox"
+            />{" "}
+            Clear headline
+          </label>
+          <Input name="currentResidence" placeholder="Corrected residence" />
+          <label htmlFor={`${formId}-clear-current-residence`}>
+            <Input
+              id={`${formId}-clear-current-residence`}
+              name="clearCurrentResidence"
+              type="checkbox"
+            />{" "}
+            Clear residence
+          </label>
+          <Input name="roles" placeholder="Corrected roles, comma-separated" />
+          <label htmlFor={`${formId}-clear-roles`}>
+            <Input
+              id={`${formId}-clear-roles`}
+              name="clearRoles"
+              type="checkbox"
+            />{" "}
+            Clear roles
+          </label>
+          <Input
+            name="skills"
+            placeholder="Corrected skills, comma-separated"
+          />
+          <label htmlFor={`${formId}-clear-skills`}>
+            <Input
+              id={`${formId}-clear-skills`}
+              name="clearSkills"
+              type="checkbox"
+            />{" "}
+            Clear skills
+          </label>
+          <Input name="seniority" placeholder="Corrected seniority" />
+          <label htmlFor={`${formId}-clear-seniority`}>
+            <Input
+              id={`${formId}-clear-seniority`}
+              name="clearSeniority"
+              type="checkbox"
+            />{" "}
+            Clear seniority
+          </label>
+          <Input
+            name="experienceYears"
+            min="0"
+            max="100"
+            step="0.5"
+            type="number"
+            placeholder="Corrected years of experience"
+          />
+          <label htmlFor={`${formId}-clear-experience-years`}>
+            <Input
+              id={`${formId}-clear-experience-years`}
+              name="clearExperienceYears"
+              type="checkbox"
+            />{" "}
+            Clear years of experience
+          </label>
+          <NativeSelect name="opportunityStatus" defaultValue="">
+            <option value="">Keep opportunity status</option>
+            <option value="open">Open</option>
+            <option value="not_open">Not open</option>
+            <option value="unspecified">Unspecified</option>
+          </NativeSelect>
+          <Textarea
+            name="professionalLinks"
+            placeholder="Corrected Professional Links, one per line"
+          />
+          <Textarea
+            name="invalidContactObservationIds"
+            placeholder="Invalid Contact Detail Observation IDs, one per line"
+          />
         </div>
       )}
       <div>
         {decisions.map((decision) => (
-          <button key={decision} name="decision" value={decision} type="submit">
+          <Button
+            key={decision}
+            name="decision"
+            value={decision}
+            type="submit"
+            formNoValidate={decision === "dismiss"}
+          >
             {decision}
-          </button>
+          </Button>
         ))}
       </div>
     </form>

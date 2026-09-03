@@ -10,15 +10,18 @@
     "format": "biome format --write .",
     "lint": "biome lint .",
     "check-types": "node ../../node_modules/@typescript/native/bin/tsc --noEmit",
+    "smoke:github": "bun ./scripts/smoke.ts github",
+    "smoke:openai": "bun ./scripts/smoke.ts openai",
     "test": "vitest run"
   },
   "devDependencies": {
     "@repo/typescript-config": "*",
     "@typescript/native": "npm:typescript@7.0.2",
+    "@types/node": "26.3.0",
     "typescript": "6.0.2",
     "vitest": "4.1.11"
   },
   "dependencies": {
-    "@trigger.dev/sdk": "4.5.15"
+    "@trigger.dev/sdk": "4.5.16"
   }
 }

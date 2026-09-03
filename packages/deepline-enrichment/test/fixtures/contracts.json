@@ -1,0 +1,104 @@
+{
+  "identity": {
+    "toolId": "limadata_find_person_profiles",
+    "provider": "limadata",
+    "operationId": "limadata_find_person_profiles",
+    "description": "Resolve LinkedIn, GitHub, and X identity links for a known person.",
+    "inputSchema": {
+      "jsonSchema": {
+        "type": "object",
+        "properties": {
+          "full_name": { "type": "string", "minLength": 1 },
+          "company_name": { "type": ["string", "null"] },
+          "company_domain": { "type": ["string", "null"] },
+          "email": { "type": ["string", "null"] }
+        },
+        "required": ["full_name"],
+        "additionalProperties": false
+      }
+    },
+    "outputSchema": {
+      "jsonSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "linkedin_url": { "type": ["string", "null"] },
+              "github_url": { "type": ["string", "null"] },
+              "x_url": { "type": ["string", "null"] }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": ["data"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "career": {
+    "toolId": "harvestapi_get_profile",
+    "provider": "harvestapi",
+    "operationId": "harvestapi_get_profile",
+    "description": "Enrich one LinkedIn profile.",
+    "inputSchema": {
+      "jsonSchema": {
+        "type": "object",
+        "properties": {
+          "url": { "type": "string", "format": "uri", "minLength": 1 },
+          "publicIdentifier": { "type": "string", "minLength": 1 },
+          "profileId": { "type": "string", "minLength": 1 },
+          "main": { "type": "string" },
+          "findEmail": { "type": "string" },
+          "skipSmtp": { "type": "string" }
+        },
+        "required": [],
+        "allOf": [
+          {
+            "anyOf": [
+              { "required": ["url"] },
+              { "required": ["publicIdentifier"] },
+              { "required": ["profileId"] }
+            ]
+          }
+        ],
+        "additionalProperties": false
+      }
+    },
+    "outputSchema": {
+      "jsonSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "element": {
+                "type": "object",
+                "properties": {
+                  "headline": { "type": "string" },
+                  "currentPosition": {
+                    "type": "array",
+                    "items": { "type": "object" }
+                  },
+                  "experience": {
+                    "type": "array",
+                    "items": { "type": "object" }
+                  },
+                  "education": {
+                    "type": "array",
+                    "items": { "type": "object" }
+                  },
+                  "skills": { "type": "array", "items": { "type": "object" } }
+                },
+                "additionalProperties": true
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "required": ["data"],
+        "additionalProperties": false
+      }
+    }
+  }
+}

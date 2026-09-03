@@ -85,6 +85,7 @@ export type MemberProfile = ProfileInput & {
     | "public_contribution"
     | "private_attestation";
   searchabilityReason:
+    | "disputed"
     | "member_opt_in"
     | "member_opt_out"
     | "operator_suppression";

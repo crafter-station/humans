@@ -1,29 +1,32 @@
-import { PostgreSqlContainer } from "@testcontainers/postgresql";
+import { fileURLToPath } from "node:url";
 import {
-  makeDatabaseLayer,
   type ClerkProjectionEvent,
   type GitHubVerification,
+  makeDatabaseLayer,
   type ProvisionedWorkspace,
 } from "@humans/database";
-import * as schema from "@humans/database/schema";
 import { applyCreditEntry, getCreditBalance } from "@humans/database/credits";
-import { eq } from "drizzle-orm";
+import { importProfiles } from "@humans/database/import-profiles";
+import * as schema from "@humans/database/schema";
+import { searchProfiles } from "@humans/database/search-profiles";
+import { PostgreSqlContainer } from "@testcontainers/postgresql";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
-import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 import { Webhook } from "standardwebhooks";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { createApp, type Bindings } from "../src/app";
+import { type Bindings, createApp } from "../src/app";
 import {
-  clerkIdentityBoundary,
   type ApiKeyIdentity,
   type ApiScope,
-  type OrganizationApiKey,
+  clerkIdentityBoundary,
   type IdentityBoundary,
+  type OrganizationApiKey,
   type SessionIdentity,
 } from "../src/clerk";
+import type { PolarBoundary } from "../src/polar";
 
 describe("Humans API", () => {
   const resources: {
@@ -318,6 +321,86 @@ describe("Humans API", () => {
     expect(identity.personalOrganizationsCreated).toBe(1);
   });
 
+  it("refuses a second Pro checkout for an active Polar subscription", async () => {
+    const billingIdentity = new FakeIdentity();
+    billingIdentity.sessions.set("billing_session", {
+      memberId: "billing_member",
+      organizationId: null,
+    });
+    let active = true;
+    const createProCheckout = vi.fn(async () => ({
+      id: "11111111-1111-4111-8111-111111111111",
+      url: "https://polar.sh/checkout/test",
+      expiresAt: new Date("2026-09-04T00:00:00Z"),
+    }));
+    const polar = {
+      billingConfigured: () => true,
+      ensureCustomer: async (input) => ({
+        id: "22222222-2222-4222-8222-222222222222",
+        clerkOrganizationId: input.clerkOrganizationId,
+        type: "team" as const,
+      }),
+      createProCheckout,
+      createCustomerPortalSession: async () => ({
+        id: "33333333-3333-4333-8333-333333333333",
+        url: "https://polar.sh/portal/test",
+        expiresAt: new Date("2026-09-04T00:00:00Z"),
+      }),
+      getCustomerState: async (clerkOrganizationId: string) => ({
+        customer: {
+          id: "22222222-2222-4222-8222-222222222222",
+          clerkOrganizationId,
+          type: "team" as const,
+        },
+        proSubscription: active
+          ? {
+              id: "44444444-4444-4444-8444-444444444444",
+              status: "active" as const,
+              currentPeriodStart: new Date("2026-09-01T00:00:00Z"),
+              currentPeriodEnd: new Date("2026-10-01T00:00:00Z"),
+              cancelAtPeriodEnd: false,
+            }
+          : null,
+      }),
+      getMeterQuantities: async () => ({ quantities: [], total: 0 }),
+      verifySubscriptionWebhook: async () => null,
+      verifyBillingWebhook: async () => null,
+    } satisfies PolarBoundary;
+    const billingApp = createApp(
+      () => makeDatabaseLayer(database),
+      billingIdentity,
+      undefined,
+      polar,
+    );
+    const provisioned = await billingApp.request("/v1/workspace", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_session" },
+    });
+    expect(provisioned.status).toBe(200);
+    billingIdentity.sessions.set("billing_session", {
+      memberId: "billing_member",
+      organizationId: "personal_billing_member",
+    });
+
+    const duplicate = await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_session" },
+    });
+    expect(duplicate.status).toBe(409);
+    await expect(duplicate.json()).resolves.toMatchObject({
+      error: { code: "subscription_already_active" },
+    });
+    expect(createProCheckout).not.toHaveBeenCalled();
+
+    active = false;
+    const checkout = await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_session" },
+    });
+    expect(checkout.status).toBe(201);
+    expect(createProCheckout).toHaveBeenCalledOnce();
+  });
+
   it("returns a structured unauthorized response", async () => {
     const response = await app.request(
       "/v1/organizations/organization_a/workspace",
@@ -471,7 +554,7 @@ describe("Humans API", () => {
       profile: { searchable: false, searchabilityReason: "member_opt_out" },
     });
 
-    const unsafeReenable = await app.request("/v1/profile/searchability", {
+    const reenable = await app.request("/v1/profile/searchability", {
       method: "PATCH",
       headers: {
         authorization: "Bearer profile_session",
@@ -479,7 +562,10 @@ describe("Humans API", () => {
       },
       body: JSON.stringify({ searchable: true }),
     });
-    expect(unsafeReenable.status).toBe(422);
+    expect(reenable.status).toBe(200);
+    await expect(reenable.json()).resolves.toMatchObject({
+      profile: { searchable: true, searchabilityReason: "member_opt_in" },
+    });
 
     const ownerRead = await app.request("/v1/profile", {
       headers: { authorization: "Bearer profile_session" },
@@ -566,10 +652,626 @@ describe("Humans API", () => {
       }),
     ).resolves.toMatchObject({ error: { code: "adult_required" } });
     await expect(
-      rejected({ ...githubVerification(), accountId: "different-account" }),
+      rejected({ ...githubVerification(), accountId: "54321" }),
     ).resolves.toMatchObject({
       error: { code: "github_identity_change_requires_review" },
     });
+  });
+
+  it("discovers, verifies, reviews, and collision-proofs Profile claims", async () => {
+    await database
+      .insert(schema.members)
+      .values([
+        { clerkId: "claim_auto_member" },
+        { clerkId: "claim_collision_member" },
+        { clerkId: "claim_review_member" },
+      ])
+      .onConflictDoNothing();
+    const [automaticProfile, reviewProfile] = await database
+      .insert(schema.profiles)
+      .values([
+        {
+          name: "Automatic Claim Profile",
+          currentCompany: "Before",
+          githubAccountId: "82001",
+          githubLogin: "old-automatic-login",
+          eligibilityBasis: "owned_repository",
+          adultAttested: true,
+          searchable: true,
+          searchabilityReason: "approved_import",
+        },
+        {
+          name: "Reviewed Claim Profile",
+          githubAccountId: "82002",
+          githubLogin: "reviewed-login",
+          eligibilityBasis: "owned_repository",
+          adultAttested: true,
+          searchable: true,
+          searchabilityReason: "approved_import",
+        },
+      ])
+      .returning();
+    if (!automaticProfile || !reviewProfile)
+      throw new Error("Claim fixtures were not created");
+    await database.insert(schema.professionalLinks).values({
+      profileId: automaticProfile.profileId,
+      url: "https://github.com/old-automatic-login",
+    });
+
+    identity.sessions.set("claim_auto_session", {
+      memberId: "claim_auto_member",
+      organizationId: null,
+    });
+    identity.sessions.set("claim_collision_session", {
+      memberId: "claim_collision_member",
+      organizationId: null,
+    });
+    identity.sessions.set("claim_review_session", {
+      memberId: "claim_review_member",
+      organizationId: null,
+    });
+    identity.github.set("claim_auto_member", {
+      ...githubVerification(),
+      accountId: "82001",
+      login: "renamed-automatic-login",
+    });
+    identity.github.set("claim_collision_member", {
+      ...githubVerification(),
+      accountId: "82001",
+      login: "renamed-automatic-login",
+    });
+    identity.github.set("claim_review_member", {
+      ...githubVerification(),
+      accountId: "82999",
+      login: "different-reviewed-login",
+    });
+
+    const candidates = await app.request("/v1/profile/claim-candidates", {
+      headers: { authorization: "Bearer claim_auto_session" },
+    });
+    expect(candidates.status).toBe(200);
+    await expect(candidates.json()).resolves.toEqual({
+      candidates: [
+        {
+          profileId: automaticProfile.profileId,
+          name: "Automatic Claim Profile",
+          githubLogin: "old-automatic-login",
+        },
+      ],
+      claim: null,
+    });
+    expect(
+      (
+        await database
+          .select({ memberId: schema.profiles.memberId })
+          .from(schema.profiles)
+          .where(eq(schema.profiles.profileId, automaticProfile.profileId))
+      )[0]?.memberId,
+    ).toBeNull();
+
+    const duplicate = await putProfile(app, "claim_auto_session", {
+      ...validProfile,
+      name: "Do Not Duplicate",
+      professionalLinks: ["https://github.com/renamed-automatic-login"],
+    });
+    expect(duplicate.status).toBe(422);
+    await expect(duplicate.json()).resolves.toMatchObject({
+      error: { code: "imported_profile_claim_required" },
+    });
+
+    const spoofed = await app.request("/v1/profile/claims", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer claim_auto_session",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        profileReference: automaticProfile.profileId,
+        oauthGithubAccountId: "spoofed",
+      }),
+    });
+    expect(spoofed.status).toBe(422);
+
+    const verified = await postProfileClaim(
+      app,
+      "claim_auto_session",
+      automaticProfile.profileId,
+    );
+    expect(verified.status).toBe(200);
+    await expect(verified.json()).resolves.toEqual({
+      claim: { status: "verified" },
+    });
+    await expect(
+      database
+        .select()
+        .from(schema.profiles)
+        .where(eq(schema.profiles.profileId, automaticProfile.profileId)),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        memberId: "claim_auto_member",
+        githubLogin: "renamed-automatic-login",
+        searchable: false,
+        searchabilityReason: "member_opt_out",
+      }),
+    ]);
+
+    const collision = await postProfileClaim(
+      app,
+      "claim_collision_session",
+      automaticProfile.profileId,
+    );
+    expect(collision.status).toBe(409);
+    await expect(collision.json()).resolves.toEqual({
+      error: {
+        code: "profile_claim_unavailable",
+        message: "The Profile claim could not be completed",
+      },
+    });
+
+    const pending = await postProfileClaim(
+      app,
+      "claim_review_session",
+      reviewProfile.profileId,
+    );
+    expect(pending.status).toBe(202);
+    await expect(pending.json()).resolves.toEqual({
+      claim: { status: "pending_review" },
+    });
+    await expect(
+      database
+        .select()
+        .from(schema.profileClaims)
+        .where(eq(schema.profileClaims.memberId, "claim_review_member")),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        profileId: reviewProfile.profileId,
+        githubAccountId: "82999",
+        status: "pending_review",
+      }),
+    ]);
+    expect(
+      (
+        await database
+          .select({ memberId: schema.profiles.memberId })
+          .from(schema.profiles)
+          .where(eq(schema.profiles.profileId, reviewProfile.profileId))
+      )[0]?.memberId,
+    ).toBeNull();
+    await database
+      .update(schema.profileClaims)
+      .set({ status: "rejected", reviewedAt: new Date() })
+      .where(eq(schema.profileClaims.memberId, "claim_review_member"));
+  });
+
+  it("edits a controlled Profile, removes Member Statements, verifies canonical links, and opts back in", async () => {
+    const [controlledProfile] = await database
+      .select({ profileId: schema.profiles.profileId })
+      .from(schema.profiles)
+      .where(eq(schema.profiles.githubAccountId, "82001"));
+    expect(controlledProfile).toBeDefined();
+    if (!controlledProfile)
+      throw new Error("Controlled Profile fixture was not found");
+
+    const ordinary = await app.request("/v1/profile/details", {
+      method: "PATCH",
+      headers: {
+        authorization: "Bearer claim_auto_session",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        name: "Controlled Profile",
+        currentCompany: "Humans",
+        professionalLinks: ["https://github.com/old-automatic-login"],
+        statements: { role: "Staff engineer", skills: ["TypeScript"] },
+      }),
+    });
+    expect(ordinary.status).toBe(200);
+    await expect(ordinary.json()).resolves.toMatchObject({
+      profile: {
+        name: "Controlled Profile",
+        currentCompany: "Humans",
+        statements: { role: "Staff engineer", skills: ["TypeScript"] },
+      },
+    });
+
+    const verifiedCanonical = await app.request("/v1/profile/details", {
+      method: "PATCH",
+      headers: {
+        authorization: "Bearer claim_auto_session",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        name: "Controlled Profile",
+        currentCompany: "Humans",
+        professionalLinks: ["https://github.com/renamed-automatic-login"],
+        statements: { role: null },
+      }),
+    });
+    expect(verifiedCanonical.status).toBe(200);
+    await expect(
+      database
+        .select()
+        .from(schema.memberStatements)
+        .where(
+          and(
+            eq(schema.memberStatements.profileId, controlledProfile.profileId),
+            eq(schema.memberStatements.field, "role"),
+          ),
+        ),
+    ).resolves.toHaveLength(0);
+
+    identity.linkedIn.set("claim_auto_member", {
+      providerUserId: "linkedin-82001",
+      username: "verified-linkedin",
+    });
+    const verifiedLinkedIn = await app.request("/v1/profile/details", {
+      method: "PATCH",
+      headers: {
+        authorization: "Bearer claim_auto_session",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        name: "Controlled Profile",
+        currentCompany: "Humans",
+        professionalLinks: [
+          "https://github.com/renamed-automatic-login",
+          "https://www.linkedin.com/in/verified-linkedin",
+        ],
+        statements: {},
+      }),
+    });
+    expect(verifiedLinkedIn.status).toBe(200);
+
+    const mismatchedLinkedIn = await app.request("/v1/profile/details", {
+      method: "PATCH",
+      headers: {
+        authorization: "Bearer claim_auto_session",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        name: "Controlled Profile",
+        currentCompany: "Humans",
+        professionalLinks: [
+          "https://github.com/renamed-automatic-login",
+          "https://www.linkedin.com/in/not-the-member",
+        ],
+        statements: {},
+      }),
+    });
+    expect(mismatchedLinkedIn.status).toBe(422);
+    await expect(mismatchedLinkedIn.json()).resolves.toMatchObject({
+      error: { code: "canonical_identity_mismatch" },
+    });
+
+    const mismatchedCanonical = await app.request("/v1/profile/details", {
+      method: "PATCH",
+      headers: {
+        authorization: "Bearer claim_auto_session",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        name: "Controlled Profile",
+        currentCompany: "Humans",
+        professionalLinks: [
+          "https://github.com/not-the-member",
+          "https://www.linkedin.com/in/verified-linkedin",
+        ],
+        statements: {},
+      }),
+    });
+    expect(mismatchedCanonical.status).toBe(422);
+    await expect(mismatchedCanonical.json()).resolves.toMatchObject({
+      error: { code: "canonical_identity_mismatch" },
+    });
+
+    const putBypass = await putProfile(app, "claim_auto_session", {
+      ...validProfile,
+      name: "Attempted canonical bypass",
+      professionalLinks: [
+        "https://github.com/renamed-automatic-login",
+        "https://www.linkedin.com/in/not-the-member",
+      ],
+    });
+    expect(putBypass.status).toBe(422);
+    await expect(putBypass.json()).resolves.toMatchObject({
+      error: { code: "canonical_identity_mismatch" },
+    });
+
+    for (const searchable of [true, false, true]) {
+      const response = await app.request("/v1/profile/searchability", {
+        method: "PATCH",
+        headers: {
+          authorization: "Bearer claim_auto_session",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ searchable }),
+      });
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        profile: {
+          searchable,
+          searchabilityReason: searchable ? "member_opt_in" : "member_opt_out",
+        },
+      });
+    }
+  });
+
+  it("accepts non-enumerating public correction/removal requests and keeps confirmed removals suppressed", async () => {
+    const [correctionProfile, removalProfile] = await database
+      .insert(schema.profiles)
+      .values([
+        {
+          name: "Public Correction Unique",
+          currentCompany: "Wrong Company",
+          githubAccountId: "83001",
+          githubLogin: "public-correction",
+          eligibilityBasis: "owned_repository",
+          adultAttested: true,
+          searchable: true,
+          searchabilityReason: "approved_import",
+        },
+        {
+          name: "Public Removal Unique",
+          githubAccountId: "83002",
+          githubLogin: "public-removal",
+          eligibilityBasis: "owned_repository",
+          adultAttested: true,
+          searchable: true,
+          searchabilityReason: "approved_import",
+        },
+      ])
+      .returning();
+    if (!correctionProfile || !removalProfile)
+      throw new Error("Public Profile request fixtures were not created");
+    expect(
+      (await searchProfiles(database, { query: "Public Correction Unique" }))
+        .results,
+    ).toHaveLength(1);
+
+    const correction = await postPublicProfileRequest(
+      app,
+      correctionProfile.profileId,
+      "correction",
+      "198.51.100.10",
+    );
+    const missing = await postPublicProfileRequest(
+      app,
+      crypto.randomUUID(),
+      "correction",
+      "198.51.100.10",
+    );
+    const duplicate = await postPublicProfileRequest(
+      app,
+      correctionProfile.profileId,
+      "correction",
+      "198.51.100.12",
+    );
+    expect(correction.status).toBe(202);
+    expect(correction.headers.get("cache-control")).toBe("no-store");
+    expect(correction.headers.get("x-robots-tag")).toBe("noindex, nofollow");
+    expect(missing.status).toBe(202);
+    expect(duplicate.status).toBe(202);
+    const publicRateLimitKeys: string[] = [];
+    const publicRateLimit = await postPublicProfileRequest(
+      app,
+      crypto.randomUUID(),
+      "correction",
+      "198.51.100.44",
+      {
+        PUBLIC_PROFILE_REQUEST_RATE_LIMITER: {
+          limit: async ({ key }) => {
+            publicRateLimitKeys.push(key);
+            return { success: false };
+          },
+        },
+      } as Bindings,
+    );
+    expect(publicRateLimit.status).toBe(429);
+    expect(publicRateLimit.headers.get("ratelimit-limit")).toBe("5");
+    expect(publicRateLimitKeys).toEqual([
+      "public-profile-request:198.51.100.44",
+    ]);
+    const correctionResponse = await correction.json();
+    const missingResponse = await missing.json();
+    expect(correctionResponse).toEqual(missingResponse);
+    expect(JSON.stringify(correctionResponse)).not.toContain(
+      "requester@example.com",
+    );
+    expect(
+      (await searchProfiles(database, { query: "Public Correction Unique" }))
+        .results,
+    ).toHaveLength(1);
+    await expect(
+      database
+        .select()
+        .from(schema.profiles)
+        .where(eq(schema.profiles.profileId, correctionProfile.profileId)),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        searchable: true,
+        searchabilityReason: "approved_import",
+      }),
+    ]);
+
+    await database
+      .insert(schema.members)
+      .values({ clerkId: "profile_request_operator" })
+      .onConflictDoNothing();
+    identity.sessions.set("profile_request_operator_session", {
+      memberId: "profile_request_operator",
+      organizationId: null,
+      systemRole: "operator",
+    });
+    const correctionRequests = await database
+      .select()
+      .from(schema.profileRequests)
+      .where(eq(schema.profileRequests.profileId, correctionProfile.profileId));
+    expect(correctionRequests).toHaveLength(1);
+    const [correctionRequest] = correctionRequests;
+    if (!correctionRequest)
+      throw new Error("Correction request fixture was not created");
+    expect(correctionRequest.status).toBe("awaiting_verification");
+    const verifiedCorrection = await app.request(
+      `/v1/operator/profile-requests/${correctionRequest.id}/verify`,
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer profile_request_operator_session",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          reason: "Requester email ownership confirmed",
+          verificationMethod: "verified-email-reply",
+          evidenceReference: "support-case:correction-1",
+        }),
+      },
+    );
+    expect(verifiedCorrection.status).toBe(200);
+    expect(
+      (await searchProfiles(database, { query: "Public Correction Unique" }))
+        .results,
+    ).toHaveLength(0);
+    const reviewedCorrection = await app.request(
+      `/v1/operator/profile-requests/${correctionRequest.id}/review`,
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer profile_request_operator_session",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          approved: true,
+          reason: "Requester evidence confirmed",
+          correction: {
+            currentCompany: "Correct Company",
+            headline: "Corrected public headline",
+            currentResidence: "Bogota, Colombia",
+            roles: ["Platform Engineer"],
+            skills: ["Rust"],
+            seniority: "senior",
+            experienceYears: 8,
+            opportunityStatus: "open",
+            professionalLinks: ["https://github.com/public-correction"],
+          },
+        }),
+      },
+    );
+    expect(reviewedCorrection.status).toBe(200);
+    await expect(
+      database
+        .select()
+        .from(schema.profiles)
+        .where(eq(schema.profiles.profileId, correctionProfile.profileId)),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        currentCompany: "Correct Company",
+        searchable: true,
+        searchabilityReason: "approved_import",
+      }),
+    ]);
+    expect(
+      (await searchProfiles(database, { skills: ["Rust"] })).results,
+    ).toContainEqual(
+      expect.objectContaining({
+        profileId: correctionProfile.profileId,
+        headline: "Corrected public headline",
+        currentResidence: "Bogota, Colombia",
+        primaryRole: "Platform Engineer",
+        seniority: "senior",
+        experienceYears: 8,
+        opportunityStatus: "open",
+      }),
+    );
+
+    const removal = await postPublicProfileRequest(
+      app,
+      removalProfile.profileId,
+      "removal",
+      "198.51.100.11",
+    );
+    expect(removal.status).toBe(202);
+    const [removalRequest] = await database
+      .select()
+      .from(schema.profileRequests)
+      .where(eq(schema.profileRequests.profileId, removalProfile.profileId));
+    if (!removalRequest)
+      throw new Error("Removal request fixture was not created");
+    const verifiedRemoval = await app.request(
+      `/v1/operator/profile-requests/${removalRequest.id}/verify`,
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer profile_request_operator_session",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          reason: "Requester identity confirmed",
+          verificationMethod: "signed-github-proof",
+          evidenceReference: "support-case:removal-1",
+        }),
+      },
+    );
+    expect(verifiedRemoval.status).toBe(200);
+    const reviewedRemoval = await app.request(
+      `/v1/operator/profile-requests/${removalRequest.id}/review`,
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer profile_request_operator_session",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          approved: true,
+          reason: "Requester identity confirmed",
+        }),
+      },
+    );
+    expect(reviewedRemoval.status).toBe(200);
+
+    const csv = `contract_version,source,source_record_id,name,current_company,github_account_id,github_login,qualifying_evidence,adult_confirmed,professional_links\nhumans-profiles-v1,api-reimport,83002,Recreated Profile,,83002,public-removal,owned_repository,true,https://github.com/public-removal`;
+    const report = await importProfiles(database, csv, {
+      dryRun: false,
+      runId: "issue12_public_reimport",
+    });
+    expect(report.appliedChanges.createProfiles).toBe(0);
+    await expect(
+      database
+        .select()
+        .from(schema.suppressionRecords)
+        .where(eq(schema.suppressionRecords.canonicalProviderId, "83002")),
+    ).resolves.toHaveLength(1);
+    expect(
+      (await searchProfiles(database, { query: "Recreated Profile" })).results,
+    ).toHaveLength(0);
+    await database
+      .delete(schema.importRuns)
+      .where(eq(schema.importRuns.id, "issue12_public_reimport"));
+  });
+
+  it("limits public Profile requests by IP and rejects oversized bodies", async () => {
+    for (let request = 0; request < 6; request += 1) {
+      const response = await postPublicProfileRequest(
+        app,
+        crypto.randomUUID(),
+        "correction",
+        "198.51.100.99",
+      );
+      expect(response.status).toBe(request < 5 ? 202 : 429);
+    }
+    const oversized = await app.request("/v1/public/profile-requests", {
+      method: "POST",
+      headers: {
+        "CF-Connecting-IP": "198.51.100.100",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        profileReference: crypto.randomUUID(),
+        kind: "correction",
+        requesterEmail: "requester@example.com",
+        details: "x".repeat(5_000),
+      }),
+    });
+    expect(oversized.status).toBe(413);
   });
 
   it("verifies and translates signed Clerk webhooks", async () => {
@@ -654,7 +1356,7 @@ describe("Humans API", () => {
       profileId: "reveal_profile",
       memberId: "reveal_owner",
       name: "Reveal Profile",
-      githubAccountId: "reveal_github",
+      githubAccountId: "88001",
       githubLogin: "reveal-profile",
       eligibilityBasis: "owned_repository",
       adultAttested: true,
@@ -752,7 +1454,7 @@ describe("Humans API", () => {
       profileId: "external_profile",
       memberId: "external_owner",
       name: "External Profile",
-      githubAccountId: "external_github",
+      githubAccountId: "88002",
       githubLogin: "external-profile",
       eligibilityBasis: "owned_repository",
       adultAttested: true,
@@ -882,6 +1584,26 @@ describe("Humans API", () => {
     identity.sessions.set("external_session", {
       memberId: "external_member",
       organizationId: "external_organization",
+    });
+    const createdList = await app.request("/v1/saved-lists", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer external_session",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ name: "Protected list" }),
+    });
+    expect(createdList.status).toBe(201);
+    expect(createdList.headers.get("cache-control")).toBe("private, no-store");
+    expect(createdList.headers.get("x-robots-tag")).toBe("noindex, nofollow");
+    const listedLists = await app.request("/v1/saved-lists", {
+      headers: { authorization: "Bearer external_session" },
+    });
+    expect(listedLists.status).toBe(200);
+    expect(listedLists.headers.get("cache-control")).toBe("private, no-store");
+    expect(listedLists.headers.get("x-robots-tag")).toBe("noindex, nofollow");
+    await expect(listedLists.json()).resolves.toMatchObject({
+      lists: [expect.objectContaining({ name: "Protected list" })],
     });
     const broadWebSearch = await app.request("/v1/profiles/search", {
       headers: { authorization: "Bearer external_session" },
@@ -1253,7 +1975,7 @@ describe("Humans API", () => {
 
     await database.insert(schema.suppressionRecords).values({
       canonicalProvider: "github",
-      canonicalProviderId: "external_github",
+      canonicalProviderId: "88002",
       reason: "removal_request",
     });
     const suppressed = await app.request("/v1/profiles/external_profile", {
@@ -1262,11 +1984,24 @@ describe("Humans API", () => {
     expect(suppressed.status).toBe(404);
 
     const operatorApp = createApp(() => makeDatabaseLayer(database), identity);
+    await database
+      .insert(schema.members)
+      .values({ clerkId: "system_operator" })
+      .onConflictDoNothing();
     identity.sessions.set("operator_session", {
       memberId: "system_operator",
       organizationId: null,
       systemRole: "operator",
     });
+    const [failedUsage] = await database
+      .select({ id: schema.creditUsageOutbox.id })
+      .from(schema.creditUsageOutbox)
+      .limit(1);
+    if (!failedUsage) throw new Error("Expected finalized Credit usage");
+    await database
+      .update(schema.creditUsageOutbox)
+      .set({ state: "failed", attempts: 8, lastErrorCode: "invalid_request" })
+      .where(eq(schema.creditUsageOutbox.id, failedUsage.id));
     const suspended = await operatorApp.request("/v1/operator/suspensions", {
       method: "POST",
       headers: {
@@ -1292,6 +2027,9 @@ describe("Humans API", () => {
     await expect(operatorOverview.json()).resolves.toMatchObject({
       imports: [],
       claims: [],
+      creditUsageDeadLetters: [
+        expect.objectContaining({ id: failedUsage.id, attempts: 8 }),
+      ],
       abuse: {
         suspensions: [
           expect.objectContaining({ principalId: "external_organization" }),
@@ -1318,6 +2056,49 @@ describe("Humans API", () => {
       },
     );
     expect(adminMutation.status).toBe(401);
+    const adminRedrive = await operatorApp.request(
+      "/v1/operator/credit-usage/redrive",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer organization_admin_session",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          ids: [failedUsage.id],
+          reason: "not authorized",
+        }),
+      },
+    );
+    expect(adminRedrive.status).toBe(401);
+    const redrive = await operatorApp.request(
+      "/v1/operator/credit-usage/redrive",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer operator_session",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          ids: [failedUsage.id],
+          reason: "Provider mapping repaired",
+        }),
+      },
+    );
+    expect(redrive.status).toBe(200);
+    await expect(redrive.json()).resolves.toEqual({ redriven: 1 });
+    await expect(
+      database
+        .select({ state: schema.creditUsageOutbox.state })
+        .from(schema.creditUsageOutbox)
+        .where(eq(schema.creditUsageOutbox.id, failedUsage.id)),
+    ).resolves.toEqual([{ state: "pending" }]);
+    await expect(
+      database
+        .select({ action: schema.operatorAuditEvents.action })
+        .from(schema.operatorAuditEvents)
+        .where(eq(schema.operatorAuditEvents.subjectId, failedUsage.id)),
+    ).resolves.toEqual([{ action: "credit_usage.redrive" }]);
     const deniedAfterSuspension = await operatorApp.request(
       "/v1/search/facets",
       { headers: { authorization: "Bearer read_key" } },
@@ -1335,6 +2116,75 @@ describe("Humans API", () => {
       },
     );
     expect(deniedInterpretation.status).toBe(403);
+  });
+
+  it("denies suspended Operators while active Operators retain access", async () => {
+    await database.insert(schema.members).values([
+      { clerkId: "active_system_operator" },
+      { clerkId: "suspended_system_operator" },
+    ]);
+    await database.insert(schema.principalSuspensions).values({
+      principalType: "member",
+      principalId: "suspended_system_operator",
+      reason: "privacy audit regression fixture",
+    });
+    identity.sessions.set("active_operator_session", {
+      memberId: "active_system_operator",
+      organizationId: null,
+      systemRole: "operator",
+    });
+    identity.sessions.set("suspended_operator_session", {
+      memberId: "suspended_system_operator",
+      organizationId: null,
+      systemRole: "operator",
+    });
+
+    const activeOverview = await app.request("/v1/operator/overview", {
+      headers: { authorization: "Bearer active_operator_session" },
+    });
+    expect(activeOverview.status).toBe(200);
+    const activeMutation = await app.request("/v1/operator/suspensions", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer active_operator_session",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        principalType: "api_key",
+        principalId: "active_operator_mutation_target",
+        reason: "active Operator authorization check",
+      }),
+    });
+    expect(activeMutation.status).toBe(201);
+
+    const suspendedOverview = await app.request("/v1/operator/overview", {
+      headers: { authorization: "Bearer suspended_operator_session" },
+    });
+    expect(suspendedOverview.status).toBe(401);
+    const suspendedMutation = await app.request("/v1/operator/suspensions", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer suspended_operator_session",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        principalType: "api_key",
+        principalId: "suspended_operator_mutation_target",
+        reason: "must not be written",
+      }),
+    });
+    expect(suspendedMutation.status).toBe(401);
+    await expect(
+      database
+        .select()
+        .from(schema.principalSuspensions)
+        .where(
+          eq(
+            schema.principalSuspensions.principalId,
+            "suspended_operator_mutation_target",
+          ),
+        ),
+    ).resolves.toHaveLength(0);
   });
 });
 
@@ -1389,6 +2239,10 @@ const invitedProjection: ProvisionedWorkspace = {
 
 class FakeIdentity implements IdentityBoundary {
   readonly github = new Map<string, GitHubVerification>();
+  readonly linkedIn = new Map<
+    string,
+    { providerUserId: string; username: string }
+  >();
   readonly sessions = new Map<string, SessionIdentity>();
   readonly apiKeySessions = new Map<string, ApiKeyIdentity>();
   readonly apiKeys = new Map<
@@ -1494,6 +2348,10 @@ class FakeIdentity implements IdentityBoundary {
     if (verification === undefined) throw new Error("GitHub is not connected");
     return verification;
   }
+
+  async verifyLinkedIn(memberId: string) {
+    return this.linkedIn.get(memberId) ?? null;
+  }
 }
 
 const validProfile = {
@@ -1533,3 +2391,42 @@ const putProfile = (
     },
     body: JSON.stringify(profile),
   });
+
+const postProfileClaim = (
+  app: ReturnType<typeof createApp>,
+  session: string,
+  profileReference: string,
+) =>
+  app.request("/v1/profile/claims", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${session}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ profileReference }),
+  });
+
+const postPublicProfileRequest = (
+  app: ReturnType<typeof createApp>,
+  profileReference: string,
+  kind: "correction" | "removal",
+  ip: string,
+  bindings?: Bindings,
+) =>
+  app.request(
+    "/v1/public/profile-requests",
+    {
+      method: "POST",
+      headers: {
+        "CF-Connecting-IP": ip,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        profileReference,
+        kind,
+        requesterEmail: "requester@example.com",
+        details: "Please review this Profile request.",
+      }),
+    },
+    bindings,
+  );

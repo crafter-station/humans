@@ -1,8 +1,10 @@
 import {
+  GitHubCheckpointError,
   GitHubProviderError,
   INACCESSIBLE_GRACE_PERIOD_DAYS,
   PIPELINE_VERSION,
   PROVIDER_SNAPSHOT_RETENTION_DAYS,
+  OpenAIProviderError,
   PermanentEnrichmentError,
   type Collected,
   type EnrichmentRun,
@@ -19,11 +21,29 @@ import {
 } from "./types.js";
 
 export const classifyGitHubError = (error: unknown) => {
-  if (!(error instanceof GitHubProviderError)) return "fatal" as const;
-  if ((error.status === 403 || error.status === 429) && error.retryAfter)
+  if (
+    !(error instanceof GitHubProviderError) &&
+    !(error instanceof OpenAIProviderError)
+  )
+    return "fatal" as const;
+  if (
+    (error.status === 429 ||
+      (error instanceof GitHubProviderError && error.status === 403)) &&
+    error.retryAfter
+  )
     return "rate-limit" as const;
-  if (error.status === 429 || error.status >= 500) return "retry" as const;
-  if (error.status === 404 || error.status === 410)
+  if (
+    error.status === 0 ||
+    error.status === 408 ||
+    error.status === 409 ||
+    error.status === 429 ||
+    error.status >= 500
+  )
+    return "retry" as const;
+  if (
+    error instanceof GitHubProviderError &&
+    (error.status === 404 || error.status === 410)
+  )
     return "inaccessible" as const;
   return "fatal" as const;
 };
@@ -101,6 +121,24 @@ const complete = (run: EnrichmentRun, stage: Stage): EnrichmentRun => ({
   currentStage: null,
 });
 
+const saveProviderCheckpoint = async <T>(
+  store: EnrichmentStore,
+  runId: string,
+  stage: Stage,
+  value: T,
+  options?: { expiresAt?: string },
+) => {
+  try {
+    await store.saveCheckpoint(runId, stage, value, options);
+  } catch {
+    try {
+      await store.saveCheckpoint(runId, stage, value, options);
+    } catch {
+      throw new GitHubCheckpointError();
+    }
+  }
+};
+
 export type GitHubEnrichmentDependencies = {
   provider: GitHubProvider;
   normalizer: EvidenceNormalizer;
@@ -166,7 +204,11 @@ export const createGitHubEnrichmentStages = (
   ) => {
     const classification = classifyGitHubError(error);
     const failedAt = now().toISOString();
-    if (error instanceof GitHubProviderError) {
+    if (
+      error instanceof GitHubProviderError ||
+      error instanceof OpenAIProviderError ||
+      error instanceof GitHubCheckpointError
+    ) {
       await dependencies.store.markGitHubObservationsStale(
         input.profileId,
         failedAt,
@@ -220,7 +262,8 @@ export const createGitHubEnrichmentStages = (
       }
       await dependencies.store.clearGitHubInaccessible(input.profileId);
       if (fetched)
-        await dependencies.store.saveCheckpoint(
+        await saveProviderCheckpoint(
+          dependencies.store,
           run.id,
           "account",
           accountEvidence,
@@ -298,7 +341,8 @@ export const createGitHubEnrichmentStages = (
           },
           collectedAt: now().toISOString(),
         };
-        await dependencies.store.saveCheckpoint(
+        await saveProviderCheckpoint(
+          dependencies.store,
           run.id,
           "repositories",
           repositoryEvidence,
@@ -349,7 +393,8 @@ export const createGitHubEnrichmentStages = (
             "AI normalization cited unsupported repository evidence",
           );
         normalized = { value, collectedAt: now().toISOString() };
-        await dependencies.store.saveCheckpoint(
+        await saveProviderCheckpoint(
+          dependencies.store,
           run.id,
           "normalization",
           normalized,
@@ -419,8 +464,12 @@ export const createGitHubEnrichmentStages = (
     error: unknown,
   ) => {
     const run = await dependencies.store.getRun(input.runId);
-    if (!run || run.status !== "running") return;
+    if (run?.status !== "running") return;
     const finishedAt = now().toISOString();
+    await dependencies.store.markGitHubObservationsStale(
+      input.profileId,
+      finishedAt,
+    );
     await dependencies.store.saveRun({
       ...run,
       status: "failed",

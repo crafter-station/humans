@@ -1,8 +1,29 @@
 "use client";
 
-import { useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
 import { useAuth } from "@clerk/nextjs";
+import { Badge } from "@repo/ui/components/badge";
+import { Button } from "@repo/ui/components/button";
+import { Card } from "@repo/ui/components/card";
+import { Input } from "@repo/ui/components/input";
+import { NativeSelect } from "@repo/ui/components/native-select";
+import {
+  Sheet,
+  SheetClose,
+  SheetContent,
+  SheetDescription,
+  SheetTitle,
+} from "@repo/ui/components/sheet";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@repo/ui/components/table";
+import { Textarea } from "@repo/ui/components/textarea";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 
 type SearchResult = {
   profileId: string;
@@ -39,6 +60,7 @@ type SavedList = {
   name: string;
   entries: Array<{ profileId: string; profileName: string; note: string }>;
 };
+type SavedListState = "error" | "loading" | "ready";
 
 export function ProfileSearch({
   onCreateProfile,
@@ -54,6 +76,9 @@ export function ProfileSearch({
   const [message, setMessage] = useState("Add a filter to search Profiles.");
   const searchRequestIds = useRef(new Map<string, string>());
   const [lists, setLists] = useState<SavedList[]>([]);
+  const [listState, setListState] = useState<SavedListState>("loading");
+  const [activeListId, setActiveListId] = useState<string | null>(null);
+  const [listMessage, setListMessage] = useState<string | null>(null);
   const [interpretationError, setInterpretationError] = useState<string | null>(
     null,
   );
@@ -64,15 +89,59 @@ export function ProfileSearch({
   searchRequestParameters.delete("view");
   const requestKey = searchRequestParameters.toString();
   const selectedProfileId = searchParams.get("profile");
-  const refreshLists = () =>
-    fetch("/api/saved-lists", { cache: "no-store" })
-      .then((response) => response.json())
-      .then((data: { lists: SavedList[] }) => setLists(data.lists));
+  const activeList =
+    lists.find(({ id }) => id === activeListId) ?? lists[0] ?? null;
+  const refreshLists = async (
+    preferredListId?: string,
+    signal?: AbortSignal,
+  ) => {
+    try {
+      const response = await fetch("/api/saved-lists", {
+        cache: "no-store",
+        signal,
+      });
+      const data = (await response.json()) as {
+        lists?: SavedList[];
+        error?: { message?: string };
+      };
+      if (!response.ok || !Array.isArray(data.lists)) {
+        throw new Error(data.error?.message ?? "Saved Lists are unavailable");
+      }
+      setLists(data.lists);
+      setListState("ready");
+      setActiveListId((current) => {
+        if (
+          preferredListId !== undefined &&
+          data.lists?.some(({ id }) => id === preferredListId)
+        ) {
+          return preferredListId;
+        }
+        if (data.lists?.some(({ id }) => id === current)) return current;
+        return data.lists?.[0]?.id ?? null;
+      });
+      return data.lists;
+    } catch (error) {
+      if (!signal?.aborted) setListState("error");
+      throw error;
+    }
+  };
+  const loadLists = useEffectEvent((signal: AbortSignal) => {
+    void refreshLists(undefined, signal).catch((error: unknown) => {
+      if (!signal.aborted) {
+        setListState("error");
+        setListMessage(
+          error instanceof Error
+            ? error.message
+            : "Saved Lists are unavailable",
+        );
+      }
+    });
+  });
 
   useEffect(() => {
-    void fetch("/api/saved-lists", { cache: "no-store" })
-      .then((response) => response.json())
-      .then((data: { lists: SavedList[] }) => setLists(data.lists));
+    const controller = new AbortController();
+    loadLists(controller.signal);
+    return () => controller.abort();
   }, []);
 
   useEffect(() => {
@@ -90,27 +159,146 @@ export function ProfileSearch({
     return () => controller.abort();
   }, [orgRole]);
 
-  const createList = async () => {
+  const createList = async (profileId?: string) => {
     const name = window.prompt("Name this shared Saved List");
-    if (!name?.trim()) return;
-    await fetch("/api/saved-lists", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name }),
-    });
-    await refreshLists();
+    if (!name?.trim()) return null;
+    setListMessage(null);
+    let createdListId: string | undefined;
+    try {
+      const response = await fetch("/api/saved-lists", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      const result = (await response.json()) as {
+        list?: { id: string };
+        error?: { message?: string };
+      };
+      if (!response.ok || !result.list) {
+        throw new Error(
+          result.error?.message ?? "The Saved List was not created",
+        );
+      }
+      createdListId = result.list.id;
+      if (profileId !== undefined) {
+        await successfulResponse(
+          fetch(
+            `/api/saved-lists/${encodeURIComponent(result.list.id)}/entries/${encodeURIComponent(profileId)}`,
+            { method: "PUT" },
+          ),
+          "The Profile was not saved",
+        );
+      }
+      await refreshLists(result.list.id);
+      setListMessage(
+        profileId === undefined
+          ? "Saved List created."
+          : "Saved List created and Profile added.",
+      );
+      return result.list.id;
+    } catch (error) {
+      if (createdListId !== undefined) {
+        await refreshLists(createdListId).catch(() => undefined);
+      }
+      setListMessage(
+        error instanceof Error
+          ? error.message
+          : "The Saved List was not created",
+      );
+      return null;
+    }
   };
   const toggleSaved = async (profileId: string) => {
-    const list = lists[0];
-    if (list === undefined) {
-      await createList();
+    if (listState !== "ready") {
+      setListMessage("Wait for Saved Lists to finish loading before saving.");
+      return;
+    }
+    const list = activeList;
+    if (list === null) {
+      await createList(profileId);
       return;
     }
     const saved = list.entries.some((entry) => entry.profileId === profileId);
-    await fetch(`/api/saved-lists/${list.id}/entries/${profileId}`, {
-      method: saved ? "DELETE" : "PUT",
+    setListMessage(null);
+    try {
+      await successfulResponse(
+        fetch(
+          `/api/saved-lists/${encodeURIComponent(list.id)}/entries/${encodeURIComponent(profileId)}`,
+          { method: saved ? "DELETE" : "PUT" },
+        ),
+        saved ? "The Profile was not removed" : "The Profile was not saved",
+      );
+      await refreshLists(list.id);
+    } catch (error) {
+      setListMessage(
+        error instanceof Error
+          ? error.message
+          : "The Saved List was not updated",
+      );
+    }
+  };
+  const retryLists = () => {
+    setListState("loading");
+    setListMessage(null);
+    void refreshLists().catch((error: unknown) => {
+      setListState("error");
+      setListMessage(
+        error instanceof Error ? error.message : "Saved Lists are unavailable",
+      );
     });
-    await refreshLists();
+  };
+  const renameActiveList = async () => {
+    if (listState !== "ready" || activeList === null) return;
+    const name = window.prompt(
+      "Rename this shared Saved List",
+      activeList.name,
+    );
+    if (!name?.trim() || name.trim() === activeList.name) return;
+    setListMessage(null);
+    try {
+      await successfulResponse(
+        fetch(`/api/saved-lists/${encodeURIComponent(activeList.id)}`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name }),
+        }),
+        "The Saved List was not renamed",
+      );
+      await refreshLists(activeList.id);
+      setListMessage("Saved List renamed.");
+    } catch (error) {
+      setListMessage(
+        error instanceof Error
+          ? error.message
+          : "The Saved List was not renamed",
+      );
+    }
+  };
+  const deleteActiveList = async () => {
+    if (
+      listState !== "ready" ||
+      activeList === null ||
+      !window.confirm(`Delete the shared Saved List "${activeList.name}"?`)
+    ) {
+      return;
+    }
+    setListMessage(null);
+    try {
+      await successfulResponse(
+        fetch(`/api/saved-lists/${encodeURIComponent(activeList.id)}`, {
+          method: "DELETE",
+        }),
+        "The Saved List was not deleted",
+      );
+      await refreshLists();
+      setListMessage("Saved List deleted.");
+    } catch (error) {
+      setListMessage(
+        error instanceof Error
+          ? error.message
+          : "The Saved List was not deleted",
+      );
+    }
   };
   const toggleRevealPolicy = async () => {
     const next = !membersCanReveal;
@@ -148,6 +336,7 @@ export function ProfileSearch({
         };
       })
       .then((page) => {
+        window.dispatchEvent(new Event("humans:credits-changed"));
         setResults(page.results);
         setNextCursor(page.nextCursor);
         setMessage(
@@ -270,29 +459,125 @@ export function ProfileSearch({
           <p className="eyebrow">Protected directory</p>
           <h1>Find builders, not keywords.</h1>
         </div>
-        <button className="profileLink" type="button" onClick={onCreateProfile}>
-          Manage my Profile
-        </button>
-        <button className="profileLink" type="button" onClick={createList}>
-          New Saved List
-        </button>
-        {orgRole === "org:admin" && (
-          <button
+        <div className="searchActions">
+          <Button
             className="profileLink"
             type="button"
-            onClick={toggleRevealPolicy}
+            onClick={onCreateProfile}
           >
-            {membersCanReveal
-              ? "Restrict reveals to admins"
-              : "Allow all Members to reveal"}
-          </button>
-        )}
+            Manage my Profile
+          </Button>
+          <div className="savedListControls">
+            <label htmlFor="active-saved-list">
+              Active Saved List
+              <NativeSelect
+                id="active-saved-list"
+                aria-label="Active Saved List"
+                value={activeList?.id ?? ""}
+                onChange={(event) => setActiveListId(event.currentTarget.value)}
+                disabled={listState !== "ready" || lists.length === 0}
+              >
+                {listState !== "ready" || lists.length === 0 ? (
+                  <option value="">
+                    {listState === "loading"
+                      ? "Loading Saved Lists"
+                      : listState === "error"
+                        ? "Saved Lists unavailable"
+                        : "No Saved Lists"}
+                  </option>
+                ) : (
+                  lists.map((list) => (
+                    <option value={list.id} key={list.id}>
+                      {list.name}
+                    </option>
+                  ))
+                )}
+              </NativeSelect>
+            </label>
+            <Button
+              type="button"
+              disabled={listState !== "ready"}
+              onClick={() => void createList()}
+            >
+              New
+            </Button>
+            {listState === "error" && (
+              <Button type="button" onClick={retryLists}>
+                Retry
+              </Button>
+            )}
+            <Button
+              type="button"
+              disabled={listState !== "ready" || activeList === null}
+              onClick={() => void renameActiveList()}
+            >
+              Rename
+            </Button>
+            <Button
+              type="button"
+              disabled={listState !== "ready" || activeList === null}
+              onClick={() => void deleteActiveList()}
+            >
+              Delete
+            </Button>
+          </div>
+          {orgRole === "org:admin" && (
+            <Button
+              className="profileLink"
+              type="button"
+              onClick={toggleRevealPolicy}
+            >
+              {membersCanReveal
+                ? "Restrict reveals to admins"
+                : "Allow all Members to reveal"}
+            </Button>
+          )}
+        </div>
       </div>
+      {listMessage && (
+        <p className="savedListMessage" role="status">
+          {listMessage}
+        </p>
+      )}
+      {activeList !== null && (
+        <details className="savedListDrawer">
+          <summary>
+            {activeList.name} · {activeList.entries.length} Profile
+            {activeList.entries.length === 1 ? "" : "s"}
+          </summary>
+          {activeList.entries.length === 0 ? (
+            <p>No Profiles saved to this list yet.</p>
+          ) : (
+            <ul>
+              {activeList.entries.map((entry) => (
+                <li key={entry.profileId}>
+                  <Button
+                    type="button"
+                    onClick={() =>
+                      updateParameters({ profile: entry.profileId }, true)
+                    }
+                  >
+                    {entry.profileName}
+                  </Button>
+                  <Button
+                    type="button"
+                    aria-label={`Remove ${entry.profileName} from ${activeList.name}`}
+                    onClick={() => void toggleSaved(entry.profileId)}
+                  >
+                    Remove
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </details>
+      )}
 
       <form action={interpretQuery} className="naturalSearch">
-        <label>
+        <label htmlFor="natural-query">
           Describe who you want to find
-          <input
+          <Input
+            id="natural-query"
             name="naturalQuery"
             required
             minLength={3}
@@ -300,9 +585,9 @@ export function ProfileSearch({
             placeholder="Senior TypeScript engineers in Colombia"
           />
         </label>
-        <button type="submit" disabled={interpreting}>
+        <Button type="submit" disabled={interpreting}>
           {interpreting ? "Interpreting…" : "Interpret query"}
-        </button>
+        </Button>
       </form>
       {interpretationError && (
         <p className="interpretationError" role="alert">
@@ -323,9 +608,9 @@ export function ProfileSearch({
             "opportunityStatus",
           ].map((name) =>
             searchParams.get(name) ? (
-              <span key={name}>
+              <Badge key={name} variant="secondary">
                 {name}: {searchParams.get(name)}
-              </span>
+              </Badge>
             ) : null,
           )}
           <span>Edit any field below before searching again.</span>
@@ -333,49 +618,55 @@ export function ProfileSearch({
       )}
 
       <form action={applyFilters} className="searchFilters">
-        <label className="wideFilter">
+        <label className="wideFilter" htmlFor="profile-search-query">
           Search
-          <input
+          <Input
+            id="profile-search-query"
             name="q"
             defaultValue={searchParams.get("q") ?? ""}
             placeholder="Name, headline, or skill"
           />
         </label>
-        <label>
+        <label htmlFor="profile-search-role">
           Role
-          <input
+          <Input
+            id="profile-search-role"
             name="role"
             defaultValue={searchParams.get("role") ?? ""}
             placeholder="Backend engineer"
           />
         </label>
-        <label>
+        <label htmlFor="profile-search-skill">
           Skills
-          <input
+          <Input
+            id="profile-search-skill"
             name="skill"
             defaultValue={searchParams.get("skill") ?? ""}
             placeholder="TypeScript, PostgreSQL"
           />
         </label>
-        <label>
+        <label htmlFor="profile-search-residence">
           Current residence
-          <input
+          <Input
+            id="profile-search-residence"
             name="residence"
             defaultValue={searchParams.get("residence") ?? ""}
             placeholder="Colombia"
           />
         </label>
-        <label>
+        <label htmlFor="profile-search-company">
           Company
-          <input
+          <Input
+            id="profile-search-company"
             name="company"
             defaultValue={searchParams.get("company") ?? ""}
             placeholder="Current company"
           />
         </label>
-        <label>
+        <label htmlFor="profile-search-seniority">
           Seniority
-          <select
+          <NativeSelect
+            id="profile-search-seniority"
             name="seniority"
             defaultValue={searchParams.get("seniority") ?? ""}
           >
@@ -384,11 +675,12 @@ export function ProfileSearch({
             <option value="mid">Mid-level</option>
             <option value="senior">Senior</option>
             <option value="staff">Staff+</option>
-          </select>
+          </NativeSelect>
         </label>
-        <label>
+        <label htmlFor="profile-search-experience">
           Experience
-          <select
+          <NativeSelect
+            id="profile-search-experience"
             name="experience"
             defaultValue={searchParams.get("experience") ?? ""}
           >
@@ -397,11 +689,12 @@ export function ProfileSearch({
             <option value="5">5+ years</option>
             <option value="8">8+ years</option>
             <option value="12">12+ years</option>
-          </select>
+          </NativeSelect>
         </label>
-        <label>
+        <label htmlFor="profile-search-opportunity-status">
           Opportunity status
-          <select
+          <NativeSelect
+            id="profile-search-opportunity-status"
             name="opportunityStatus"
             defaultValue={searchParams.get("opportunityStatus") ?? ""}
           >
@@ -409,11 +702,11 @@ export function ProfileSearch({
             <option value="open">Open</option>
             <option value="not_open">Not open</option>
             <option value="unspecified">Unspecified</option>
-          </select>
+          </NativeSelect>
         </label>
-        <button className="searchButton" type="submit">
+        <Button className="searchButton" type="submit">
           Apply filters
-        </button>
+        </Button>
       </form>
 
       <div className="resultsMeta">
@@ -421,160 +714,175 @@ export function ProfileSearch({
         <span>Ranked by match, evidence, and freshness</span>
       </div>
       <div className="tableFrame">
-        <table className="profileTable">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Headline</th>
-              <th>Current residence</th>
-              <th>Primary role</th>
-              <th>Strongest skills</th>
-              <th>Company</th>
-              <th>Status</th>
-              <th>Freshness</th>
-              <th>Saved</th>
-            </tr>
-          </thead>
-          <tbody>
+        <Table className="profileTable">
+          <TableHeader>
+            <TableRow>
+              <TableHead>Name</TableHead>
+              <TableHead>Headline</TableHead>
+              <TableHead>Current residence</TableHead>
+              <TableHead>Primary role</TableHead>
+              <TableHead>Strongest skills</TableHead>
+              <TableHead>Company</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead>Freshness</TableHead>
+              <TableHead>Saved</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
             {results.map((result) => (
-              <tr
+              <TableRow
                 key={result.profileId}
                 onClick={() => updateParameters({ profile: result.profileId })}
               >
-                <td>
-                  <button className="rowName" type="button">
+                <TableCell>
+                  <Button className="rowName" type="button">
                     {result.name}
-                  </button>
-                </td>
-                <td>{result.headline ?? "Not stated"}</td>
-                <td>{result.currentResidence ?? "Not stated"}</td>
-                <td>{result.primaryRole ?? "Not stated"}</td>
-                <td>
+                  </Button>
+                </TableCell>
+                <TableCell>{result.headline ?? "Not stated"}</TableCell>
+                <TableCell>{result.currentResidence ?? "Not stated"}</TableCell>
+                <TableCell>{result.primaryRole ?? "Not stated"}</TableCell>
+                <TableCell>
                   <div className="skillList">
                     {result.skills.slice(0, 3).map((skill) => (
-                      <span key={skill}>{skill}</span>
+                      <Badge key={skill} variant="secondary">
+                        {skill}
+                      </Badge>
                     ))}
                   </div>
-                </td>
-                <td>{result.currentCompany ?? "Independent"}</td>
-                <td>
-                  <span className={`status status-${result.opportunityStatus}`}>
+                </TableCell>
+                <TableCell>{result.currentCompany ?? "Not stated"}</TableCell>
+                <TableCell>
+                  <Badge
+                    className={`status status-${result.opportunityStatus}`}
+                    variant="outline"
+                  >
                     {statusLabel(result.opportunityStatus)}
-                  </span>
-                </td>
-                <td>
+                  </Badge>
+                </TableCell>
+                <TableCell>
                   <span className="freshness">
                     {relativeDate(result.freshness)} · {result.evidence}
                   </span>
-                </td>
-                <td>
-                  <button
+                </TableCell>
+                <TableCell>
+                  <Button
                     className="saveButton"
                     type="button"
+                    disabled={listState !== "ready"}
                     onClick={(event) => {
                       event.stopPropagation();
                       void toggleSaved(result.profileId);
                     }}
                   >
-                    {lists.some((list) =>
-                      list.entries.some(
-                        (entry) => entry.profileId === result.profileId,
-                      ),
+                    {activeList?.entries.some(
+                      (entry) => entry.profileId === result.profileId,
                     )
                       ? "Saved"
                       : "+ Save"}
-                  </button>
-                </td>
-              </tr>
+                  </Button>
+                </TableCell>
+              </TableRow>
             ))}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       </div>
       <div className="pagination">
         {searchParams.has("cursor") && (
-          <button type="button" onClick={() => router.back()}>
+          <Button type="button" onClick={() => router.back()}>
             Previous page
-          </button>
+          </Button>
         )}
         {nextCursor !== null && (
-          <button
+          <Button
             type="button"
             onClick={() =>
               updateParameters({ cursor: nextCursor, profile: null }, true)
             }
           >
             Next page
-          </button>
+          </Button>
         )}
       </div>
 
-      {selectedProfileId !== null && (
-        <div
-          className="panelBackdrop"
-          role="dialog"
-          aria-label="Profile detail"
-          onClick={(event) => {
-            if (event.target === event.currentTarget)
-              updateParameters({ profile: null });
-          }}
-          onKeyDown={(event) => {
-            if (event.key === "Escape") updateParameters({ profile: null });
-          }}
+      <Sheet
+        open={selectedProfileId !== null}
+        onOpenChange={(open) => {
+          if (!open) updateParameters({ profile: null });
+        }}
+      >
+        <SheetContent
+          className="profilePanel block sm:max-w-none"
+          showCloseButton={false}
         >
-          <aside className="profilePanel">
-            <button
-              className="panelClose"
-              type="button"
-              onClick={() => updateParameters({ profile: null })}
-            >
-              Close
-            </button>
-            {profile?.profileId !== selectedProfileId ? (
+          <SheetTitle className="sr-only">Profile detail</SheetTitle>
+          <SheetDescription className="sr-only">
+            Details, skills, links, and professional Contact Details for the
+            selected Profile.
+          </SheetDescription>
+          <SheetClose
+            render={
+              <Button className="panelClose" type="button" variant="ghost" />
+            }
+          >
+            Close
+          </SheetClose>
+          {selectedProfileId !== null &&
+            (profile?.profileId !== selectedProfileId ? (
               <p>Loading Profile...</p>
             ) : (
               <ProfilePanel
                 key={profile.profileId}
                 profile={profile}
-                lists={lists}
+                activeList={activeList}
                 onToggle={toggleSaved}
                 onRefresh={refreshLists}
               />
-            )}
-          </aside>
-        </div>
-      )}
+            ))}
+        </SheetContent>
+      </Sheet>
     </section>
   );
 }
 
 function ProfilePanel({
   profile,
-  lists,
+  activeList,
   onToggle,
   onRefresh,
 }: {
   profile: ProfileDetail;
-  lists: SavedList[];
+  activeList: SavedList | null;
   onToggle: (profileId: string) => Promise<void>;
-  onRefresh: () => Promise<void>;
+  onRefresh: () => Promise<unknown>;
 }) {
   const [contactDetails, setContactDetails] = useState(profile.contactDetails);
   const [contactMessage, setContactMessage] = useState<string | null>(null);
   const [pendingContact, setPendingContact] = useState<string | null>(null);
-  const entry = lists
-    .flatMap((list) => list.entries.map((entry) => ({ ...entry, list })))
-    .find((entry) => entry.profileId === profile.profileId);
+  const entry = activeList?.entries.find(
+    (entry) => entry.profileId === profile.profileId,
+  );
   const saveNote = async (form: FormData) => {
-    if (entry === undefined) return;
-    await fetch(
-      `/api/saved-lists/${entry.list.id}/entries/${profile.profileId}`,
-      {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ note: String(form.get("note") ?? "") }),
-      },
-    );
-    await onRefresh();
+    if (entry === undefined || activeList === null) return;
+    try {
+      await successfulResponse(
+        fetch(
+          `/api/saved-lists/${encodeURIComponent(activeList.id)}/entries/${encodeURIComponent(profile.profileId)}`,
+          {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ note: String(form.get("note") ?? "") }),
+          },
+        ),
+        "The team note was not saved",
+      );
+      await onRefresh();
+      setContactMessage("Team note saved.");
+    } catch (error) {
+      setContactMessage(
+        error instanceof Error ? error.message : "The team note was not saved",
+      );
+    }
   };
   const reveal = async (detail: ContactDetail) => {
     setPendingContact(detail.observationId);
@@ -606,12 +914,14 @@ function ProfilePanel({
       );
       return;
     }
+    const revealed = result.reveal;
+    window.dispatchEvent(new Event("humans:credits-changed"));
     setContactDetails((current) =>
       current.map((item) =>
-        item.observationId === result.reveal!.observationId
+        item.observationId === revealed.observationId
           ? {
               ...item,
-              value: result.reveal!.value,
+              value: revealed.value,
               previouslyPurchased: true,
             }
           : item,
@@ -648,6 +958,7 @@ function ProfilePanel({
         ({ observationId }) => observationId !== detail.observationId,
       ),
     );
+    window.dispatchEvent(new Event("humans:credits-changed"));
     setContactMessage(
       "The Contact Detail was suppressed, its purchases refunded, and re-enrichment queued.",
     );
@@ -659,24 +970,25 @@ function ProfilePanel({
       <p className="panelHeadline">
         {profile.headline ?? profile.primaryRole ?? "Builder"}
       </p>
-      <button
+      <Button
         className="saveButton"
         type="button"
         onClick={() => void onToggle(profile.profileId)}
       >
         {entry === undefined ? "+ Save to list" : "Remove from list"}
-      </button>
+      </Button>
       {entry !== undefined && (
         <form action={saveNote} className="savedNote">
-          <label>
+          <label htmlFor="saved-profile-note">
             Team note
-            <textarea
+            <Textarea
+              id="saved-profile-note"
               name="note"
               defaultValue={entry.note}
               placeholder="Add context for your teammates"
             />
           </label>
-          <button type="submit">Save note</button>
+          <Button type="submit">Save note</Button>
         </form>
       )}
       <dl>
@@ -690,7 +1002,7 @@ function ProfilePanel({
         </div>
         <div>
           <dt>Company</dt>
-          <dd>{profile.currentCompany ?? "Independent"}</dd>
+          <dd>{profile.currentCompany ?? "Not stated"}</dd>
         </div>
         <div>
           <dt>Experience</dt>
@@ -707,7 +1019,9 @@ function ProfilePanel({
       </dl>
       <div className="panelSkills">
         {profile.skills.map((skill) => (
-          <span key={skill}>{skill}</span>
+          <Badge key={skill} variant="secondary">
+            {skill}
+          </Badge>
         ))}
       </div>
       <section className="contactDetails" aria-labelledby="contact-heading">
@@ -719,7 +1033,7 @@ function ProfilePanel({
           <p className="contactEmpty">No verified professional details.</p>
         ) : (
           contactDetails.map((detail) => (
-            <article className="contactCard" key={detail.observationId}>
+            <Card className="contactCard" key={detail.observationId}>
               <div>
                 <span className="contactType">
                   {detail.type === "professional-email"
@@ -751,18 +1065,19 @@ function ProfilePanel({
                 </div>
               </dl>
               {detail.value ? (
-                <button
+                <Button
                   className="contactReport"
                   type="button"
+                  variant="destructive"
                   disabled={pendingContact === detail.observationId}
                   onClick={() => void reportInvalid(detail)}
                 >
                   {detail.type === "professional-email"
                     ? "Report bounced email"
                     : "Report wrong phone"}
-                </button>
+                </Button>
               ) : (
-                <button
+                <Button
                   className="contactReveal"
                   type="button"
                   disabled={pendingContact === detail.observationId}
@@ -771,9 +1086,9 @@ function ProfilePanel({
                   {pendingContact === detail.observationId
                     ? "Reserving Credits..."
                     : `Reveal for ${detail.price} Credits`}
-                </button>
+                </Button>
               )}
-            </article>
+            </Card>
           ))
         )}
         {contactMessage && (
@@ -784,13 +1099,14 @@ function ProfilePanel({
       </section>
       {profile.links.map((link) => (
         <a
+          aria-label={`Open ${professionalLinkLabel(link)} in a new tab`}
           className="professionalLink"
           href={link}
           key={link}
           target="_blank"
           rel="noreferrer"
         >
-          Professional link ↗
+          {professionalLinkLabel(link)} ↗
         </a>
       ))}
     </>
@@ -804,10 +1120,34 @@ const statusLabel = (status: SearchResult["opportunityStatus"]) =>
       ? "Not open"
       : "Unspecified";
 
+const professionalLinkLabel = (value: string) => {
+  const hostname = new URL(value).hostname.toLowerCase().replace(/^www\./, "");
+  const labels: Record<string, string> = {
+    "cal.com": "Calendar",
+    "github.com": "GitHub",
+    "instagram.com": "Instagram",
+    "linkedin.com": "LinkedIn",
+    "x.com": "X",
+  };
+  return labels[hostname] ?? hostname;
+};
+
 const relativeDate = (value: string) => {
   const days = Math.max(
     0,
     Math.floor((Date.now() - new Date(value).getTime()) / 86_400_000),
   );
   return days === 0 ? "Today" : days === 1 ? "1d ago" : `${days}d ago`;
+};
+
+const successfulResponse = async (
+  responsePromise: Promise<Response>,
+  fallback: string,
+) => {
+  const response = await responsePromise;
+  if (response.ok) return;
+  const result = (await response.json().catch(() => null)) as {
+    error?: { message?: string };
+  } | null;
+  throw new Error(result?.error?.message ?? fallback);
 };

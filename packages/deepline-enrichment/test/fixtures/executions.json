@@ -1,0 +1,96 @@
+{
+  "identity": {
+    "status": "completed",
+    "toolResponse": {
+      "raw": {
+        "data": {
+          "linkedin_url": "https://www.linkedin.com/in/ada-lovelace",
+          "github_url": "https://github.com/ada",
+          "x_url": "https://x.com/ada"
+        }
+      },
+      "rawV2": {
+        "data": {
+          "linkedin_url": "https://www.linkedin.com/in/ada-lovelace",
+          "github_url": "https://github.com/ada",
+          "x_url": "https://x.com/ada"
+        },
+        "meta": { "requestId": "sanitized-identity-request" }
+      }
+    }
+  },
+  "career": {
+    "status": "completed",
+    "toolResponse": {
+      "raw": {
+        "data": {
+          "element": {
+            "id": "linkedin:ada-lovelace",
+            "linkedinUrl": "https://www.linkedin.com/in/ada-lovelace",
+            "headline": "Staff Software Engineer",
+            "currentPosition": [
+              {
+                "companyId": "analytical-engines",
+                "companyName": "Analytical Engines",
+                "position": "Staff Software Engineer",
+                "location": "Lima, Peru",
+                "employmentType": "Full-time",
+                "startDate": {
+                  "month": "January",
+                  "text": "Jan 2024",
+                  "year": 2024
+                },
+                "endDate": null
+              }
+            ],
+            "experience": [
+              {
+                "companyId": "analytical-engines",
+                "companyName": "Analytical Engines",
+                "position": "Staff Software Engineer",
+                "startDate": {
+                  "month": "January",
+                  "text": "Jan 2024",
+                  "year": 2024
+                },
+                "endDate": null
+              }
+            ],
+            "education": [
+              {
+                "schoolId": "university-of-london",
+                "schoolName": "University of London",
+                "degree": "Mathematics",
+                "fieldOfStudy": "Mathematics",
+                "skills": []
+              }
+            ],
+            "skills": [
+              {
+                "name": "TypeScript",
+                "endorsements": "42",
+                "positions": ["analytical-engines"]
+              },
+              {
+                "name": "Distributed Systems",
+                "endorsements": "21",
+                "positions": []
+              }
+            ]
+          },
+          "status": 200,
+          "error": null
+        }
+      },
+      "rawV2": {
+        "data": {
+          "element": {
+            "id": "linkedin:ada-lovelace",
+            "headline": "Staff Software Engineer"
+          }
+        },
+        "meta": { "requestId": "sanitized-career-request" }
+      }
+    }
+  }
+}

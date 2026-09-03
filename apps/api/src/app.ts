@@ -4,31 +4,32 @@ import {
   type makeDatabaseLayer,
   type makeDatabaseService,
 } from "@humans/database";
+import type { ContactDetailType } from "@humans/database/contact-reveals";
+import { isProfessionalLink } from "@humans/database/professional-links";
+import { profileSearchRequestFingerprint } from "@humans/database/search-profiles";
 import { Scalar } from "@scalar/hono-api-reference";
 import { Effect } from "effect";
 import type { Context } from "hono";
-import type { ContactDetailType } from "@humans/database/contact-reveals";
-import { profileSearchRequestFingerprint } from "@humans/database/search-profiles";
 
 import {
-  clerkIdentityBoundary,
   type ApiKeyIdentity,
   type ApiScope,
+  clerkIdentityBoundary,
   type IdentityBoundary,
 } from "./clerk";
 import {
-  createContactRevealAction,
   type ContactRevealFailure,
+  createContactRevealAction,
   toContactRevealFailure,
 } from "./contact-reveal-action";
+import { handleMcpRequest } from "./mcp";
 import {
   interpretedFiltersSchema,
+  type NaturalSearchDecoder,
   NaturalSearchError,
   NaturalSearchInterpreter,
-  type NaturalSearchDecoder,
 } from "./natural-search";
-import { handleMcpRequest } from "./mcp";
-import { polarBoundary, type PolarBoundary } from "./polar";
+import { type PolarBoundary, polarBoundary } from "./polar";
 
 export type Bindings = {
   CLERK_PUBLISHABLE_KEY: string;
@@ -38,14 +39,38 @@ export type Bindings = {
   DATABASE_URL: string;
   SEARCH_CURSOR_SECRET?: string;
   OPENAI_API_KEY?: string;
+  OPENAI_MODEL?: string;
   ORGANIZATION_RATE_LIMITER?: RateLimitBinding;
   MEMBER_RATE_LIMITER?: RateLimitBinding;
   API_KEY_RATE_LIMITER?: RateLimitBinding;
   IP_RATE_LIMITER?: RateLimitBinding;
   NATURAL_SEARCH_RATE_LIMITER?: RateLimitBinding;
+  PUBLIC_PROFILE_REQUEST_RATE_LIMITER?: RateLimitBinding;
+  POLAR_ACCESS_TOKEN?: string;
+  POLAR_BASE_URL?: string;
+  POLAR_ORGANIZATION_ID?: string;
+  POLAR_PRO_PRODUCT_ID?: string;
+  POLAR_USAGE_METER_ID?: string;
+  POLAR_USAGE_EVENT_NAME?: string;
   POLAR_WEBHOOK_SECRET?: string;
+  BILLING_APP_ORIGIN?: string;
+  BILLING_REQUIRED?: "true";
+  SENTRY_DSN?: string;
+  SENTRY_ENVIRONMENT?: string;
+  SENTRY_RELEASE?: string;
+  CF_VERSION_METADATA?: { id: string };
   WEB_PROXY_SECRET?: string;
 };
+
+export type ErrorReportContext = {
+  correlationId?: string;
+  operation: string;
+};
+
+export type ErrorReporter = (
+  error: unknown,
+  context: ErrorReportContext,
+) => void;
 
 type RateLimitBinding = {
   limit(input: { key: string }): Promise<{ success: boolean }>;
@@ -355,20 +380,67 @@ const externalApiPaths = {
   },
 } as const;
 
+const professionalLinkInput = z
+  .url()
+  .max(2_048)
+  .refine((value) => isProfessionalLinkUrl(value));
+
 const profileInput = z.object({
-  name: z.string().trim().min(1),
-  currentCompany: z.string().trim().min(1).nullable(),
-  professionalLinks: z.array(z.url()).min(1),
+  name: z.string().trim().min(1).max(200),
+  currentCompany: z.string().trim().min(1).max(200).nullable(),
+  professionalLinks: z.array(professionalLinkInput).min(1).max(20),
   statements: z.record(z.string(), z.union([z.string(), z.array(z.string())])),
   adultAttestation: z.boolean(),
   privateCodeAttestation: z.boolean(),
   searchable: z.boolean(),
 });
 
+const memberStatementsInput = z
+  .object({
+    name: z.string().trim().min(1).max(200).nullable().optional(),
+    currentCompany: z.string().trim().min(1).max(200).nullable().optional(),
+    headline: z.string().trim().min(1).max(500).nullable().optional(),
+    role: z.string().trim().min(1).max(200).nullable().optional(),
+    location: z.string().trim().min(1).max(200).nullable().optional(),
+    skills: z
+      .array(z.string().trim().min(1).max(100))
+      .max(50)
+      .nullable()
+      .optional(),
+    opportunityStatus: z
+      .enum(["open", "not_open", "unspecified"])
+      .nullable()
+      .optional(),
+  })
+  .strict();
+
+const controlledProfileInput = z
+  .object({
+    name: z.string().trim().min(1).max(200),
+    currentCompany: z.string().trim().min(1).max(200).nullable(),
+    professionalLinks: z.array(professionalLinkInput).min(1).max(20),
+    statements: memberStatementsInput,
+  })
+  .strict();
+
+const claimInput = z.object({ profileReference: z.uuid() }).strict();
+
+const publicProfileRequestInput = z
+  .object({
+    profileReference: z.uuid(),
+    kind: z.enum(["correction", "removal"]),
+    requesterEmail: z.email().max(254),
+    details: z.string().trim().min(10).max(2_000),
+  })
+  .strict();
+
+const maximumPublicProfileRequestBytes = 4_096;
+
 const operatorDecision = z
   .object({
     approved: z.boolean(),
     reason: z.string().trim().min(1).max(500),
+    evidenceReference: z.string().trim().min(1).max(500).optional(),
   })
   .strict();
 
@@ -442,6 +514,7 @@ export const createApp = (
   identity: IdentityBoundary = clerkIdentityBoundary,
   naturalSearchDecoder?: NaturalSearchDecoder,
   polar: PolarBoundary = polarBoundary,
+  errorReporter: ErrorReporter = () => undefined,
 ) => {
   const app = new OpenAPIHono<{ Bindings: Bindings }>();
   let naturalSearch: NaturalSearchInterpreter | undefined;
@@ -450,16 +523,60 @@ export const createApp = (
   const apiKeyRequests = new Map<string, number[]>();
   const ipRequests = new Map<string, number[]>();
   const naturalSearchRequests = new Map<string, number[]>();
+  const publicProfileRequestRequests = new Map<string, number[]>();
   let internalMcpToken: string | undefined;
   const getInternalMcpToken = () => (internalMcpToken ??= crypto.randomUUID());
+  const reportUnexpected = (
+    context: Context<{ Bindings: Bindings }>,
+    error: unknown,
+    operation: string,
+  ) => {
+    errorReporter(error, {
+      correlationId: suppliedCorrelationId(context),
+      operation,
+    });
+  };
+  const unavailable = (
+    context: Context<{ Bindings: Bindings }>,
+    error: unknown,
+    operation: string,
+  ) => {
+    reportUnexpected(context, error, operation);
+    return serviceUnavailable(context);
+  };
+  const observedSearchError = (
+    context: Context<{ Bindings: Bindings }>,
+    error: unknown,
+    operation: string,
+  ) => {
+    const response = externalSearchError(context, error);
+    if (response.status >= 500) reportUnexpected(context, error, operation);
+    return response;
+  };
+  const observedContactError = (
+    context: Context<{ Bindings: Bindings }>,
+    error: unknown,
+    operation: string,
+  ) => {
+    const response = contactError(context, error);
+    if (response.status >= 500) reportUnexpected(context, error, operation);
+    return response;
+  };
 
   app.openapi(healthRoute, async (context) => {
     try {
+      if (
+        context.env?.BILLING_REQUIRED === "true" &&
+        !polar.billingConfigured(context.env)
+      ) {
+        throw new Error("Billing configuration is required");
+      }
       const health = await Effect.runPromise(
         checkHealth().pipe(Effect.provide(databaseLayer(context.env))),
       );
       return context.json(health, 200);
-    } catch {
+    } catch (error) {
+      reportUnexpected(context, error, "health.check");
       return context.json(
         { message: "Service unavailable", status: "error" } as const,
         503,
@@ -493,7 +610,8 @@ export const createApp = (
         }).pipe(Effect.provide(databaseLayer(context.env))),
       );
       return context.json({ processed }, 200);
-    } catch {
+    } catch (error) {
+      reportUnexpected(context, error, "clerk.webhook.project");
       return context.json(
         {
           error: {
@@ -507,12 +625,9 @@ export const createApp = (
   });
 
   app.post("/webhooks/polar", async (context) => {
-    let event: Awaited<ReturnType<PolarBoundary["verifySubscriptionWebhook"]>>;
+    let event: Awaited<ReturnType<PolarBoundary["verifyBillingWebhook"]>>;
     try {
-      event = await polar.verifySubscriptionWebhook(
-        context.req.raw,
-        context.env,
-      );
+      event = await polar.verifyBillingWebhook(context.req.raw, context.env);
     } catch {
       return context.json(
         {
@@ -526,26 +641,93 @@ export const createApp = (
     }
     if (event === null) return context.json({ processed: false }, 200);
     try {
-      await runDatabase(context, (database) =>
+      const projection = await runDatabase(context, (database) =>
         database.setPolarSubscriptionStatus({
           organizationId: event.organizationId,
           polarSubscriptionId: event.subscriptionId,
-          active: event.active,
+          polarCustomerId: event.polarCustomerId,
+          status: event.status,
+          eventType: event.eventType,
           eventId: event.eventId,
           occurredAt: event.occurredAt,
+          periodStart: event.periodStart,
+          periodEnd: event.periodEnd,
+          cancelAtPeriodEnd: event.cancelAtPeriodEnd,
         }),
       );
-      return context.json({ processed: true }, 200);
-    } catch {
-      return serviceUnavailable(context);
+      return context.json(projection, 200);
+    } catch (error) {
+      return unavailable(context, error, "polar.webhook.apply");
+    }
+  });
+
+  app.post("/v1/public/profile-requests", async (context) => {
+    privateResponse(context);
+    const limited = await enforcePublicProfileRequestRateLimit(context);
+    if (limited instanceof Response) return limited;
+
+    const declaredLength = Number(context.req.header("Content-Length"));
+    if (
+      Number.isFinite(declaredLength) &&
+      declaredLength > maximumPublicProfileRequestBytes
+    ) {
+      return requestTooLarge(context);
+    }
+    const body = await context.req.text().catch(() => null);
+    if (
+      body === null ||
+      new TextEncoder().encode(body).byteLength >
+        maximumPublicProfileRequestBytes
+    ) {
+      return requestTooLarge(context);
+    }
+    const input = publicProfileRequestInput.safeParse(
+      (() => {
+        try {
+          return JSON.parse(body) as unknown;
+        } catch {
+          return null;
+        }
+      })(),
+    );
+    if (!input.success)
+      return validationError(context, "invalid_profile_request");
+
+    try {
+      await runDatabase(context, (database) =>
+        database.submitPublicProfileRequest({
+          profileId: input.data.profileReference,
+          kind: input.data.kind,
+          requesterEmail: input.data.requesterEmail,
+          details: input.data.details,
+        }),
+      );
+      return acceptedPublicProfileRequest(context);
+    } catch (error) {
+      if (
+        ["profile_not_found", "request_already_active"].includes(
+          taggedErrorReason(error, "ProfileControlRejected") ?? "",
+        )
+      ) {
+        return acceptedPublicProfileRequest(context);
+      }
+      return unavailable(context, error, "public.profile-request.submit");
     }
   });
 
   const operatorActor = async (context: AppContext) => {
-    const session = await identity.authenticate(context.req.raw, context.env);
-    return session?.systemRole === "operator"
-      ? { operatorId: session.memberId }
-      : null;
+    try {
+      const session = await identity.authenticate(context.req.raw, context.env);
+      if (session?.systemRole !== "operator") return unauthorized(context);
+      await runDatabase(context, (database) =>
+        database.assertMemberActive(session.memberId),
+      );
+      return { operatorId: session.memberId };
+    } catch (error) {
+      return tagged(error, "AbuseControlRejected")
+        ? unauthorized(context)
+        : unavailable(context, error, "operator.authorize");
+    }
   };
 
   const operatorContext = (context: AppContext, operatorId: string) => ({
@@ -555,21 +737,21 @@ export const createApp = (
 
   app.get("/v1/operator/overview", async (context) => {
     const operator = await operatorActor(context);
-    if (!operator) return unauthorized(context);
+    if (operator instanceof Response) return operator;
     try {
       const overview = await runDatabase(context, (database) =>
         database.getOperatorOverview(),
       );
       privateResponse(context);
       return context.json(overview, 200);
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "operator.overview");
     }
   });
 
   app.post("/v1/operator/claims/:claimId/review", async (context) => {
     const operator = await operatorActor(context);
-    if (!operator) return unauthorized(context);
+    if (operator instanceof Response) return operator;
     const input = operatorDecision.safeParse(
       await context.req.json().catch(() => null),
     );
@@ -582,29 +764,102 @@ export const createApp = (
           {
             ...operatorContext(context, operator.operatorId),
             reason: input.data.reason,
+            evidenceReference: input.data.evidenceReference,
           },
         ),
       );
       return context.json({ claim }, 200);
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "operator.claim.review");
     }
   });
+
+  app.post(
+    "/v1/operator/profile-requests/:requestId/verify",
+    async (context) => {
+      const operator = await operatorActor(context);
+      if (operator instanceof Response) return operator;
+      const input = z
+        .object({
+          reason: z.string().trim().min(1).max(500),
+          verificationMethod: z.string().trim().min(1).max(200),
+          evidenceReference: z.string().trim().min(1).max(500),
+        })
+        .strict()
+        .safeParse(await context.req.json().catch(() => null));
+      if (!input.success) return validationError(context, "invalid_decision");
+      try {
+        const request = await runDatabase(context, (database) =>
+          database.verifyRequestAsOperator(context.req.param("requestId"), {
+            ...operatorContext(context, operator.operatorId),
+            reason: input.data.reason,
+            verificationMethod: input.data.verificationMethod,
+            evidenceReference: input.data.evidenceReference,
+          }),
+        );
+        return context.json({ request }, 200);
+      } catch (error) {
+        return unavailable(context, error, "operator.profile-request.verify");
+      }
+    },
+  );
 
   app.post(
     "/v1/operator/profile-requests/:requestId/review",
     async (context) => {
       const operator = await operatorActor(context);
-      if (!operator) return unauthorized(context);
+      if (operator instanceof Response) return operator;
       const input = operatorDecision
         .extend({
           correction: z
             .object({
-              name: z.string().trim().min(1).optional(),
-              currentCompany: z.string().trim().min(1).nullable().optional(),
-              githubAccountId: z.string().trim().min(1).optional(),
-              githubLogin: z.string().trim().min(1).optional(),
+              name: z.string().trim().min(1).max(200).optional(),
+              currentCompany: z
+                .string()
+                .trim()
+                .min(1)
+                .max(200)
+                .nullable()
+                .optional(),
+              headline: z.string().trim().min(1).max(300).nullable().optional(),
+              currentResidence: z
+                .string()
+                .trim()
+                .min(1)
+                .max(200)
+                .nullable()
+                .optional(),
+              roles: z
+                .array(z.string().trim().min(1).max(100))
+                .max(20)
+                .optional(),
+              skills: z
+                .array(z.string().trim().min(1).max(100))
+                .max(100)
+                .optional(),
+              seniority: z
+                .string()
+                .trim()
+                .min(1)
+                .max(100)
+                .nullable()
+                .optional(),
+              experienceYears: z.number().min(0).max(100).nullable().optional(),
+              opportunityStatus: z
+                .enum(["open", "not_open", "unspecified"])
+                .optional(),
+              professionalLinks: z
+                .array(professionalLinkInput)
+                .min(1)
+                .max(20)
+                .optional(),
+              invalidContactObservationIds: z
+                .array(z.uuid())
+                .min(1)
+                .max(100)
+                .optional(),
             })
+            .strict()
             .optional(),
         })
         .safeParse(await context.req.json().catch(() => null));
@@ -622,15 +877,15 @@ export const createApp = (
           ),
         );
         return context.json({ request }, 200);
-      } catch {
-        return serviceUnavailable(context);
+      } catch (error) {
+        return unavailable(context, error, "operator.profile-request.review");
       }
     },
   );
 
   app.post("/v1/operator/suppressions", async (context) => {
     const operator = await operatorActor(context);
-    if (!operator) return unauthorized(context);
+    if (operator instanceof Response) return operator;
     const input = z
       .object({
         canonicalProviderId: z.string().min(1),
@@ -647,14 +902,14 @@ export const createApp = (
         ),
       );
       return context.json({ suppressed: true }, 201);
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "operator.profile.suppress");
     }
   });
 
   app.post("/v1/operator/credit-adjustments", async (context) => {
     const operator = await operatorActor(context);
-    if (!operator) return unauthorized(context);
+    if (operator instanceof Response) return operator;
     const input = z
       .object({
         organizationId: z.string().min(1),
@@ -677,8 +932,32 @@ export const createApp = (
         }),
       );
       return context.json(result, 200);
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "operator.credit.adjust");
+    }
+  });
+
+  app.post("/v1/operator/credit-usage/redrive", async (context) => {
+    const operator = await operatorActor(context);
+    if (operator instanceof Response) return operator;
+    const input = z
+      .object({
+        ids: z.array(z.uuid()).min(1).max(100),
+        reason: z.string().trim().min(1).max(500),
+      })
+      .strict()
+      .safeParse(await context.req.json().catch(() => null));
+    if (!input.success) return validationError(context, "invalid_redrive");
+    try {
+      const redriven = await runDatabase(context, (database) =>
+        database.redriveCreditUsageAsOperator(input.data.ids, {
+          ...operatorContext(context, operator.operatorId),
+          reason: input.data.reason,
+        }),
+      );
+      return context.json({ redriven: redriven.length }, 200);
+    } catch (error) {
+      return unavailable(context, error, "operator.credit-usage.redrive");
     }
   });
 
@@ -686,7 +965,7 @@ export const createApp = (
     "/v1/operator/reconciliations/:reconciliationId/retry",
     async (context) => {
       const operator = await operatorActor(context);
-      if (!operator) return unauthorized(context);
+      if (operator instanceof Response) return operator;
       const input = z
         .object({ reason: z.string().trim().min(1).max(500) })
         .strict()
@@ -700,6 +979,18 @@ export const createApp = (
               ...operatorContext(context, operator.operatorId),
               reason: input.data.reason,
             },
+            (target) =>
+              polar
+                .getMeterQuantities(
+                  {
+                    clerkOrganizationId: target.organizationId,
+                    startAt: target.startAt,
+                    endAt: target.endAt,
+                    interval: "day",
+                  },
+                  context.env,
+                )
+                .then(({ total }) => total),
           ),
         );
         return reconciliation
@@ -713,15 +1004,15 @@ export const createApp = (
               },
               404,
             );
-      } catch {
-        return serviceUnavailable(context);
+      } catch (error) {
+        return unavailable(context, error, "operator.reconciliation.retry");
       }
     },
   );
 
   app.post("/v1/operator/suspensions", async (context) => {
     const operator = await operatorActor(context);
-    if (!operator) return unauthorized(context);
+    if (operator instanceof Response) return operator;
     const input = z
       .object({
         principalType: z.enum(["member", "organization", "api_key"]),
@@ -755,14 +1046,14 @@ export const createApp = (
           context.env,
         );
       return context.json({ suspension }, 201);
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "operator.principal.suspend");
     }
   });
 
   app.delete("/v1/operator/suspensions/:suspensionId", async (context) => {
     const operator = await operatorActor(context);
-    if (!operator) return unauthorized(context);
+    if (operator instanceof Response) return operator;
     try {
       const suspension = await runDatabase(context, (database) =>
         database.revokeSuspensionAsOperator(
@@ -778,8 +1069,8 @@ export const createApp = (
             },
             404,
           );
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "operator.suspension.revoke");
     }
   });
 
@@ -787,7 +1078,7 @@ export const createApp = (
     "/v1/operator/members/:memberId/revoke-sessions",
     async (context) => {
       const operator = await operatorActor(context);
-      if (!operator) return unauthorized(context);
+      if (operator instanceof Response) return operator;
       if (!identity.revokeMemberSessions) return serviceUnavailable(context);
       await runDatabase(context, (database) =>
         database.recordOperatorAudit(
@@ -809,7 +1100,7 @@ export const createApp = (
     "/v1/operator/organizations/:organizationId/revoke-keys",
     async (context) => {
       const operator = await operatorActor(context);
-      if (!operator) return unauthorized(context);
+      if (operator instanceof Response) return operator;
       if (!identity.revokeAllOrganizationApiKeys)
         return serviceUnavailable(context);
       await runDatabase(context, (database) =>
@@ -882,6 +1173,33 @@ export const createApp = (
     });
   });
 
+  const ensureOrganizationPolarCustomer = async (
+    context: AppContext,
+    memberId: string,
+    organizationId: string,
+  ) => {
+    const seed = await runDatabase(context, (database) =>
+      database.getBillingCustomerSeed({ memberId, organizationId }),
+    );
+    const customer = await polar.ensureCustomer(
+      {
+        clerkOrganizationId: organizationId,
+        name: seed.name,
+        owner: {
+          externalId: memberId,
+          email: seed.email,
+        },
+      },
+      context.env,
+    );
+    await runDatabase(context, (database) =>
+      database.recordPolarCustomer({
+        organizationId,
+        polarCustomerId: customer.id,
+      }),
+    );
+  };
+
   app.post("/v1/workspace", async (context) => {
     const session = await identity.authenticate(context.req.raw, context.env);
     if (session === null) return unauthorized(context);
@@ -921,6 +1239,12 @@ export const createApp = (
           botProtectionVerified: session.botProtectionVerified === true,
         }),
       );
+      if (polar.billingConfigured(context.env))
+        await ensureOrganizationPolarCustomer(
+          context,
+          session.memberId,
+          workspace.organizationId,
+        );
       return context.json(workspace, 200);
     } catch (error) {
       if (tagged(error, "AbuseControlRejected"))
@@ -933,6 +1257,7 @@ export const createApp = (
           },
           403,
         );
+      reportUnexpected(context, error, "workspace.provision");
       return context.json(
         {
           error: {
@@ -969,6 +1294,7 @@ export const createApp = (
       ) {
         return forbidden(context);
       }
+      reportUnexpected(context, error, "workspace.read");
       return context.json(
         {
           error: {
@@ -1014,6 +1340,106 @@ export const createApp = (
       : false;
   };
 
+  app.get("/v1/billing", async (context) => {
+    const session = await identity.authenticate(context.req.raw, context.env);
+    if (session === null || session.organizationId === null)
+      return unauthorized(context);
+    const organizationId = session.organizationId;
+    try {
+      const workspace = await runDatabase(context, (database) =>
+        database.getWorkspace(session.memberId, organizationId),
+      );
+      const billing = await runDatabase(context, (database) =>
+        database.getOrganizationBillingOverview(organizationId),
+      );
+      privateResponse(context);
+      return context.json(
+        {
+          ...billing,
+          canManageBilling:
+            workspace.role === "org:admin" || workspace.role === "admin",
+        },
+        200,
+      );
+    } catch (error) {
+      return tagged(error, "WorkspaceForbidden")
+        ? forbidden(context)
+        : unavailable(context, error, "billing.overview");
+    }
+  });
+
+  app.post("/v1/billing/checkout", async (context) => {
+    try {
+      const admin = await organizationAdmin(context);
+      if (admin === null) return unauthorized(context);
+      if (admin === false) return forbidden(context);
+      if ((await context.req.text()).trim())
+        return validationError(context, "invalid_checkout");
+      await ensureOrganizationPolarCustomer(
+        context,
+        admin.memberId,
+        admin.organizationId,
+      );
+      const state = await polar.getCustomerState(
+        admin.organizationId,
+        context.env,
+      );
+      if (state.proSubscription !== null) {
+        privateResponse(context);
+        return context.json(
+          {
+            error: {
+              code: "subscription_already_active",
+              message: "Manage the existing subscription in the billing portal",
+            },
+          },
+          409,
+        );
+      }
+      const checkout = await polar.createProCheckout(
+        admin.organizationId,
+        context.env,
+      );
+      privateResponse(context);
+      return context.json(
+        { url: checkout.url, expiresAt: checkout.expiresAt },
+        201,
+      );
+    } catch (error) {
+      return tagged(error, "WorkspaceForbidden")
+        ? forbidden(context)
+        : unavailable(context, error, "billing.checkout.create");
+    }
+  });
+
+  app.post("/v1/billing/portal", async (context) => {
+    try {
+      const admin = await organizationAdmin(context);
+      if (admin === null) return unauthorized(context);
+      if (admin === false) return forbidden(context);
+      if ((await context.req.text()).trim())
+        return validationError(context, "invalid_portal");
+      await ensureOrganizationPolarCustomer(
+        context,
+        admin.memberId,
+        admin.organizationId,
+      );
+      const portal = await polar.createCustomerPortalSession(
+        admin.organizationId,
+        context.env,
+      );
+      privateResponse(context);
+      return context.json(
+        { url: portal.url, expiresAt: portal.expiresAt },
+        201,
+      );
+    } catch (error) {
+      return tagged(error, "WorkspaceForbidden")
+        ? forbidden(context)
+        : unavailable(context, error, "billing.portal.create");
+    }
+  });
+
   app.post("/v1/organization/api-keys", async (context) => {
     try {
       const admin = await organizationAdmin(context);
@@ -1037,7 +1463,7 @@ export const createApp = (
     } catch (error) {
       return tagged(error, "WorkspaceForbidden")
         ? forbidden(context)
-        : serviceUnavailable(context);
+        : unavailable(context, error, "organization.api-key.create");
     }
   });
 
@@ -1055,7 +1481,7 @@ export const createApp = (
     } catch (error) {
       return tagged(error, "WorkspaceForbidden")
         ? forbidden(context)
-        : serviceUnavailable(context);
+        : unavailable(context, error, "organization.api-key.list");
     }
   });
 
@@ -1079,7 +1505,81 @@ export const createApp = (
     } catch (error) {
       return tagged(error, "WorkspaceForbidden")
         ? forbidden(context)
-        : serviceUnavailable(context);
+        : unavailable(context, error, "organization.api-key.revoke");
+    }
+  });
+
+  const claimGitHubIdentity = async (context: AppContext, memberId: string) => {
+    let github: Awaited<ReturnType<IdentityBoundary["verifyGitHub"]>>;
+    try {
+      github = await identity.verifyGitHub(memberId, context.env);
+    } catch {
+      return invalidProfile(context, "github_ownership_not_verified");
+    }
+    if (github.accountType !== "User")
+      return invalidProfile(context, "ineligible_github_account_type");
+    if (!github.ownershipVerified)
+      return invalidProfile(context, "github_ownership_not_verified");
+    if (github.knownMinor) {
+      await runDatabase(context, (database) =>
+        database.suppressKnownMinorProfile(github.accountId),
+      );
+      return invalidProfile(context, "adult_required");
+    }
+    return github;
+  };
+
+  app.get("/v1/profile/claim-candidates", async (context) => {
+    const session = await identity.authenticate(context.req.raw, context.env);
+    if (session === null) return unauthorized(context);
+    const github = await claimGitHubIdentity(context, session.memberId);
+    if (github instanceof Response) return github;
+
+    try {
+      const [candidates, claim] = await Promise.all([
+        runDatabase(context, (database) =>
+          database.findClaimCandidates({ githubAccountId: github.accountId }),
+        ),
+        runDatabase(context, (database) =>
+          database.getMemberProfileClaim(session.memberId),
+        ),
+      ]);
+      privateResponse(context);
+      return context.json({ candidates, claim }, 200);
+    } catch (error) {
+      return unavailable(context, error, "profile.claim-candidates.read");
+    }
+  });
+
+  app.post("/v1/profile/claims", async (context) => {
+    const session = await identity.authenticate(context.req.raw, context.env);
+    if (session === null) return unauthorized(context);
+    const input = claimInput.safeParse(
+      await context.req.json().catch(() => null),
+    );
+    if (!input.success)
+      return validationError(context, "invalid_profile_claim");
+    const github = await claimGitHubIdentity(context, session.memberId);
+    if (github instanceof Response) return github;
+
+    try {
+      const claim = await runDatabase(context, (database) =>
+        database.requestProfileClaim({
+          profileId: input.data.profileReference,
+          memberId: session.memberId,
+          oauthGithubAccountId: github.accountId,
+          oauthGithubLogin: github.login,
+        }),
+      );
+      privateResponse(context);
+      const result = { claim: { status: claim.status } };
+      return claim.status === "verified"
+        ? context.json(result, 200)
+        : context.json(result, 202);
+    } catch (error) {
+      return tagged(error, "ProfileControlRejected")
+        ? claimUnavailable(context)
+        : unavailable(context, error, "profile.claim.request");
     }
   });
 
@@ -1096,8 +1596,8 @@ export const createApp = (
       );
       privateResponse(context);
       return context.json({ profile }, 200);
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "profile.read");
     }
   });
 
@@ -1110,7 +1610,12 @@ export const createApp = (
     if (!parsed.success) return invalidProfile(context, "invalid_profile");
 
     try {
-      const github = await identity.verifyGitHub(session.memberId, context.env);
+      const [github, linkedIn] = await Promise.all([
+        identity.verifyGitHub(session.memberId, context.env),
+        parsed.data.professionalLinks.some(isLinkedInProfileUrl)
+          ? identity.verifyLinkedIn(session.memberId, context.env)
+          : Promise.resolve(null),
+      ]);
       const profile = await Effect.runPromise(
         Effect.gen(function* () {
           const database = yield* Database;
@@ -1118,15 +1623,84 @@ export const createApp = (
             session.memberId,
             parsed.data,
             github,
+            linkedIn === null
+              ? { github }
+              : {
+                  github,
+                  linkedIn: {
+                    username: linkedIn.username,
+                    providerUserId: linkedIn.providerUserId,
+                  },
+                },
           );
         }).pipe(Effect.provide(databaseLayer(context.env))),
       );
       privateResponse(context);
       return context.json({ profile }, 200);
     } catch (error) {
-      return taggedReason(error) === null
-        ? serviceUnavailable(context)
-        : invalidProfile(context, taggedReason(error)!);
+      const reason = taggedReason(error);
+      return reason === null
+        ? unavailable(context, error, "profile.save")
+        : invalidProfile(context, reason);
+    }
+  });
+
+  app.patch("/v1/profile/details", async (context) => {
+    const session = await identity.authenticate(context.req.raw, context.env);
+    if (session === null) return unauthorized(context);
+    const input = controlledProfileInput.safeParse(
+      await context.req.json().catch(() => null),
+    );
+    if (!input.success) return invalidProfile(context, "invalid_profile");
+
+    const edit = (canonicalIdentityVerification?: {
+      github?: Awaited<ReturnType<IdentityBoundary["verifyGitHub"]>>;
+      linkedIn?: { username: string; providerUserId: string };
+    }) =>
+      runDatabase(context, (database) =>
+        database.editControlledProfile({
+          memberId: session.memberId,
+          ...input.data,
+          canonicalIdentityVerification,
+        }),
+      );
+
+    try {
+      try {
+        await edit();
+      } catch (error) {
+        if (
+          taggedErrorReason(error, "ProfileControlRejected") !==
+          "canonical_identity_change_requires_verification"
+        ) {
+          throw error;
+        }
+        const [github, linkedIn] = await Promise.allSettled([
+          identity.verifyGitHub(session.memberId, context.env),
+          identity.verifyLinkedIn(session.memberId, context.env),
+        ]);
+        await edit({
+          ...(github.status === "fulfilled" ? { github: github.value } : {}),
+          ...(linkedIn.status === "fulfilled" && linkedIn.value
+            ? {
+                linkedIn: {
+                  username: linkedIn.value.username,
+                  providerUserId: linkedIn.value.providerUserId,
+                },
+              }
+            : {}),
+        });
+      }
+      const profile = await runDatabase(context, (database) =>
+        database.getProfile(session.memberId),
+      );
+      privateResponse(context);
+      return context.json({ profile }, 200);
+    } catch (error) {
+      const reason = taggedErrorReason(error, "ProfileControlRejected");
+      return reason === null
+        ? unavailable(context, error, "profile.details.update")
+        : invalidProfile(context, reason);
     }
   });
 
@@ -1134,23 +1708,32 @@ export const createApp = (
     const session = await identity.authenticate(context.req.raw, context.env);
     if (session === null) return unauthorized(context);
     const parsed = z
-      .object({ searchable: z.literal(false) })
+      .object({ searchable: z.boolean() })
+      .strict()
       .safeParse(await context.req.json().catch(() => null));
     if (!parsed.success) return invalidProfile(context, "invalid_profile");
 
     try {
-      const profile = await Effect.runPromise(
-        Effect.gen(function* () {
-          const database = yield* Database;
-          return yield* database.disableProfileSearchability(session.memberId);
-        }).pipe(Effect.provide(databaseLayer(context.env))),
+      const github = parsed.data.searchable
+        ? await identity.verifyGitHub(session.memberId, context.env)
+        : undefined;
+      await runDatabase(context, (database) =>
+        database.setProfileSearchability(
+          session.memberId,
+          parsed.data.searchable,
+          github,
+        ),
+      );
+      const profile = await runDatabase(context, (database) =>
+        database.getProfile(session.memberId),
       );
       privateResponse(context);
       return context.json({ profile }, 200);
     } catch (error) {
-      return taggedReason(error) === null
-        ? serviceUnavailable(context)
-        : invalidProfile(context, taggedReason(error)!);
+      const reason = taggedErrorReason(error, "ProfileControlRejected");
+      return reason === null
+        ? unavailable(context, error, "profile.searchability.update")
+        : invalidProfile(context, reason);
     }
   });
 
@@ -1171,6 +1754,9 @@ export const createApp = (
         database.searchProfilesWithCredit({
           organizationId: actor.organizationId,
           idempotencyKey,
+          memberId: actor.memberId,
+          apiKeyId: actor.keyId,
+          source: requestSource(context, true),
           filters,
           cursor: query.data.cursor,
           pageSize: query.data.pageSize,
@@ -1179,7 +1765,7 @@ export const createApp = (
       privateResponse(context);
       return context.json(page, 200);
     } catch (error) {
-      return externalSearchError(context, error);
+      return observedSearchError(context, error, "profiles.search.api-key");
     }
   });
 
@@ -1192,8 +1778,8 @@ export const createApp = (
       );
       privateResponse(context);
       return context.json({ facets }, 200);
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "search.facets.api-key");
     }
   });
 
@@ -1231,6 +1817,9 @@ export const createApp = (
         database.searchProfilesWithCredit({
           organizationId: actor.organizationId,
           idempotencyKey,
+          memberId: actor.memberId,
+          apiKeyId: actor.keyId,
+          source: requestSource(context, true),
           filters,
           cursor: input.data.cursor,
           pageSize: input.data.pageSize,
@@ -1247,7 +1836,7 @@ export const createApp = (
           { error: { code: error.code, message: error.message } },
           422,
         );
-      return externalSearchError(context, error);
+      return observedSearchError(context, error, "profiles.search.natural");
     }
   });
 
@@ -1304,6 +1893,8 @@ export const createApp = (
             organizationId,
             idempotencyKey:
               context.req.header("Idempotency-Key") ?? crypto.randomUUID(),
+            memberId: actor.memberId,
+            source: "web",
             filters,
             cursor: parsed.data.cursor,
             pageSize: parsed.data.pageSize,
@@ -1314,7 +1905,7 @@ export const createApp = (
       context.header("X-Robots-Tag", "noindex, nofollow");
       return context.json(page, 200);
     } catch (error) {
-      return externalSearchError(context, error);
+      return observedSearchError(context, error, "profiles.search.member");
     }
   });
 
@@ -1350,7 +1941,7 @@ export const createApp = (
           { error: { code: error.code, message: error.message } },
           422,
         );
-      return serviceUnavailable(context);
+      return unavailable(context, error, "profiles.search.interpret");
     }
   });
 
@@ -1407,7 +1998,7 @@ export const createApp = (
       context.header("X-Robots-Tag", "noindex, nofollow");
       return context.json(result, 200);
     } catch (error) {
-      return contactError(context, error);
+      return observedContactError(context, error, "profile.read");
     }
   });
 
@@ -1440,7 +2031,7 @@ export const createApp = (
       return tagged(error, "WorkspaceForbidden") ||
         tagged(error, "AbuseControlRejected")
         ? forbidden(context)
-        : serviceUnavailable(context);
+        : unavailable(context, error, "organization.authorize");
     }
   };
   const runDatabase = <A>(
@@ -1474,10 +2065,13 @@ export const createApp = (
         ? (context.req.header("X-Humans-Client-IP") ?? "unknown")
         : (context.req.header("CF-Connecting-IP") ?? "unknown");
   const correlationId = (context: AppContext) => {
-    const value = context.req.header("X-Correlation-ID")?.trim();
-    const id = value && value.length <= 200 ? value : crypto.randomUUID();
+    const id = suppliedCorrelationId(context) ?? crypto.randomUUID();
     context.header("X-Correlation-ID", id);
     return id;
+  };
+  const suppliedCorrelationId = (context: AppContext) => {
+    const value = context.req.header("X-Correlation-ID")?.trim();
+    return value && /^[A-Za-z0-9_-]{1,100}$/.test(value) ? value : undefined;
   };
   const hashIp = async (value: string) => {
     const digest = await crypto.subtle.digest(
@@ -1553,6 +2147,17 @@ export const createApp = (
       );
     setRateLimitHeaders(context, tightest);
     return denied ? rateLimited(context, denied) : null;
+  };
+
+  const enforcePublicProfileRequestRateLimit = async (context: AppContext) => {
+    const ip = clientIp(context);
+    const limit = await enforceRateLimit(
+      context.env?.PUBLIC_PROFILE_REQUEST_RATE_LIMITER,
+      takeRateLimit(publicProfileRequestRequests, ip, 5),
+      `public-profile-request:${ip}`,
+    );
+    setRateLimitHeaders(context, limit);
+    return limit.allowed ? null : publicRateLimited(context, limit);
   };
 
   const authorizeApiKey = async (
@@ -1763,7 +2368,7 @@ export const createApp = (
       privateContactResponse(context);
       return context.json(result, 200);
     } catch (error) {
-      return contactError(context, error);
+      return observedContactError(context, error, "contact-detail.report");
     }
   });
 
@@ -1798,7 +2403,7 @@ export const createApp = (
         privateContactResponse(context);
         return context.json(result, 200);
       } catch (error) {
-        return contactError(context, error);
+        return observedContactError(context, error, "contact-detail.suppress");
       }
     },
   );
@@ -1832,7 +2437,11 @@ export const createApp = (
       privateContactResponse(context);
       return context.json({ policy }, 200);
     } catch (error) {
-      return contactError(context, error);
+      return observedContactError(
+        context,
+        error,
+        "contact-reveal.policy.update",
+      );
     }
   });
 
@@ -1850,7 +2459,7 @@ export const createApp = (
       privateContactResponse(context);
       return context.json({ policy }, 200);
     } catch (error) {
-      return contactError(context, error);
+      return observedContactError(context, error, "contact-reveal.policy.read");
     }
   });
 
@@ -1876,6 +2485,7 @@ export const createApp = (
     const actor = await savedListContext(context);
     if (actor === null) return unauthorized(context);
     if (actor instanceof Response) return actor;
+    privateResponse(context);
     try {
       return context.json(
         {
@@ -1885,14 +2495,15 @@ export const createApp = (
         },
         200,
       );
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "saved-list.list");
     }
   });
   app.post("/v1/saved-lists", async (context) => {
     const actor = await savedListContext(context);
     if (actor === null) return unauthorized(context);
     if (actor instanceof Response) return actor;
+    privateResponse(context);
     const input = savedListInput.safeParse(
       await context.req.json().catch(() => null),
     );
@@ -1914,14 +2525,15 @@ export const createApp = (
         },
         201,
       );
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "saved-list.create");
     }
   });
   app.patch("/v1/saved-lists/:listId", async (context) => {
     const actor = await savedListContext(context);
     if (actor === null) return unauthorized(context);
     if (actor instanceof Response) return actor;
+    privateResponse(context);
     const input = savedListInput.safeParse(
       await context.req.json().catch(() => null),
     );
@@ -1944,14 +2556,15 @@ export const createApp = (
         },
         200,
       );
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "saved-list.rename");
     }
   });
   app.delete("/v1/saved-lists/:listId", async (context) => {
     const actor = await savedListContext(context);
     if (actor === null) return unauthorized(context);
     if (actor instanceof Response) return actor;
+    privateResponse(context);
     try {
       await runSavedList(context, (database) =>
         database.deleteSavedList(
@@ -1961,14 +2574,15 @@ export const createApp = (
         ),
       );
       return context.body(null, 204);
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "saved-list.delete");
     }
   });
   app.put("/v1/saved-lists/:listId/entries/:profileId", async (context) => {
     const actor = await savedListContext(context);
     if (actor === null) return unauthorized(context);
     if (actor instanceof Response) return actor;
+    privateResponse(context);
     try {
       await runSavedList(context, (database) =>
         database.addSavedListEntry(
@@ -1979,14 +2593,15 @@ export const createApp = (
         ),
       );
       return context.body(null, 204);
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "saved-list.entry.add");
     }
   });
   app.delete("/v1/saved-lists/:listId/entries/:profileId", async (context) => {
     const actor = await savedListContext(context);
     if (actor === null) return unauthorized(context);
     if (actor instanceof Response) return actor;
+    privateResponse(context);
     try {
       await runSavedList(context, (database) =>
         database.removeSavedListEntry(
@@ -1997,14 +2612,15 @@ export const createApp = (
         ),
       );
       return context.body(null, 204);
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "saved-list.entry.remove");
     }
   });
   app.patch("/v1/saved-lists/:listId/entries/:profileId", async (context) => {
     const actor = await savedListContext(context);
     if (actor === null) return unauthorized(context);
     if (actor instanceof Response) return actor;
+    privateResponse(context);
     const input = z
       .object({ note: z.string().max(5000) })
       .safeParse(await context.req.json().catch(() => null));
@@ -2024,8 +2640,8 @@ export const createApp = (
         ),
       );
       return context.body(null, 204);
-    } catch {
-      return serviceUnavailable(context);
+    } catch (error) {
+      return unavailable(context, error, "saved-list.entry.note");
     }
   });
 
@@ -2067,6 +2683,8 @@ export const createApp = (
     "/docs",
     Scalar({
       pageTitle: "Humans API Reference",
+      persistAuth: false,
+      telemetry: false,
       url: "/openapi.json",
     }),
   );
@@ -2138,6 +2756,42 @@ const validationError = (
 ) =>
   context.json({ error: { code, message: "Request validation failed" } }, 422);
 
+const claimUnavailable = (context: {
+  json: (body: z.infer<typeof errorResponse>, status: 409) => Response;
+}) =>
+  context.json(
+    {
+      error: {
+        code: "profile_claim_unavailable",
+        message: "The Profile claim could not be completed",
+      },
+    },
+    409,
+  );
+
+const acceptedPublicProfileRequest = (context: Context) => {
+  context.header("Cache-Control", "no-store");
+  context.header("X-Robots-Tag", "noindex, nofollow");
+  return context.json(
+    {
+      received: true,
+      message: "If the Profile reference matches, it is hidden during review.",
+    },
+    202,
+  );
+};
+
+const requestTooLarge = (context: Context) =>
+  context.json(
+    {
+      error: {
+        code: "request_too_large",
+        message: "Request body is too large",
+      },
+    },
+    413,
+  );
+
 type RateLimitResult = {
   allowed: boolean;
   limit: number;
@@ -2197,6 +2851,25 @@ const rateLimited = (
       error: {
         code: "rate_limited",
         message: "The Organization request limit was exceeded",
+      },
+    },
+    429,
+  );
+};
+
+const publicRateLimited = (
+  context: Context<{ Bindings: Bindings }>,
+  limit: RateLimitResult,
+) => {
+  context.header(
+    "Retry-After",
+    String(Math.max(1, limit.reset - Math.floor(Date.now() / 1000))),
+  );
+  return context.json(
+    {
+      error: {
+        code: "rate_limited",
+        message: "Too many requests",
       },
     },
     429,
@@ -2299,6 +2972,27 @@ const list = (value: string | undefined) =>
     .map((item) => item.trim())
     .filter(Boolean) ?? [];
 
+const isProfessionalLinkUrl = (value: string) => {
+  return isProfessionalLink(value);
+};
+
+const isLinkedInProfileUrl = (value: string) => {
+  try {
+    if (!isProfessionalLinkUrl(value)) return false;
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase().replace(/^www\./, "");
+    const segments = url.pathname.split("/").filter(Boolean);
+    return (
+      (hostname === "linkedin.com" || hostname.endsWith(".linkedin.com")) &&
+      segments.length === 2 &&
+      segments[0]?.toLowerCase() === "in" &&
+      /^[a-z\d-]{1,100}$/i.test(segments[1] ?? "")
+    );
+  } catch {
+    return false;
+  }
+};
+
 const hasMeaningfulFilter = (filters: {
   query?: string;
   roles?: string[];
@@ -2320,8 +3014,13 @@ const hasMeaningfulFilter = (filters: {
     filters.opportunityStatuses,
   ].some((values) => (values?.length ?? 0) > 0);
 
-const decodeNaturalSearch = async (prompt: string, bindings: Bindings) => {
-  if (!bindings.OPENAI_API_KEY)
+const decodeNaturalSearch = async (
+  prompt: string,
+  bindings: Bindings | undefined,
+) => {
+  const apiKey = bindings?.OPENAI_API_KEY?.trim();
+  const model = bindings?.OPENAI_MODEL?.trim();
+  if (!apiKey || !model)
     throw new NaturalSearchError(
       "invalid_interpretation",
       "Natural-language search is not configured. You can still use structured filters.",
@@ -2329,11 +3028,11 @@ const decodeNaturalSearch = async (prompt: string, bindings: Bindings) => {
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      authorization: `Bearer ${bindings.OPENAI_API_KEY}`,
+      authorization: `Bearer ${apiKey}`,
       "content-type": "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-4o-mini",
+      model,
       temperature: 0,
       response_format: { type: "json_object" },
       messages: [
@@ -2345,6 +3044,7 @@ const decodeNaturalSearch = async (prompt: string, bindings: Bindings) => {
         { role: "user", content: prompt },
       ],
     }),
+    signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) throw new Error("Interpretation provider failed");
   const payload = (await response.json()) as {

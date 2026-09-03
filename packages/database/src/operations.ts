@@ -1,12 +1,24 @@
-import { desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull } from "drizzle-orm";
 
-import { applyCreditEntry } from "./credits";
 import { revokeSuspension, suspendPrincipal } from "./abuse-controls";
+import {
+  type CreditMeterReader,
+  listCreditUsageDeadLetters,
+  reconcileCreditUsage,
+  redriveCreditUsage,
+} from "./billing";
+import { applyCreditEntry } from "./credits";
+import { EnrichmentStoreError } from "./enrichment";
+import { lockGitHubIdentity } from "./github-identity";
 import { suppressProviderIdentity } from "./import-profiles";
-import { reviewProfileClaim, reviewProfileRequest } from "./profile-control";
+import {
+  type OperatorProfileCorrection,
+  reviewProfileClaim,
+  reviewProfileRequest,
+  verifyProfileRequest,
+} from "./profile-control";
 import {
   creditReconciliations,
-  creditAccounts,
   enrichmentRuns,
   importRowFailures,
   importRuns,
@@ -15,6 +27,7 @@ import {
   profileClaims,
   profileObservations,
   profileRequests,
+  profiles,
   securityActivity,
   suppressionRecords,
 } from "./schema";
@@ -24,59 +37,77 @@ export type OperatorActionContext = {
   operatorId: string;
   correlationId: string;
   reason?: string;
-  correction?: {
-    name?: string;
-    currentCompany?: string | null;
-    githubAccountId?: string;
-    githubLogin?: string;
-  };
+  evidenceReference?: string;
+  correction?: OperatorProfileCorrection;
 };
 
 export const recordEnrichmentRun = async (
   database: DrizzleDatabase,
   input: typeof enrichmentRuns.$inferInsert,
 ) => {
-  const [run] = await database
-    .insert(enrichmentRuns)
-    .values(input)
-    .onConflictDoUpdate({
-      target: enrichmentRuns.id,
-      set: {
-        stage: input.stage,
-        status: input.status,
-        retryClassification: input.retryClassification,
-        terminalClassification: input.terminalClassification,
-        attempts: input.attempts,
-        durationMs: input.durationMs,
-        costMetadata: input.costMetadata,
-        finishedAt: input.finishedAt,
-      },
-    })
-    .returning();
-  if (!run) throw new Error("enrichment_run_not_recorded");
-  return run;
-};
+  return database.transaction(async (transaction) => {
+    const [identity] = await transaction
+      .select({
+        githubAccountId: profiles.githubAccountId,
+        searchabilityReason: profiles.searchabilityReason,
+      })
+      .from(profiles)
+      .where(eq(profiles.profileId, input.profileId))
+      .limit(1);
+    if (!identity) throw new EnrichmentStoreError("profile_not_found");
+    if (identity.searchabilityReason === "operator_suppression")
+      throw new EnrichmentStoreError("profile_suppressed");
+    await lockGitHubIdentity(transaction, identity.githubAccountId);
+    const [profile] = await transaction
+      .select({
+        searchabilityReason: profiles.searchabilityReason,
+        suppressionId: suppressionRecords.canonicalProviderId,
+      })
+      .from(profiles)
+      .leftJoin(
+        suppressionRecords,
+        and(
+          eq(suppressionRecords.canonicalProvider, "github"),
+          eq(suppressionRecords.canonicalProviderId, profiles.githubAccountId),
+        ),
+      )
+      .where(eq(profiles.profileId, input.profileId))
+      .limit(1)
+      .for("update", { of: profiles });
+    if (!profile) throw new EnrichmentStoreError("profile_not_found");
+    if (
+      profile.searchabilityReason === "operator_suppression" ||
+      profile.suppressionId !== null
+    )
+      throw new EnrichmentStoreError("profile_suppressed");
 
-export const recordCreditReconciliation = async (
-  database: DrizzleDatabase,
-  input: { organizationId: string; polarCredits: number },
-) => {
-  const [account] = await database
-    .select({ balance: creditAccounts.balance })
-    .from(creditAccounts)
-    .where(eq(creditAccounts.organizationId, input.organizationId))
-    .limit(1);
-  const localCredits = account?.balance ?? 0;
-  const [reconciliation] = await database
-    .insert(creditReconciliations)
-    .values({
-      ...input,
-      localCredits,
-      status: localCredits === input.polarCredits ? "matched" : "difference",
-    })
-    .returning();
-  if (!reconciliation) throw new Error("credit_reconciliation_not_recorded");
-  return reconciliation;
+    const [run] = await transaction
+      .insert(enrichmentRuns)
+      .values(input)
+      .onConflictDoUpdate({
+        target: enrichmentRuns.id,
+        set: {
+          stage: input.stage,
+          status: input.status,
+          completedStages: input.completedStages,
+          error: input.error,
+          retryClassification: input.retryClassification,
+          terminalClassification: input.terminalClassification,
+          attempts: input.attempts,
+          durationMs: input.durationMs,
+          costMetadata: input.costMetadata,
+          finishedAt: input.finishedAt,
+          observationsPersistedAt: input.observationsPersistedAt,
+        },
+        setWhere: and(
+          eq(enrichmentRuns.profileId, input.profileId),
+          eq(enrichmentRuns.provider, input.provider),
+        ),
+      })
+      .returning();
+    if (!run) throw new EnrichmentStoreError("run_id_collision");
+    return run;
+  });
 };
 
 const audit = (
@@ -121,6 +152,7 @@ export const getOperatorOverview = async (database: DrizzleDatabase) => {
     suspensions,
     abuseSignals,
     reconciliations,
+    creditUsageDeadLetters,
     auditTrail,
     staleObservations,
   ] = await Promise.all([
@@ -141,14 +173,21 @@ export const getOperatorOverview = async (database: DrizzleDatabase) => {
       .orderBy(desc(enrichmentRuns.startedAt))
       .limit(100),
     database
-      .select()
+      .select({
+        claim: profileClaims,
+        targetGithubAccountId: profiles.githubAccountId,
+        targetGithubLogin: profiles.githubLogin,
+      })
       .from(profileClaims)
+      .innerJoin(profiles, eq(profiles.profileId, profileClaims.profileId))
       .where(eq(profileClaims.status, "pending_review"))
       .orderBy(profileClaims.createdAt),
     database
       .select()
       .from(profileRequests)
-      .where(eq(profileRequests.status, "pending"))
+      .where(
+        inArray(profileRequests.status, ["awaiting_verification", "pending"]),
+      )
       .orderBy(profileRequests.createdAt),
     database
       .select()
@@ -178,6 +217,7 @@ export const getOperatorOverview = async (database: DrizzleDatabase) => {
       .from(creditReconciliations)
       .orderBy(desc(creditReconciliations.checkedAt))
       .limit(100),
+    listCreditUsageDeadLetters(database),
     database
       .select()
       .from(operatorAuditEvents)
@@ -236,11 +276,12 @@ export const getOperatorOverview = async (database: DrizzleDatabase) => {
         }, {}),
       ),
     },
-    claims,
+    claims: claims.map(({ claim, ...target }) => ({ ...claim, ...target })),
     requests,
     suppressions,
     abuse: { signals: abuseSignals, suspensions },
     reconciliations,
+    creditUsageDeadLetters,
     auditTrail,
   };
 };
@@ -263,6 +304,15 @@ export const reviewRequestAsOperator = async (
   return reviewProfileRequest(database, requestId, confirmed, context);
 };
 
+export const verifyRequestAsOperator = async (
+  database: DrizzleDatabase,
+  requestId: string,
+  context: OperatorActionContext & {
+    evidenceReference: string;
+    verificationMethod: string;
+  },
+) => verifyProfileRequest(database, requestId, context);
+
 export const suppressProfileAsOperator = async (
   database: DrizzleDatabase,
   input: { canonicalProviderId: string; reason: string },
@@ -283,9 +333,11 @@ export const adjustCreditsAsOperator = async (
   const result = await applyCreditEntry(database, {
     organizationId: input.organizationId,
     idempotencyKey: `operator:${input.idempotencyKey}`,
-    kind: input.amount > 0 ? "grant" : "charge",
-    amount: Math.abs(input.amount),
-    referenceId: `operator-adjustment:${context.correlationId}`,
+    kind: "adjustment",
+    amount: input.amount,
+    referenceId: `operator-adjustment:${input.idempotencyKey}`,
+    actor: { type: "operator", id: context.operatorId },
+    operation: "billing.credit.adjustment",
     operatorAudit: {
       ...context,
       action: "credits.adjust",
@@ -300,27 +352,43 @@ export const retryReconciliationAsOperator = async (
   database: DrizzleDatabase,
   reconciliationId: string,
   context: OperatorActionContext,
+  readMeter: CreditMeterReader,
 ) => {
-  return database.transaction(async (tx) => {
-    const [reconciliation] = await tx
-      .update(creditReconciliations)
-      .set({
-        status: "retry_pending",
-        attempts: sql`${creditReconciliations.attempts} + 1`,
-        lastError: null,
-      })
-      .where(eq(creditReconciliations.id, reconciliationId))
-      .returning();
-    if (!reconciliation) return null;
+  const [reconciliation] = await database
+    .select({ id: creditReconciliations.id })
+    .from(creditReconciliations)
+    .where(eq(creditReconciliations.id, reconciliationId))
+    .limit(1);
+  if (!reconciliation) return null;
+  await database.transaction(async (tx) => {
     await tx.insert(operatorAuditEvents).values({
       ...context,
       action: "credit_reconciliation.retry",
       subjectType: "credit_reconciliation",
       subjectId: reconciliationId,
     });
-    return reconciliation;
   });
+  return reconcileCreditUsage(database, { reconciliationId }, readMeter);
 };
+
+export const redriveCreditUsageAsOperator = (
+  database: DrizzleDatabase,
+  ids: readonly string[],
+  context: OperatorActionContext,
+) =>
+  database.transaction(async (tx) => {
+    const redriven = await redriveCreditUsage(tx, { ids });
+    if (redriven.length > 0)
+      await tx.insert(operatorAuditEvents).values(
+        redriven.map(({ id }) => ({
+          ...context,
+          action: "credit_usage.redrive",
+          subjectType: "credit_usage_outbox",
+          subjectId: id,
+        })),
+      );
+    return redriven;
+  });
 
 export const suspendPrincipalAsOperator = (
   database: DrizzleDatabase,

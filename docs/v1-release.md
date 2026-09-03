@@ -14,7 +14,7 @@ branches, API credentials, webhook secrets, or encryption/signing secrets.
 | Clerk instance ID | Local development instance | `ins_3InRqXS3sKxXPyqqiOMQ75PhGQx` | `ins_3InStOBNOMbj1uRVtQCN0GLX3tt` |
 | Clerk webhook endpoint | Local listener | `ep_3InUXE23pr40O0RjqGLbf2nlKWi` | `ep_3InUe0OhgKQtJXkVkkSNi7LVmIN` |
 | Neon project and branch | Local database | `autumn-base-48692547` / `br-silent-heart-audvpz7y` | `autumn-base-48692547` / `br-spring-haze-autqf4gr` |
-| Trigger.dev project/environment | `proj_umusurvkybxuonbiopal` / Development | `proj_umusurvkybxuonbiopal` / Staging | `proj_umusurvkybxuonbiopal` / Production |
+| Trigger.dev project/environment | `proj_umusurvkybxuonbiopal` / Development | `proj_bzchfkbbyztlvsntroom` / Production (`Humans Preview`) | `proj_umusurvkybxuonbiopal` / Production (`Humans`) |
 | Cloudflare Worker | `humans-api-local` | `humans-api-preview` / `d011be97-1b8c-4600-8ac7-5724a2a55b95` | `humans-api-production` / `6ce29841-eff4-4605-a00a-8ac1a1b696ca` |
 | Vercel project/environment | Local | `prj_1rRwDoknIk65eWIHIScwyuuHDthI` / Preview / `dpl_6kpu7sXEZukyEpLCEREbiB3oH2U5` | `prj_1rRwDoknIk65eWIHIScwyuuHDthI` / Production / `dpl_AjaXzBaBodtu15qGWWdoSAirmF3J` |
 | Polar organization/environment | Sandbox | Pending / Sandbox | Pending / Production |
@@ -23,7 +23,7 @@ branches, API credentials, webhook secrets, or encryption/signing secrets.
 | GitHub sign-in OAuth app | Clerk shared development credential | Clerk shared development credential | `cuevaio/Humans` / application `3833647` |
 | TikHub credential ID | Local credential | Pending | Pending |
 | Deepline credential ID | Local credential | Pending | Pending |
-| Sentry project/environment | Local | Pending / Preview | Pending / Production |
+| Sentry project/environment | Local | `cueva/humans-preview` (`4512020599144448`) / Preview | `cueva/humans` (`4512020552089600`) / Production |
 
 The production web application is `https://humans.crafter.run`. The HTTP API,
 MCP endpoint, Scalar documentation, and OpenAPI contract are available at
@@ -38,10 +38,17 @@ Before deployment, verify every populated preview identifier differs from its
 production counterpart. A credential ID may be its dashboard label or last four
 characters, but must not be the credential itself.
 
+Both Clerk instances must enable automatic Organization creation with the
+`My Organization` fallback, disable email-domain detection and name templates,
+and keep forced Organization selection enabled. This gives an uninvited Member
+one personal Organization without allowing an email domain to define ownership.
+
 ### Cloudflare secrets
 
 Set each value independently in both deployed Worker environments:
 
+- `CLERK_BOT_PROTECTION_ENABLED=true` after confirming Clerk bot protection is
+  enabled for that instance
 - `DATABASE_URL`
 - `CLERK_PUBLISHABLE_KEY`
 - `CLERK_SECRET_KEY`
@@ -49,7 +56,19 @@ Set each value independently in both deployed Worker environments:
 - `SEARCH_CURSOR_SECRET`
 - `WEB_PROXY_SECRET`
 - `OPENAI_API_KEY` when natural-language search is enabled
+- `OPENAI_MODEL` when natural-language search is enabled
+- `POLAR_ACCESS_TOKEN` when billing is enabled
+- `POLAR_BASE_URL` when billing is enabled
+- `POLAR_ORGANIZATION_ID` when billing is enabled
+- `POLAR_PRO_PRODUCT_ID` when billing is enabled
+- `POLAR_USAGE_METER_ID` when billing is enabled
+- `POLAR_USAGE_EVENT_NAME` when billing is enabled
 - `POLAR_WEBHOOK_SECRET` when billing is enabled
+- `BILLING_APP_ORIGIN` when billing is enabled
+
+The committed Preview and Production Worker configuration sets
+`BILLING_REQUIRED=true`. `/health` fails closed unless every Polar setting is
+present and valid; local development may omit Polar entirely.
 
 From `apps/api`, use `bunx wrangler secret put <NAME> --env preview` or
 `bunx wrangler secret put <NAME> --env production`. `WEB_PROXY_SECRET` must
@@ -59,10 +78,20 @@ Vercel requires `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`,
 `HUMANS_API_URL`, and `HUMANS_PROXY_SECRET` in separate Preview and Production
 scopes. Configure `apps/web` as the Vercel project root.
 
-Trigger.dev uses one dedicated `TRIGGER_PROJECT_REF`; its Development, Staging,
-and Production environments require separate database and provider credentials.
+Trigger.dev Preview uses the Production environment of the isolated
+`Humans Preview` project because the Free plan has no Staging environment.
+Production uses only the Production environment of the separate `Humans`
+project. Each requires its own database, provider, Polar, and Sentry settings.
 Polar webhooks and Clerk webhooks must target only the Worker URL from their own
 environment.
+
+Before recording either Polar product ID, verify the product is a fixed
+`$20 USD` monthly subscription, maps only to the configured Humans usage meter,
+and has no metered overage price. Confirm a successful subscription payment is
+the authority for each 1,000-Credit Pro grant; subscription-state notifications
+alone must not grant Credits. In both Polar environments, confirm **Allow
+multiple subscriptions** is disabled; the checkout route also refuses to create
+a session when Polar already reports an active Pro subscription.
 
 ## Release procedure
 
@@ -79,21 +108,38 @@ environment.
    Apply the committed migrations to that branch and run application health and
    representative read checks. Do not continue if data, constraints, indexes,
    or the `vector` extension differ from the source.
-6. Deploy Trigger.dev to staging with `bun run deploy:trigger:preview:dry-run`
+6. Apply the reviewed migrations to the Preview database, then deploy
+   Trigger.dev to the isolated Preview project with
+   `bun run deploy:trigger:preview:dry-run`
    followed by `bun run deploy:trigger:preview`.
 7. Deploy the Worker with `bun run deploy:api:preview` and deploy the web app to
    a Vercel preview from the same commit.
 8. Verify `/health`, `/openapi.json`, `/docs`, `/mcp`, the protected web app,
    the representative CSV journey, API/MCP acceptance, and browser acceptance
    in preview. Attach sanitized logs and test results to the release record.
+   Run `bun run test:browser -- --project=preview-chromium` with the Preview
+   Clerk test keys, `PLAYWRIGHT_PREVIEW_URL`, and a sanitized
+   `E2E_PROFILE_QUERY`. Supply an ephemeral
+   `VERCEL_AUTOMATION_BYPASS_SECRET`; Playwright sends it only in the initial
+   Preview request and asks Vercel to establish the follow-up navigation cookie.
+   Confirm teardown deletes the disposable Member and Organization, then revoke
+   the bypass and delete local browser artifacts.
 9. Apply migrations to production, run
    `bun run deploy:trigger:production:dry-run` followed by
    `bun run deploy:trigger:production`, then run
    `bun run deploy:api:production` and promote the verified Vercel deployment.
    Stop on any version or commit mismatch.
 10. Repeat the bounded health, API/MCP, indexing, and browser checks in
-    production. Roll back application deployments on failure; restore data only
-    through a reviewed Neon recovery procedure.
+     production. Roll back application deployments on failure; restore data only
+     through a reviewed Neon recovery procedure.
+     Generate a short-lived supported Clerk impersonation URL for the
+     GitHub-connected represented Member and run
+     `bun run test:browser -- --project=production-profile-control` with
+     `PLAYWRIGHT_PRODUCTION_URL` and `E2E_PROFILE_OWNER_IMPERSONATION_URL`.
+     Tracing is disabled for this project; confirm the suite restores the
+     original Searchability and signs out the impersonation. Run this only for
+     the intended represented Member: an initial successful claim is durable
+     even though Searchability is restored.
 
 Live provider smoke tests must require explicit opt-in, use one known-safe
 identity, cap requests and retries, have a short timeout, and log no Contact

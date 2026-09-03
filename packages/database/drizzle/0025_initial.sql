@@ -1,0 +1,1 @@
+ALTER TABLE "contact_detail_invalidations" ALTER COLUMN "reported_by" DROP NOT NULL;

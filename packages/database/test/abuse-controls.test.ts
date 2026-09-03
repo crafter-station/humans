@@ -1,8 +1,8 @@
+import { fileURLToPath } from "node:url";
 import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
-import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
@@ -16,6 +16,7 @@ import {
   setPolarSubscriptionStatus,
   suspendPrincipal,
 } from "../src/abuse-controls";
+import { getOrganizationBillingOverview } from "../src/billing";
 import { applyCreditEntry, reserveCredit } from "../src/credits";
 import * as schema from "../src/schema";
 
@@ -47,6 +48,7 @@ describe("abuse controls", () => {
     await database.delete(schema.creditAccounts);
     await database.delete(schema.memberFreeCreditClaims);
     await database.delete(schema.polarWebhookEvents);
+    await database.delete(schema.polarCustomers);
     await database.delete(schema.organizationEntitlements);
     await database.delete(schema.organizationMemberships);
     await database.delete(schema.organizations);
@@ -120,7 +122,7 @@ describe("abuse controls", () => {
       .select()
       .from(schema.creditAccounts)
       .where(eq(schema.creditAccounts.organizationId, "organization_one"));
-    expect(freeAccount?.balance).toBe(200);
+    expect(freeAccount?.balance).toBe(100);
     await expect(
       activateOrganizationEntitlement(database, {
         memberId: "member_two",
@@ -141,15 +143,43 @@ describe("abuse controls", () => {
         emailVerified: true,
         botProtectionVerified: true,
       }),
-    ).rejects.toMatchObject({ code: "paid_subscription_required" });
+    ).resolves.toEqual({ tier: "free", status: "inactive" });
+    await expect(
+      getOrganizationBillingOverview(database, "organization_two"),
+    ).resolves.toMatchObject({
+      plan: "free",
+      availableCredits: 0,
+      status: "inactive",
+      chargeable: false,
+    });
 
     await setPolarSubscriptionStatus(database, {
       organizationId: "organization_two",
       polarSubscriptionId: "polar_subscription_one",
-      active: true,
+      polarCustomerId: "polar_customer_one",
+      status: "active",
+      eventType: "order.paid",
       eventId: "polar_event_one",
       occurredAt: new Date("2026-09-02T00:00:00Z"),
+      periodStart: new Date("2026-09-01T00:00:00Z"),
+      periodEnd: new Date("2026-10-01T00:00:00Z"),
+      cancelAtPeriodEnd: false,
+      now: new Date("2026-09-02T00:00:00Z"),
     });
+    await expect(
+      database
+        .select({
+          tier: schema.organizationEntitlements.tier,
+          status: schema.organizationEntitlements.status,
+        })
+        .from(schema.organizationEntitlements)
+        .where(
+          eq(
+            schema.organizationEntitlements.organizationId,
+            "organization_two",
+          ),
+        ),
+    ).resolves.toEqual([{ tier: "pro", status: "active" }]);
     await expect(
       activateOrganizationEntitlement(database, {
         memberId: "member_one",
@@ -164,16 +194,28 @@ describe("abuse controls", () => {
     await setPolarSubscriptionStatus(database, {
       organizationId: "organization_two",
       polarSubscriptionId: "polar_subscription_one",
-      active: false,
+      polarCustomerId: "polar_customer_one",
+      status: "unpaid",
+      eventType: "subscription.revoked",
       eventId: "polar_event_newer",
       occurredAt: new Date("2026-09-03T00:00:00Z"),
+      periodStart: new Date("2026-09-01T00:00:00Z"),
+      periodEnd: new Date("2026-10-01T00:00:00Z"),
+      cancelAtPeriodEnd: false,
+      now: new Date("2026-09-03T00:00:00Z"),
     });
     await setPolarSubscriptionStatus(database, {
       organizationId: "organization_two",
       polarSubscriptionId: "polar_subscription_one",
-      active: true,
+      polarCustomerId: "polar_customer_one",
+      status: "active",
+      eventType: "subscription.updated",
       eventId: "polar_event_delayed",
       occurredAt: new Date("2026-09-02T12:00:00Z"),
+      periodStart: new Date("2026-09-01T00:00:00Z"),
+      periodEnd: new Date("2026-10-01T00:00:00Z"),
+      cancelAtPeriodEnd: false,
+      now: new Date("2026-09-03T00:00:00Z"),
     });
     const [orderedEntitlement] = await database
       .select()
@@ -181,7 +223,11 @@ describe("abuse controls", () => {
       .where(
         eq(schema.organizationEntitlements.organizationId, "organization_two"),
       );
-    expect(orderedEntitlement?.status).toBe("inactive");
+    expect(orderedEntitlement).toMatchObject({
+      status: "blocked",
+      polarStatus: "unpaid",
+      pendingFreeAtPeriodEnd: false,
+    });
     await expect(
       organizationRevealLimit(database, "organization_one"),
     ).resolves.toBe(10);

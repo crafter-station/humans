@@ -1,11 +1,24 @@
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq, ne } from "drizzle-orm";
 import { Effect } from "effect";
-
+import { recordEmployment, staleCurrentEmployment } from "../companies";
+import {
+  canonicalGitHubAccountId,
+  lockGitHubIdentity,
+} from "../github-identity";
+import { verifiedProfessionalLink } from "../professional-links";
+import {
+  type CanonicalIdentityVerification,
+  ProfileControlError,
+  verifyCanonicalProfileLinks,
+} from "../profile-control";
+import { suppressGitHubIdentityInTransaction } from "../profile-suppression";
 import {
   contactDetailSuppressions,
   memberStatements,
   professionalLinks,
+  profileClaims,
   profiles,
+  suppressionRecords,
 } from "../schema";
 import { DatabaseUnavailable, ProfileRejected } from "./errors";
 import type {
@@ -54,21 +67,46 @@ export const makeProfileService = (database: DrizzleDatabase) => {
     memberId: string,
     input: ProfileInput,
     github: GitHubVerification,
+    canonicalIdentityVerification?: CanonicalIdentityVerification,
   ) => {
-    const rejection = profileRejection(input, github);
+    const githubAccountId = canonicalGitHubAccountId(github.accountId);
+    if (githubAccountId === null)
+      return Effect.fail(
+        new ProfileRejected({ reason: "github_ownership_not_verified" }),
+      );
+    const hasRecentContribution = hasRecentPublicContribution(
+      github.contributedPubliclySince,
+    );
+    const rejection = profileRejection(input, github, hasRecentContribution);
     if (rejection !== null) {
       return Effect.gen(function* () {
         if (github.knownMinor) {
           yield* Effect.tryPromise({
             try: () =>
-              database
-                .update(profiles)
-                .set({
-                  searchable: false,
-                  searchabilityReason: "operator_suppression",
-                  updatedAt: new Date(),
-                })
-                .where(eq(profiles.memberId, memberId)),
+              database.transaction(async (transaction) => {
+                const [existing] = await transaction
+                  .select({ githubAccountId: profiles.githubAccountId })
+                  .from(profiles)
+                  .where(eq(profiles.memberId, memberId))
+                  .limit(1);
+                const existingAccountId =
+                  existing === undefined
+                    ? null
+                    : canonicalGitHubAccountId(existing.githubAccountId);
+                const accountIds = [
+                  ...new Set([
+                    githubAccountId,
+                    ...(existingAccountId === null ? [] : [existingAccountId]),
+                  ]),
+                ].sort();
+                for (const accountId of accountIds)
+                  await suppressGitHubIdentityInTransaction(transaction, {
+                    githubAccountId: accountId,
+                    reason: "known_minor",
+                    purge: true,
+                    detachMember: false,
+                  });
+              }),
             catch: (cause) => new DatabaseUnavailable({ cause }),
           });
         }
@@ -78,68 +116,172 @@ export const makeProfileService = (database: DrizzleDatabase) => {
 
     const eligibilityBasis = github.ownsNonForkRepository
       ? ("owned_repository" as const)
-      : github.contributedPubliclySince !== null
+      : hasRecentContribution
         ? ("public_contribution" as const)
         : ("private_attestation" as const);
     const searchabilityReason = input.searchable
       ? ("member_opt_in" as const)
       : ("member_opt_out" as const);
 
-    return Effect.gen(function* () {
-      const existing = yield* getProfile(memberId);
-      if (existing !== null && existing.githubAccountId !== github.accountId) {
-        return yield* new ProfileRejected({
-          reason: "github_identity_change_requires_review",
-        });
-      }
-
-      return yield* Effect.tryPromise({
-        try: async () => {
-          await database.transaction(async (transaction) => {
-            const [storedProfile] = await transaction
-              .insert(profiles)
-              .values({
-                memberId,
-                name: input.name,
-                currentCompany: input.currentCompany,
-                githubAccountId: github.accountId,
-                githubLogin: github.login,
-                eligibilityBasis,
-                adultAttested: true,
-                searchable: input.searchable,
-                searchabilityReason,
-              })
-              .onConflictDoUpdate({
-                target: profiles.memberId,
-                set: {
-                  name: input.name,
-                  currentCompany: input.currentCompany,
-                  githubLogin: github.login,
-                  eligibilityBasis,
-                  adultAttested: true,
-                  searchable: input.searchable,
-                  searchabilityReason,
-                  updatedAt: new Date(),
-                },
-              })
-              .returning({
-                githubAccountId: profiles.githubAccountId,
-                profileId: profiles.profileId,
-              });
-            if (storedProfile?.githubAccountId !== github.accountId) {
+    return Effect.tryPromise({
+      try: async () => {
+        const contactSuppressions = await database.transaction(
+          async (transaction) => {
+            await lockGitHubIdentity(transaction, githubAccountId);
+            const [existing] = await transaction
+              .select()
+              .from(profiles)
+              .where(eq(profiles.memberId, memberId))
+              .limit(1)
+              .for("update");
+            if (
+              existing !== undefined &&
+              existing.githubAccountId !== githubAccountId
+            ) {
               throw new ProfileRejected({
                 reason: "github_identity_change_requires_review",
               });
             }
+            if (
+              existing?.searchabilityReason === "operator_suppression" ||
+              existing?.searchabilityReason === "disputed"
+            ) {
+              throw new ProfileRejected({
+                reason: "profile_searchability_locked",
+              });
+            }
+            const [suppression] = await transaction
+              .select({
+                canonicalProviderId: suppressionRecords.canonicalProviderId,
+              })
+              .from(suppressionRecords)
+              .where(
+                and(
+                  eq(suppressionRecords.canonicalProvider, "github"),
+                  eq(suppressionRecords.canonicalProviderId, githubAccountId),
+                ),
+              )
+              .limit(1);
+            const [canonicalProfile] = await transaction
+              .select({ profileId: profiles.profileId })
+              .from(profiles)
+              .where(eq(profiles.githubAccountId, githubAccountId))
+              .limit(1);
+            const [pendingClaim] = await transaction
+              .select({ id: profileClaims.id })
+              .from(profileClaims)
+              .where(
+                and(
+                  eq(profileClaims.memberId, memberId),
+                  eq(profileClaims.status, "pending_review"),
+                ),
+              )
+              .limit(1);
+            if (suppression !== undefined)
+              throw new ProfileRejected({ reason: "profile_suppressed" });
+            if (pendingClaim !== undefined)
+              throw new ProfileRejected({ reason: "profile_claim_pending" });
+            if (existing === undefined && canonicalProfile !== undefined) {
+              throw new ProfileRejected({
+                reason: "imported_profile_claim_required",
+              });
+            }
+
+            const existingLinks =
+              existing === undefined
+                ? []
+                : await transaction
+                    .select()
+                    .from(professionalLinks)
+                    .where(eq(professionalLinks.profileId, existing.profileId));
+            try {
+              verifyCanonicalProfileLinks(
+                githubAccountId,
+                existingLinks.map(({ url }) => url),
+                input.professionalLinks,
+                { ...canonicalIdentityVerification, github },
+              );
+            } catch (cause) {
+              if (cause instanceof ProfileControlError)
+                throw new ProfileRejected({ reason: cause.code });
+              throw cause;
+            }
+
+            const now = new Date();
+            const [storedProfile] = existing
+              ? await transaction
+                  .update(profiles)
+                  .set({
+                    name: input.name,
+                    currentCompany: input.currentCompany,
+                    githubLogin: github.login,
+                    eligibilityBasis,
+                    adultAttested: true,
+                    searchable: input.searchable,
+                    searchabilityReason,
+                    updatedAt: now,
+                  })
+                  .where(eq(profiles.profileId, existing.profileId))
+                  .returning()
+              : await transaction
+                  .insert(profiles)
+                  .values({
+                    memberId,
+                    name: input.name,
+                    currentCompany: input.currentCompany,
+                    githubAccountId,
+                    githubLogin: github.login,
+                    eligibilityBasis,
+                    adultAttested: true,
+                    searchable: input.searchable,
+                    searchabilityReason,
+                  })
+                  .returning();
+            if (!storedProfile) throw new Error("profile_not_saved");
+            await staleCurrentEmployment(
+              transaction,
+              storedProfile.profileId,
+              "member",
+              now,
+            );
+            if (input.currentCompany !== null)
+              await recordEmployment(transaction, {
+                profileId: storedProfile.profileId,
+                companyName: input.currentCompany,
+                current: true,
+                source: "member",
+                sourceRecordId: memberId,
+                pipelineVersion: "member-v1",
+                confidence: 1,
+                collectedAt: now,
+              });
             await transaction
               .delete(professionalLinks)
               .where(eq(professionalLinks.profileId, storedProfile.profileId));
             await transaction.insert(professionalLinks).values(
-              input.professionalLinks.map((url) => ({
-                profileId: storedProfile.profileId,
-                url,
-              })),
+              input.professionalLinks.map((url) => {
+                const existingLink = existingLinks.find(
+                  (link) => link.url === url,
+                );
+                const verified = verifiedProfessionalLink(
+                  url,
+                  { ...canonicalIdentityVerification, github },
+                  now,
+                );
+                return verified === undefined && existingLink !== undefined
+                  ? existingLink
+                  : {
+                      profileId: storedProfile.profileId,
+                      url,
+                      source: "member",
+                      sourceRecordId: memberId,
+                      ...verified,
+                    };
+              }),
             );
+            await transaction
+              .delete(memberStatements)
+              .where(eq(memberStatements.profileId, storedProfile.profileId));
             const statements = Object.entries(input.statements);
             if (statements.length > 0) {
               await transaction.insert(memberStatements).values(
@@ -154,22 +296,38 @@ export const makeProfileService = (database: DrizzleDatabase) => {
                 })),
               );
             }
-          });
-          return {
-            ...input,
-            memberId,
-            githubAccountId: github.accountId,
-            githubLogin: github.login,
-            eligibilityBasis,
-            searchabilityReason,
-            contactSuppressions: existing?.contactSuppressions ?? [],
-          };
-        },
-        catch: (cause) =>
-          cause instanceof ProfileRejected
-            ? cause
-            : new DatabaseUnavailable({ cause }),
-      });
+            const suppressions = await transaction
+              .select({ type: contactDetailSuppressions.type })
+              .from(contactDetailSuppressions)
+              .where(
+                eq(
+                  contactDetailSuppressions.profileId,
+                  storedProfile.profileId,
+                ),
+              );
+            return suppressions
+              .map(({ type }) => type)
+              .filter(
+                (type): type is MemberProfile["contactSuppressions"][number] =>
+                  type === "professional-email" ||
+                  type === "direct-professional-phone",
+              );
+          },
+        );
+        return {
+          ...input,
+          memberId,
+          githubAccountId,
+          githubLogin: github.login,
+          eligibilityBasis,
+          searchabilityReason,
+          contactSuppressions,
+        };
+      },
+      catch: (cause) =>
+        cause instanceof ProfileRejected
+          ? cause
+          : new DatabaseUnavailable({ cause }),
     }).pipe(Effect.withSpan("Database.saveProfile"));
   };
 
@@ -184,7 +342,13 @@ export const makeProfileService = (database: DrizzleDatabase) => {
               searchabilityReason: "member_opt_out",
               updatedAt: new Date(),
             })
-            .where(eq(profiles.memberId, memberId))
+            .where(
+              and(
+                eq(profiles.memberId, memberId),
+                ne(profiles.searchabilityReason, "disputed"),
+                ne(profiles.searchabilityReason, "operator_suppression"),
+              ),
+            )
             .returning(),
         catch: (cause) => new DatabaseUnavailable({ cause }),
       });
@@ -201,7 +365,11 @@ export const makeProfileService = (database: DrizzleDatabase) => {
   return { disableProfileSearchability, getProfile, saveProfile };
 };
 
-const profileRejection = (input: ProfileInput, github: GitHubVerification) => {
+const profileRejection = (
+  input: ProfileInput,
+  github: GitHubVerification,
+  hasRecentContribution: boolean,
+) => {
   if (input.name.trim() === "" || input.professionalLinks.length === 0) {
     return "profile_details_required";
   }
@@ -209,12 +377,6 @@ const profileRejection = (input: ProfileInput, github: GitHubVerification) => {
   if (!github.ownershipVerified) return "github_ownership_not_verified";
   if (!input.adultAttestation || github.knownMinor) return "adult_required";
 
-  const contributionCutoff = new Date();
-  contributionCutoff.setUTCFullYear(contributionCutoff.getUTCFullYear() - 1);
-  contributionCutoff.setUTCHours(0, 0, 0, 0);
-  const hasRecentContribution =
-    github.contributedPubliclySince !== null &&
-    github.contributedPubliclySince >= contributionCutoff;
   if (
     !github.ownsNonForkRepository &&
     !hasRecentContribution &&
@@ -225,36 +387,48 @@ const profileRejection = (input: ProfileInput, github: GitHubVerification) => {
   return null;
 };
 
+const hasRecentPublicContribution = (contributedSince: Date | null) => {
+  if (contributedSince === null) return false;
+  const contributionCutoff = new Date();
+  contributionCutoff.setUTCFullYear(contributionCutoff.getUTCFullYear() - 1);
+  contributionCutoff.setUTCHours(0, 0, 0, 0);
+  return contributedSince >= contributionCutoff;
+};
+
 const profileResult = (
   profile: typeof profiles.$inferSelect,
   links: Array<{ url: string }>,
   statements: Array<{ field: string; value: unknown }>,
   suppressions: Array<{ type: string }>,
-): MemberProfile => ({
-  memberId: profile.memberId!,
-  name: profile.name,
-  currentCompany: profile.currentCompany,
-  professionalLinks: links.map(({ url }) => url),
-  statements: statements.reduce<Record<string, string | string[]>>(
-    (latest, { field, value }) => {
-      if (!(field in latest)) latest[field] = value as string | string[];
-      return latest;
-    },
-    {},
-  ),
-  adultAttestation: profile.adultAttested,
-  privateCodeAttestation: profile.eligibilityBasis === "private_attestation",
-  searchable: profile.searchable,
-  githubAccountId: profile.githubAccountId,
-  githubLogin: profile.githubLogin,
-  eligibilityBasis:
-    profile.eligibilityBasis as MemberProfile["eligibilityBasis"],
-  searchabilityReason:
-    profile.searchabilityReason as MemberProfile["searchabilityReason"],
-  contactSuppressions: suppressions
-    .map(({ type }) => type)
-    .filter(
-      (type): type is MemberProfile["contactSuppressions"][number] =>
-        type === "professional-email" || type === "direct-professional-phone",
+): MemberProfile => {
+  if (profile.memberId === null) throw new Error("profile_member_missing");
+  return {
+    memberId: profile.memberId,
+    name: profile.name,
+    currentCompany: profile.currentCompany,
+    professionalLinks: links.map(({ url }) => url),
+    statements: statements.reduce<Record<string, string | string[]>>(
+      (latest, { field, value }) => {
+        if (!(field in latest)) latest[field] = value as string | string[];
+        return latest;
+      },
+      {},
     ),
-});
+    adultAttestation: profile.adultAttested,
+    privateCodeAttestation: profile.eligibilityBasis === "private_attestation",
+    searchable: profile.searchable,
+    githubAccountId: profile.githubAccountId,
+    githubLogin: profile.githubLogin,
+    eligibilityBasis:
+      profile.eligibilityBasis as MemberProfile["eligibilityBasis"],
+    searchabilityReason:
+      profile.searchabilityReason as MemberProfile["searchabilityReason"],
+    contactSuppressions: suppressions
+      .map(({ type }) => type)
+      .filter(
+        (type): type is MemberProfile["contactSuppressions"][number] =>
+          type === "professional-email" ||
+          type === "direct-professional-phone",
+      ),
+  };
+};

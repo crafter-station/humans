@@ -1,0 +1,4 @@
+packages/database/imports/
+apps/web/playwright/.clerk/
+apps/web/playwright-report/
+apps/web/test-results/

@@ -5,16 +5,21 @@ import {
   eq,
   gte,
   isNull,
+  notExists,
   or,
   sql,
 } from "drizzle-orm";
 
-import { applyCreditEntryInTransaction } from "./credits";
+import { projectPolarSubscriptionEvent } from "./billing";
+import {
+  initializeFreeCreditPeriod,
+  rolloverCreditPeriodInTransaction,
+} from "./credits";
 import {
   memberFreeCreditClaims,
+  members,
   organizationEntitlements,
   organizationMemberships,
-  polarWebhookEvents,
   principalSuspensions,
   securityActivity,
   securityAuditEvents,
@@ -51,12 +56,15 @@ export const activateOrganizationEntitlement = async (
     organizationId: string;
     emailVerified: boolean;
     botProtectionVerified: boolean;
+    now?: Date;
   },
 ) =>
   database.transaction(async (tx) => {
-    await tx.execute(
-      sql`select pg_advisory_xact_lock(hashtext(${input.memberId}))`,
-    );
+    for (const lockId of [
+      `free-credit-member:${input.memberId}`,
+      `free-credit-organization:${input.organizationId}`,
+    ].sort())
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${lockId}))`);
     const [membership] = await tx
       .select({ memberId: organizationMemberships.memberId })
       .from(organizationMemberships)
@@ -70,22 +78,25 @@ export const activateOrganizationEntitlement = async (
       .limit(1);
     if (!membership) throw new AbuseControlError("forbidden");
 
-    const [currentEntitlement] = await tx
-      .select({
-        status: organizationEntitlements.status,
-        tier: organizationEntitlements.tier,
-      })
-      .from(organizationEntitlements)
-      .where(eq(organizationEntitlements.organizationId, input.organizationId))
-      .limit(1);
-    if (currentEntitlement?.status === "active")
+    const now = input.now ?? new Date();
+    const current = await rolloverCreditPeriodInTransaction(
+      tx,
+      input.organizationId,
+      now,
+    );
+    if (current?.status === "active") {
       return {
-        tier:
-          currentEntitlement.tier === "pro"
-            ? ("pro" as const)
-            : ("free" as const),
+        tier: current?.tier === "pro" ? ("pro" as const) : ("free" as const),
         status: "active" as const,
       };
+    }
+
+    if (
+      current?.tier === "pro" &&
+      (current.periodEnd === null ||
+        current.periodEnd.getTime() > now.getTime())
+    )
+      return { tier: "pro" as const, status: current.status };
 
     if (!input.emailVerified || !input.botProtectionVerified)
       throw new AbuseControlError("verification_required");
@@ -98,74 +109,37 @@ export const activateOrganizationEntitlement = async (
       .onConflictDoNothing()
       .returning();
     if (!claim) {
-      const [existing] = await tx
-        .select({ organizationId: memberFreeCreditClaims.organizationId })
+      const [organizationClaim] = await tx
+        .select({ memberId: memberFreeCreditClaims.memberId })
         .from(memberFreeCreditClaims)
-        .where(eq(memberFreeCreditClaims.memberId, input.memberId))
+        .where(eq(memberFreeCreditClaims.organizationId, input.organizationId))
         .limit(1);
-      if (existing?.organizationId !== input.organizationId)
-        throw new AbuseControlError("paid_subscription_required");
+      if (!organizationClaim) {
+        if (current)
+          return {
+            tier: current.tier === "pro" ? ("pro" as const) : ("free" as const),
+            status: current.status,
+          };
+        await tx
+          .insert(organizationEntitlements)
+          .values({
+            organizationId: input.organizationId,
+            tier: "free",
+            status: "inactive",
+          })
+          .onConflictDoNothing();
+        return { tier: "free" as const, status: "inactive" as const };
+      }
     }
-    await tx
-      .insert(organizationEntitlements)
-      .values({
-        organizationId: input.organizationId,
-        tier: "free",
-        status: "active",
-      })
-      .onConflictDoUpdate({
-        target: organizationEntitlements.organizationId,
-        set: { tier: "free", status: "active", updatedAt: new Date() },
-      });
-    await applyCreditEntryInTransaction(tx, {
+    await initializeFreeCreditPeriod(tx, {
       organizationId: input.organizationId,
-      idempotencyKey: `free-activation:${input.memberId}`,
-      kind: "grant",
-      amount: 100,
-      referenceId: input.memberId,
+      memberId: input.memberId,
+      now,
     });
     return { tier: "free" as const, status: "active" as const };
   });
 
-export const setPolarSubscriptionStatus = async (
-  database: DrizzleDatabase,
-  input: {
-    organizationId: string;
-    polarSubscriptionId: string;
-    active: boolean;
-    eventId: string;
-    occurredAt: Date;
-  },
-) => {
-  await database.transaction(async (tx) => {
-    const [event] = await tx
-      .insert(polarWebhookEvents)
-      .values({ id: input.eventId })
-      .onConflictDoNothing()
-      .returning();
-    if (!event) return;
-    await tx
-      .insert(organizationEntitlements)
-      .values({
-        organizationId: input.organizationId,
-        tier: "pro",
-        status: input.active ? "active" : "inactive",
-        polarSubscriptionId: input.polarSubscriptionId,
-        polarEventAt: input.occurredAt,
-      })
-      .onConflictDoUpdate({
-        target: organizationEntitlements.organizationId,
-        set: {
-          tier: "pro",
-          status: input.active ? "active" : "inactive",
-          polarSubscriptionId: input.polarSubscriptionId,
-          polarEventAt: input.occurredAt,
-          updatedAt: new Date(),
-        },
-        setWhere: sql`${organizationEntitlements.polarEventAt} is null or ${organizationEntitlements.polarEventAt} <= ${input.occurredAt}`,
-      });
-  });
-};
+export const setPolarSubscriptionStatus = projectPolarSubscriptionEvent;
 
 export const organizationRevealLimit = async (
   database: DrizzleDatabase | Transaction,
@@ -238,6 +212,35 @@ export const revokeSuspension = async (
     )
     .returning();
   return suspension ?? null;
+};
+
+export const assertMemberActive = async (
+  database: DrizzleDatabase | Transaction,
+  memberId: string,
+) => {
+  const [member] = await database
+    .select({ id: members.clerkId })
+    .from(members)
+    .where(
+      and(
+        eq(members.clerkId, memberId),
+        eq(members.active, true),
+        notExists(
+          database
+            .select({ id: principalSuspensions.id })
+            .from(principalSuspensions)
+            .where(
+              and(
+                eq(principalSuspensions.principalType, "member"),
+                eq(principalSuspensions.principalId, memberId),
+                isNull(principalSuspensions.revokedAt),
+              ),
+            ),
+        ),
+      ),
+    )
+    .limit(1);
+  if (!member) throw new AbuseControlError("forbidden");
 };
 
 export const assertPrincipalActive = async (

@@ -26,6 +26,10 @@ export const creditLedgerEntries = pgTable(
     kind: text("kind").notNull(),
     amount: integer("amount").notNull(),
     referenceId: text("reference_id"),
+    actorType: text("actor_type"),
+    actorId: text("actor_id"),
+    operation: text("operation"),
+    periodStart: timestamp("period_start", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

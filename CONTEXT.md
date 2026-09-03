@@ -12,6 +12,14 @@ _Avoid_: User, participant
 A workspace whose Members share searches, saved lists, and access to Humans.
 _Avoid_: Account, team, tenant
 
+**Company**:
+An employer represented independently from customer Organizations. A Company may have multiple names and stable external identities; a name alone does not establish that two Companies are the same.
+_Avoid_: Organization, account, workspace
+
+**Employment**:
+A sourced relationship between a Profile and a Company, including whether the source presents it as current. Conflicting Employments may coexist and do not replace their source Observations.
+_Avoid_: Organization membership, canonical employer
+
 **Profile**:
 The discoverable representation of an adult who builds with code and has a qualifying personal GitHub account. A Profile may be imported without a corresponding Member or created or claimed by a Member.
 _Avoid_: Participant, contact, candidate, user

@@ -1,20 +1,22 @@
 import {
-  InvalidTikHubPayloadError,
-  TIKHUB_PIPELINE_VERSION,
-  TIKHUB_SNAPSHOT_RETENTION_DAYS,
-  TikHubProviderError,
   type CareerEntry,
   type Collected,
+  InvalidTikHubPayloadError,
+  PermanentTikHubError,
   type ProviderContactCandidate,
   type PublicTikHubObservation,
+  TIKHUB_PIPELINE_VERSION,
+  TIKHUB_SNAPSHOT_RETENTION_DAYS,
+  TikHubCheckpointError,
   type TikHubEnrichmentInput,
   type TikHubEvidence,
   type TikHubObservation,
   type TikHubProfile,
+  type TikHubProvider,
+  TikHubProviderError,
   type TikHubRun,
   type TikHubStage,
   type TikHubStore,
-  type TikHubProvider,
 } from "./types.js";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -22,6 +24,11 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const stringOrNull = (value: unknown, field: string) => {
   if (value === null || typeof value === "string") return value;
+  throw new InvalidTikHubPayloadError(`Invalid ${field}`);
+};
+
+const stringValue = (value: unknown, field: string) => {
+  if (typeof value === "string") return value;
   throw new InvalidTikHubPayloadError(`Invalid ${field}`);
 };
 
@@ -35,10 +42,17 @@ const careerEntries = (value: unknown, field: string): CareerEntry[] => {
       typeof item.organization !== "string"
     )
       throw new InvalidTikHubPayloadError(`Invalid ${field} entry`);
-    for (const key of ["title", "field", "startedAt", "endedAt"] as const)
+    for (const key of [
+      "companyId",
+      "title",
+      "field",
+      "startedAt",
+      "endedAt",
+    ] as const)
       if (item[key] !== undefined && typeof item[key] !== "string")
         throw new InvalidTikHubPayloadError(`Invalid ${field} entry`);
-    const { title, startedAt, endedAt } = item as {
+    const { companyId, title, startedAt, endedAt } = item as {
+      companyId?: string;
       title?: string;
       startedAt?: string;
       endedAt?: string;
@@ -47,6 +61,7 @@ const careerEntries = (value: unknown, field: string): CareerEntry[] => {
     return {
       sourceRecordId: item.sourceRecordId,
       organization: item.organization,
+      ...(companyId === undefined ? {} : { companyId }),
       ...(title === undefined ? {} : { title }),
       ...(educationField === undefined ? {} : { field: educationField }),
       ...(startedAt === undefined ? {} : { startedAt }),
@@ -96,6 +111,14 @@ export const parseTikHubProfile = (payload: unknown): TikHubProfile => {
     sourceRecordId: payload.sourceRecordId,
     headline: stringOrNull(payload.headline, "headline"),
     currentCompany: stringOrNull(payload.currentCompany, "currentCompany"),
+    ...(payload.currentCompanyId === undefined
+      ? {}
+      : {
+          currentCompanyId: stringValue(
+            payload.currentCompanyId,
+            "currentCompanyId",
+          ),
+        }),
     experience: careerEntries(payload.experience, "experience"),
     education: careerEntries(payload.education, "education"),
     skills: payload.skills,
@@ -109,6 +132,9 @@ export const normalizeTikHubEvidence = (
   sourceRecordId: profile.sourceRecordId,
   headline: profile.headline,
   currentCompany: profile.currentCompany,
+  ...(profile.currentCompanyId === undefined
+    ? {}
+    : { currentCompanyId: profile.currentCompanyId }),
   experience: profile.experience,
   education: profile.education,
   skills: profile.skills,
@@ -136,11 +162,12 @@ export const toPublicTikHubObservation = (
 };
 
 export const classifyTikHubError = (error: unknown) => {
-  if (error instanceof InvalidTikHubPayloadError) return "fatal" as const;
+  if (error instanceof PermanentTikHubError) return "fatal" as const;
   if (!(error instanceof TikHubProviderError)) return "retry" as const;
-  if ((error.status === 429 || error.status === 403) && error.retryAfter)
+  if ((error.status === 429 || error.status >= 500) && error.retryAfter)
     return "rate-limit" as const;
-  if (error.status === 429 || error.status >= 500) return "retry" as const;
+  if (error.status === 0 || error.status === 429 || error.status >= 500)
+    return "retry" as const;
   return "fatal" as const;
 };
 
@@ -151,6 +178,24 @@ const complete = (run: TikHubRun, stage: TikHubStage): TikHubRun => ({
     : [...run.completedStages, stage],
   currentStage: null,
 });
+
+const saveProviderCheckpoint = async <T>(
+  store: TikHubStore,
+  runId: string,
+  stage: TikHubStage,
+  value: T,
+  options: { expiresAt: string },
+) => {
+  try {
+    await store.saveCheckpoint(runId, stage, value, options);
+  } catch {
+    try {
+      await store.saveCheckpoint(runId, stage, value, options);
+    } catch {
+      throw new TikHubCheckpointError();
+    }
+  }
+};
 
 const observationsFor = (
   profileId: string,
@@ -268,12 +313,18 @@ export const createTikHubEnrichmentStages = (dependencies: {
         parseTikHubProfile(value);
         const collected = { value, collectedAt: now().toISOString() };
         snapshot = collected;
-        await dependencies.store.saveCheckpoint(run.id, "fetch", collected, {
-          expiresAt: new Date(
-            new Date(collected.collectedAt).getTime() +
-              TIKHUB_SNAPSHOT_RETENTION_DAYS * 86_400_000,
-          ).toISOString(),
-        });
+        await saveProviderCheckpoint(
+          dependencies.store,
+          run.id,
+          "fetch",
+          collected,
+          {
+            expiresAt: new Date(
+              new Date(collected.collectedAt).getTime() +
+                TIKHUB_SNAPSHOT_RETENTION_DAYS * 86_400_000,
+            ).toISOString(),
+          },
+        );
       }
       run = complete(run, "fetch");
       await dependencies.store.saveRun(run);
@@ -352,8 +403,12 @@ export const createTikHubEnrichmentStages = (dependencies: {
     error: unknown,
   ) => {
     const run = await dependencies.store.getRun(input.runId);
-    if (!run || run.status !== "running") return;
+    if (run?.status !== "running") return;
     const finishedAt = now().toISOString();
+    await dependencies.store.markTikHubObservationsStale(
+      input.profileId,
+      finishedAt,
+    );
     await dependencies.store.saveRun({
       ...run,
       status: "failed",

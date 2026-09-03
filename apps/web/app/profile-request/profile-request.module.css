@@ -1,0 +1,142 @@
+.page {
+  min-height: 100svh;
+  padding: 28px 5vw 64px;
+  color: var(--foreground);
+  background: var(--background);
+}
+
+.nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.wordmark {
+  font-size: 1.35rem;
+  font-weight: 750;
+  letter-spacing: -0.05em;
+}
+
+.back {
+  padding-bottom: 3px;
+  border-bottom: 1px solid currentColor;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 0.7fr);
+  gap: clamp(48px, 9vw, 140px);
+  align-items: start;
+  max-width: 1280px;
+  padding-top: clamp(70px, 12vh, 130px);
+}
+
+.eyebrow {
+  margin-bottom: 22px;
+  color: var(--muted-foreground);
+  font: 650 0.73rem / 1 var(--font-geist-mono);
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.intro h1 {
+  max-width: 780px;
+  font-size: clamp(3.7rem, 8vw, 7rem);
+  font-weight: 570;
+  letter-spacing: -0.07em;
+  line-height: 0.9;
+}
+
+.intro > p {
+  max-width: 620px;
+  margin-top: 34px;
+  font-size: 1.1rem;
+  line-height: 1.6;
+}
+
+.intro aside {
+  max-width: 540px;
+  margin-top: 42px;
+  padding: 18px 0 0 76px;
+  color: var(--muted-foreground);
+  border-top: 1px solid var(--border);
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+
+.form {
+  display: grid;
+  gap: 20px;
+  padding: 28px;
+  color: var(--card-foreground);
+  background: var(--card);
+  border: 1px solid var(--border);
+}
+
+.form label {
+  display: grid;
+  gap: 8px;
+  font-size: 0.86rem;
+}
+
+.form input,
+.form select,
+.form textarea {
+  width: 100%;
+  padding: 13px 14px;
+  color: var(--foreground);
+  background: var(--background);
+  border: 1px solid var(--input);
+  border-radius: var(--radius-sm);
+  font: inherit;
+}
+
+.form textarea {
+  resize: vertical;
+}
+
+.form label span {
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+.form button {
+  padding: 14px 18px;
+  color: var(--primary-foreground);
+  background: var(--primary);
+  border: 0;
+  font: 700 0.9rem / 1 var(--font-geist-sans);
+  cursor: pointer;
+}
+
+.form button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.form > p {
+  color: var(--foreground);
+  line-height: 1.5;
+}
+
+@media (max-width: 780px) {
+  .page {
+    padding: 20px 20px 40px;
+  }
+
+  .layout {
+    grid-template-columns: 1fr;
+    padding-top: 70px;
+  }
+
+  .intro aside {
+    padding-left: 0;
+  }
+
+  .form {
+    padding: 22px;
+  }
+}

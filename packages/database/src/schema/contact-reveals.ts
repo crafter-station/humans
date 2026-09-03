@@ -32,9 +32,7 @@ export const contactDetailInvalidations = pgTable(
   "contact_detail_invalidations",
   {
     observationId: text("observation_id").primaryKey(),
-    reportedBy: text("reported_by")
-      .notNull()
-      .references(() => members.clerkId),
+    reportedBy: text("reported_by").references(() => members.clerkId),
     reason: text("reason").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()

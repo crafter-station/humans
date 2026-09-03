@@ -1,4 +1,5 @@
 import { PostgreSqlContainer } from "@testcontainers/postgresql";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { Effect } from "effect";
@@ -97,6 +98,436 @@ describe("Profile search", () => {
     expect(result.results[0]).not.toHaveProperty("score");
   });
 
+  it("resolves field aliases before applying Member Statement precedence", async () => {
+    const profileId = "statement-precedence";
+    try {
+      await database.insert(schema.profiles).values({
+        profileId,
+        name: "Alias Profile",
+        currentCompany: null,
+        githubAccountId: "91001",
+        githubLogin: "statement-precedence",
+        eligibilityBasis: "owned_repository",
+        adultAttested: true,
+        searchable: true,
+        searchabilityReason: "approved_import",
+      });
+      await database.insert(schema.profileObservations).values({
+        profileId,
+        field: "github-normalization",
+        value: {
+          roles: ["Provider Engineer"],
+          location: "Provider Location",
+          current_residence: "Provider Residence",
+          current_company: "Provider Company",
+          opportunity_status: "not_open",
+        },
+        source: "provider-normalization",
+        sourceRecordId: "statement-precedence:normalization",
+        pipelineVersion: "provider-v1",
+        confidence: 1,
+        collectedAt: new Date("2026-08-30T00:00:00Z"),
+      });
+      await database.insert(schema.memberStatements).values([
+        {
+          id: "statement-precedence-role",
+          profileId,
+          field: "role",
+          value: "Member Architect",
+          source: "member",
+          pipelineVersion: "member-v1",
+          confidence: 1,
+          collectedAt: new Date("2026-08-20T00:00:00Z"),
+        },
+        {
+          id: "statement-precedence-residence-old",
+          profileId,
+          field: "currentResidence",
+          value: "Older Member Residence",
+          source: "member",
+          pipelineVersion: "member-v1",
+          confidence: 1,
+          collectedAt: new Date("2026-08-20T00:00:00Z"),
+        },
+        {
+          id: "statement-precedence-residence-new",
+          profileId,
+          field: "location",
+          value: "Quito, Ecuador",
+          source: "member",
+          pipelineVersion: "member-v1",
+          confidence: 1,
+          collectedAt: new Date("2026-08-21T00:00:00Z"),
+        },
+        {
+          id: "statement-precedence-company",
+          profileId,
+          field: "currentCompany",
+          value: "Member Company",
+          source: "member",
+          pipelineVersion: "member-v1",
+          confidence: 1,
+          collectedAt: new Date("2026-08-20T00:00:00Z"),
+        },
+        {
+          id: "statement-precedence-opportunity",
+          profileId,
+          field: "opportunityStatus",
+          value: "open",
+          source: "member",
+          pipelineVersion: "member-v1",
+          confidence: 1,
+          collectedAt: new Date("2026-08-20T00:00:00Z"),
+        },
+      ]);
+
+      await expect(getSearchableProfile(database, profileId)).resolves.toEqual(
+        expect.objectContaining({
+          profileId,
+          primaryRole: "Member Architect",
+          currentResidence: "Quito, Ecuador",
+          currentCompany: "Member Company",
+          opportunityStatus: "open",
+        }),
+      );
+      const result = await searchProfiles(database, {
+        roles: ["member architect"],
+        currentResidences: ["quito"],
+        companies: ["member company"],
+        opportunityStatuses: ["open"],
+      });
+      expect(result.results.map(({ profileId: id }) => id)).toContain(
+        profileId,
+      );
+    } finally {
+      await database
+        .delete(schema.memberStatements)
+        .where(eq(schema.memberStatements.profileId, profileId));
+      await database
+        .delete(schema.profileObservations)
+        .where(eq(schema.profileObservations.profileId, profileId));
+      await database
+        .delete(schema.profiles)
+        .where(eq(schema.profiles.profileId, profileId));
+    }
+  });
+
+  it("projects TikHub LinkedIn career evidence into imported Profile search", async () => {
+    const profileId = "tikhub-career-projection";
+    try {
+      await database.insert(schema.profiles).values({
+        profileId,
+        name: "TikHub Profile",
+        currentCompany: null,
+        githubAccountId: "91002",
+        githubLogin: "tikhub-career-projection",
+        eligibilityBasis: "owned_repository",
+        adultAttested: true,
+        searchable: true,
+        searchabilityReason: "approved_import",
+      });
+      await database.insert(schema.profileObservations).values({
+        profileId,
+        field: "linkedin-career",
+        value: {
+          sourceRecordId: "linkedin:91002",
+          headline: "Founder and Engineer",
+          currentCompany: "Zabio (SureFX)",
+          experience: [],
+          education: [],
+          skills: ["TypeScript"],
+        },
+        source: "tikhub",
+        sourceRecordId: "linkedin:91002",
+        pipelineVersion: "tikhub-linkedin-v1",
+        confidence: 1,
+        collectedAt: new Date("2026-09-03T00:00:00Z"),
+      });
+      await database.insert(schema.profileObservations).values({
+        profileId,
+        field: "headline",
+        value: "Fallback headline",
+        source: "deepline",
+        sourceRecordId: "deepline:headline:91002",
+        pipelineVersion: "deepline-fallback-v1",
+        confidence: 1,
+        collectedAt: new Date("2026-09-03T00:30:00Z"),
+      });
+
+      await expect(getSearchableProfile(database, profileId)).resolves.toEqual(
+        expect.objectContaining({
+          headline: "Founder and Engineer",
+          currentCompany: "Zabio (SureFX)",
+          skills: ["TypeScript"],
+        }),
+      );
+      const result = await searchProfiles(database, {
+        companies: ["Zabio (SureFX)"],
+      });
+      expect(result.results.map(({ profileId: id }) => id)).toContain(
+        profileId,
+      );
+
+      await database
+        .update(schema.profiles)
+        .set({ currentCompany: "Zabio (SureFX)" })
+        .where(eq(schema.profiles.profileId, profileId));
+      await database.insert(schema.profileObservations).values({
+        profileId,
+        field: "current_company",
+        value: sql`'null'::jsonb`,
+        source: "public-profile-request",
+        sourceRecordId: "cleared-company:91002",
+        pipelineVersion: "public-request-v1",
+        confidence: 1,
+        collectedAt: new Date("2026-09-03T00:45:00Z"),
+      });
+      await expect(getSearchableProfile(database, profileId)).resolves.toEqual(
+        expect.objectContaining({
+          headline: "Founder and Engineer",
+          currentCompany: null,
+          skills: ["TypeScript"],
+        }),
+      );
+      const clearedResult = await searchProfiles(database, {
+        companies: ["Zabio (SureFX)"],
+      });
+      expect(
+        clearedResult.results.map(({ profileId: id }) => id),
+      ).not.toContain(profileId);
+
+      await database
+        .update(schema.profileObservations)
+        .set({ staleAt: new Date("2026-09-03T01:00:00Z") })
+        .where(
+          and(
+            eq(schema.profileObservations.profileId, profileId),
+            inArray(schema.profileObservations.source, ["tikhub", "deepline"]),
+          ),
+        );
+      await expect(getSearchableProfile(database, profileId)).resolves.toEqual(
+        expect.objectContaining({
+          headline: null,
+          currentCompany: null,
+          skills: [],
+        }),
+      );
+      const staleResult = await searchProfiles(database, {
+        companies: ["Zabio (SureFX)"],
+      });
+      expect(staleResult.results.map(({ profileId: id }) => id)).not.toContain(
+        profileId,
+      );
+    } finally {
+      await database
+        .delete(schema.profileObservations)
+        .where(eq(schema.profileObservations.profileId, profileId));
+      await database
+        .delete(schema.profiles)
+        .where(eq(schema.profiles.profileId, profileId));
+    }
+  });
+
+  it("uses fallback evidence when direct providers returned missing values", async () => {
+    const profileId = "missing-direct-fallback-projection";
+    try {
+      await database.insert(schema.profiles).values({
+        profileId,
+        name: "Fallback Profile",
+        currentCompany: "Imported Company",
+        githubAccountId: "91003",
+        githubLogin: "missing-direct-fallback",
+        eligibilityBasis: "owned_repository",
+        adultAttested: true,
+        searchable: true,
+        searchabilityReason: "approved_import",
+      });
+      await database.insert(schema.profileObservations).values([
+        {
+          profileId,
+          field: "linkedin-career",
+          value: {
+            sourceRecordId: "linkedin:91003",
+            headline: null,
+            currentCompany: null,
+            experience: [],
+            education: [],
+            skills: [],
+          },
+          source: "tikhub",
+          sourceRecordId: "linkedin:91003",
+          pipelineVersion: "tikhub-linkedin-v1",
+          confidence: 1,
+        },
+        {
+          profileId,
+          field: "github-normalization",
+          value: { roles: [], skills: [], summary: "" },
+          source: "github-ai-normalization",
+          sourceRecordId: "github:91003:normalization",
+          pipelineVersion: "github-v1",
+          confidence: 1,
+        },
+        {
+          profileId,
+          field: "headline",
+          value: "Fallback headline",
+          source: "deepline",
+          sourceRecordId: "deepline:headline:91003",
+          pipelineVersion: "deepline-fallback-v1",
+          confidence: 0.8,
+        },
+        {
+          profileId,
+          field: "skills",
+          value: ["Rust"],
+          source: "deepline",
+          sourceRecordId: "deepline:skills:91003",
+          pipelineVersion: "deepline-fallback-v1",
+          confidence: 0.8,
+        },
+        {
+          profileId,
+          field: "currentPosition",
+          value: [
+            {
+              companyName: "Fallback Company",
+              position: "Principal Engineer",
+            },
+          ],
+          source: "deepline",
+          sourceRecordId: "deepline:position:91003",
+          pipelineVersion: "deepline-fallback-v1",
+          confidence: 0.8,
+        },
+      ]);
+
+      await expect(getSearchableProfile(database, profileId)).resolves.toEqual(
+        expect.objectContaining({
+          headline: "Fallback headline",
+          currentCompany: "Fallback Company",
+          primaryRole: "Principal Engineer",
+          skills: ["Rust"],
+        }),
+      );
+
+      await database.insert(schema.profileObservations).values({
+        profileId,
+        field: "github-normalization",
+        value: {
+          roles: ["Maintainer"],
+          skills: ["TypeScript"],
+          summary: "Direct GitHub summary",
+        },
+        source: "github-ai-normalization",
+        sourceRecordId: "github:91003:complete-normalization",
+        pipelineVersion: "github-v1",
+        confidence: 1,
+      });
+      await expect(getSearchableProfile(database, profileId)).resolves.toEqual(
+        expect.objectContaining({
+          headline: "Direct GitHub summary",
+          primaryRole: "Maintainer",
+          skills: ["TypeScript"],
+        }),
+      );
+
+      await database.insert(schema.profileObservations).values([
+        {
+          profileId,
+          field: "github-account",
+          value: { company: "Earlier Direct Company" },
+          source: "github",
+          sourceRecordId: "github:91003:earlier-account",
+          pipelineVersion: "github-v1",
+          confidence: 1,
+          collectedAt: new Date("2026-09-01T00:00:00.000Z"),
+        },
+        {
+          profileId,
+          field: "github-account",
+          value: { company: "Latest Direct Company" },
+          source: "github",
+          sourceRecordId: "github:91003:latest-account",
+          pipelineVersion: "github-v1",
+          confidence: 1,
+          collectedAt: new Date("2026-09-02T00:00:00.000Z"),
+        },
+      ]);
+      await expect(getSearchableProfile(database, profileId)).resolves.toEqual(
+        expect.objectContaining({ currentCompany: "Latest Direct Company" }),
+      );
+    } finally {
+      await database
+        .delete(schema.profileObservations)
+        .where(eq(schema.profileObservations.profileId, profileId));
+      await database
+        .delete(schema.profiles)
+        .where(eq(schema.profiles.profileId, profileId));
+    }
+  });
+
+  it("keeps controlled Profile name and currentCompany authoritative in search", async () => {
+    const memberId = "member-search-precedence";
+    const profileId = "controlled-search-precedence";
+    try {
+      await database.insert(schema.members).values({ clerkId: memberId });
+      await database.insert(schema.profiles).values({
+        profileId,
+        memberId,
+        name: "PUT Name",
+        currentCompany: null,
+        githubAccountId: "91002",
+        githubLogin: "controlled-search-precedence",
+        eligibilityBasis: "owned_repository",
+        adultAttested: true,
+        searchable: true,
+        searchabilityReason: "member_opt_in",
+      });
+      await database.insert(schema.profileObservations).values({
+        profileId,
+        field: "github-normalization",
+        value: {
+          name: "Provider Name",
+          current_company: "Provider Company",
+        },
+        source: "provider-normalization",
+        sourceRecordId: "controlled-search-precedence:normalization",
+        pipelineVersion: "provider-v1",
+        confidence: 1,
+      });
+
+      await expect(getSearchableProfile(database, profileId)).resolves.toEqual(
+        expect.objectContaining({
+          profileId,
+          name: "PUT Name",
+          currentCompany: null,
+        }),
+      );
+      const putValue = await searchProfiles(database, { query: "PUT Name" });
+      expect(putValue.results.map(({ profileId: id }) => id)).toContain(
+        profileId,
+      );
+      const providerValues = await searchProfiles(database, {
+        query: "Provider Name",
+        companies: ["Provider Company"],
+      });
+      expect(
+        providerValues.results.map(({ profileId: id }) => id),
+      ).not.toContain(profileId);
+    } finally {
+      await database
+        .delete(schema.profileObservations)
+        .where(eq(schema.profileObservations.profileId, profileId));
+      await database
+        .delete(schema.profiles)
+        .where(eq(schema.profiles.profileId, profileId));
+      await database
+        .delete(schema.members)
+        .where(eq(schema.members.clerkId, memberId));
+    }
+  });
+
   it("excludes non-searchable and suppressed Profiles from search and detail", async () => {
     const result = await searchProfiles(database, {});
     expect(result.results.map(({ profileId }) => profileId)).not.toEqual(
@@ -116,15 +547,20 @@ describe("Profile search", () => {
     );
     expect(first.results).toHaveLength(2);
     expect(first.nextCursor).not.toBeNull();
+    const firstCursor = first.nextCursor;
+    if (firstCursor === null) throw new Error("Expected a search cursor");
     const second = await searchProfiles(
       database,
       {},
       {
-        cursor: first.nextCursor!,
+        cursor: firstCursor,
         pageSize: 1,
         now: new Date("2026-09-01T12:01:00Z"),
       },
     );
+    const secondCursor = second.nextCursor;
+    if (secondCursor === null)
+      throw new Error("Expected a second search cursor");
     expect(second.results.map(({ profileId }) => profileId)).not.toEqual(
       expect.arrayContaining(first.results.map(({ profileId }) => profileId)),
     );
@@ -133,7 +569,7 @@ describe("Profile search", () => {
         database,
         {},
         {
-          cursor: second.nextCursor!,
+          cursor: secondCursor,
           pageSize: 1,
           now: new Date("2026-09-01T12:16:00Z"),
         },
@@ -143,7 +579,7 @@ describe("Profile search", () => {
       searchProfiles(
         database,
         { skills: ["rust"] },
-        { cursor: first.nextCursor!, now: new Date("2026-09-01T12:01:00Z") },
+        { cursor: firstCursor, now: new Date("2026-09-01T12:01:00Z") },
       ),
     ).rejects.toBeInstanceOf(InvalidSearchCursor);
     await expect(
@@ -151,7 +587,7 @@ describe("Profile search", () => {
         database,
         {},
         {
-          cursor: `${first.nextCursor!.slice(0, -1)}x`,
+          cursor: `${firstCursor[0] === "A" ? "B" : "A"}${firstCursor.slice(1)}`,
           now: new Date("2026-09-01T12:01:00Z"),
         },
       ),
@@ -160,7 +596,7 @@ describe("Profile search", () => {
       searchProfiles(
         database,
         {},
-        { cursor: first.nextCursor!, now: new Date("2026-09-01T12:16:00Z") },
+        { cursor: firstCursor, now: new Date("2026-09-01T12:16:00Z") },
       ),
     ).rejects.toBeInstanceOf(InvalidSearchCursor);
     await expect(
@@ -214,12 +650,15 @@ describe("Profile search", () => {
       pageSize: 1,
     });
     expect(await getCreditBalance(database, "organization_search")).toBe(1);
+    const nextCursor = first.page.nextCursor;
+    if (nextCursor === null)
+      throw new Error("Expected a charged search cursor");
 
     await runChargedProfileSearch(database, {
       organizationId: "organization_search",
       idempotencyKey: "search:second",
       filters: { skills: ["typescript"] },
-      cursor: first.page.nextCursor!,
+      cursor: nextCursor,
       pageSize: 1,
     });
     expect(await getCreditBalance(database, "organization_search")).toBe(0);
@@ -272,7 +711,7 @@ describe("Profile search", () => {
         profileId: `reachable-${index.toString().padStart(4, "0")}`,
         name: `Reachable ${index.toString().padStart(4, "0")}`,
         currentCompany: null,
-        githubAccountId: `reachable-github-${index}`,
+        githubAccountId: String(94_000 + index),
         githubLogin: `reachable-${index}`,
         eligibilityBasis: "owned_repository",
         adultAttested: true,
@@ -313,7 +752,7 @@ const seedSearchProfiles = async (
       profileId: "ana",
       name: "Ana Rios",
       currentCompany: "Acme",
-      githubAccountId: "s1",
+      githubAccountId: "92001",
       githubLogin: "ana",
       searchable: true,
       updatedAt: new Date("2026-08-20"),
@@ -323,7 +762,7 @@ const seedSearchProfiles = async (
       profileId: "bea",
       name: "Bea Mora",
       currentCompany: "Beta",
-      githubAccountId: "s2",
+      githubAccountId: "92002",
       githubLogin: "bea",
       searchable: true,
       updatedAt: new Date("2026-08-10"),
@@ -333,7 +772,7 @@ const seedSearchProfiles = async (
       profileId: "carla",
       name: "Carla Luz",
       currentCompany: "Cloud",
-      githubAccountId: "s3",
+      githubAccountId: "92003",
       githubLogin: "carla",
       searchable: true,
       updatedAt: new Date("2026-08-30"),
@@ -343,7 +782,7 @@ const seedSearchProfiles = async (
       profileId: "diego",
       name: "Diego Paz",
       currentCompany: "Delta",
-      githubAccountId: "s4",
+      githubAccountId: "92004",
       githubLogin: "diego",
       searchable: true,
       updatedAt: new Date("2026-08-29"),
@@ -353,7 +792,7 @@ const seedSearchProfiles = async (
       profileId: "suppressed",
       name: "Suppressed",
       currentCompany: null,
-      githubAccountId: "s5",
+      githubAccountId: "92005",
       githubLogin: "suppressed",
       searchable: true,
       updatedAt: new Date("2026-08-29"),
@@ -363,7 +802,7 @@ const seedSearchProfiles = async (
       profileId: "private",
       name: "Private",
       currentCompany: null,
-      githubAccountId: "s6",
+      githubAccountId: "92006",
       githubLogin: "private",
       searchable: false,
       updatedAt: new Date("2026-08-29"),
@@ -441,7 +880,7 @@ const seedSearchProfiles = async (
   });
   await database.insert(schema.suppressionRecords).values({
     canonicalProvider: "github",
-    canonicalProviderId: "s5",
+    canonicalProviderId: "92005",
     reason: "person_requested_removal",
   });
 };

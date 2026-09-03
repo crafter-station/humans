@@ -1,8 +1,7 @@
 import { Context, type Effect } from "effect";
-
-import type { runChargedProfileSearch } from "../charged-search";
 import type {
   activateOrganizationEntitlement,
+  assertMemberActive,
   assertPrincipalActive,
   recordSecurityActivity,
   recordSecurityAudit,
@@ -10,6 +9,12 @@ import type {
   setPolarSubscriptionStatus,
   suspendPrincipal,
 } from "../abuse-controls";
+import type {
+  getBillingCustomerSeed,
+  getOrganizationBillingOverview,
+  recordPolarCustomer,
+} from "../billing";
+import type { runChargedProfileSearch } from "../charged-search";
 import type {
   ContactDetailType,
   getOrganizationContactRevealPolicy,
@@ -23,28 +28,42 @@ import type {
   adjustCreditsAsOperator,
   getOperatorOverview,
   recordOperatorAudit,
+  redriveCreditUsageAsOperator,
   retryReconciliationAsOperator,
-  revokeSuspensionAsOperator,
   reviewClaimAsOperator,
   reviewRequestAsOperator,
+  revokeSuspensionAsOperator,
   suppressProfileAsOperator,
   suspendPrincipalAsOperator,
+  verifyRequestAsOperator,
 } from "../operations";
 import type {
-  getSearchableProfile,
-  listProfileSearchFacets,
-  searchProfiles,
-  ProfileSearchFilters,
-} from "../search-profiles";
+  CanonicalIdentityVerification,
+  editControlledProfile,
+  findClaimCandidates,
+  getMemberProfileClaim,
+  requestProfileClaim,
+  setMemberStatements,
+  setProfileSearchability,
+  submitPublicProfileRequest,
+  suppressKnownMinorProfile,
+} from "../profile-control";
 import type {
   createSavedList,
   listSavedLists,
   renameSavedList,
 } from "../saved-lists";
 import type {
+  getSearchableProfile,
+  listProfileSearchFacets,
+  ProfileSearchFilters,
+  searchProfiles,
+} from "../search-profiles";
+import type {
   AbuseControlRejected,
   ContactRevealRejected,
   DatabaseUnavailable,
+  ProfileControlRejected,
   ProfileRejected,
   SearchChargeRejected,
   SearchRejected,
@@ -71,6 +90,9 @@ export class Database extends Context.Service<
     readonly assertPrincipalActive: (
       input: Parameters<typeof assertPrincipalActive>[1],
     ) => Effect.Effect<void, DatabaseUnavailable | AbuseControlRejected>;
+    readonly assertMemberActive: (
+      memberId: Parameters<typeof assertMemberActive>[1],
+    ) => Effect.Effect<void, DatabaseUnavailable | AbuseControlRejected>;
     readonly check: Effect.Effect<void, DatabaseUnavailable>;
     readonly projectClerkEvent: (
       event: ClerkProjectionEvent,
@@ -79,6 +101,24 @@ export class Database extends Context.Service<
       memberId: string,
       organizationId: string,
     ) => Effect.Effect<Workspace, DatabaseUnavailable | WorkspaceForbidden>;
+    readonly getBillingCustomerSeed: (
+      input: Parameters<typeof getBillingCustomerSeed>[1],
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof getBillingCustomerSeed>>,
+      DatabaseUnavailable
+    >;
+    readonly getOrganizationBillingOverview: (
+      organizationId: string,
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof getOrganizationBillingOverview>>,
+      DatabaseUnavailable
+    >;
+    readonly recordPolarCustomer: (
+      input: Parameters<typeof recordPolarCustomer>[1],
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof recordPolarCustomer>>,
+      DatabaseUnavailable
+    >;
     readonly getOperatorOverview: () => Effect.Effect<
       Awaited<ReturnType<typeof getOperatorOverview>>,
       DatabaseUnavailable
@@ -143,6 +183,17 @@ export class Database extends Context.Service<
       Awaited<ReturnType<typeof retryReconciliationAsOperator>>,
       DatabaseUnavailable
     >;
+    readonly redriveCreditUsageAsOperator: (
+      ...input: Parameters<typeof redriveCreditUsageAsOperator> extends [
+        unknown,
+        ...infer Rest,
+      ]
+        ? Rest
+        : never
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof redriveCreditUsageAsOperator>>,
+      DatabaseUnavailable
+    >;
     readonly suspendPrincipalAsOperator: (
       ...input: Parameters<typeof suspendPrincipalAsOperator> extends [
         unknown,
@@ -165,6 +216,17 @@ export class Database extends Context.Service<
       Awaited<ReturnType<typeof revokeSuspensionAsOperator>>,
       DatabaseUnavailable
     >;
+    readonly verifyRequestAsOperator: (
+      ...input: Parameters<typeof verifyRequestAsOperator> extends [
+        unknown,
+        ...infer Rest,
+      ]
+        ? Rest
+        : never
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof verifyRequestAsOperator>>,
+      DatabaseUnavailable
+    >;
     readonly provisionWorkspace: (
       memberId: string,
       provision: () => Promise<ProvisionedWorkspace>,
@@ -176,10 +238,55 @@ export class Database extends Context.Service<
       memberId: string,
       input: ProfileInput,
       github: GitHubVerification,
+      canonicalIdentityVerification?: CanonicalIdentityVerification,
     ) => Effect.Effect<MemberProfile, DatabaseUnavailable | ProfileRejected>;
     readonly disableProfileSearchability: (
       memberId: string,
     ) => Effect.Effect<MemberProfile, DatabaseUnavailable | ProfileRejected>;
+    readonly editControlledProfile: (
+      input: Parameters<typeof editControlledProfile>[1],
+    ) => Effect.Effect<void, DatabaseUnavailable | ProfileControlRejected>;
+    readonly findClaimCandidates: (
+      identity: Parameters<typeof findClaimCandidates>[1],
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof findClaimCandidates>>,
+      DatabaseUnavailable
+    >;
+    readonly getMemberProfileClaim: (
+      memberId: string,
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof getMemberProfileClaim>>,
+      DatabaseUnavailable
+    >;
+    readonly requestProfileClaim: (
+      input: Parameters<typeof requestProfileClaim>[1],
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof requestProfileClaim>>,
+      DatabaseUnavailable | ProfileControlRejected
+    >;
+    readonly setMemberStatements: (
+      input: Parameters<typeof setMemberStatements>[1],
+    ) => Effect.Effect<void, DatabaseUnavailable | ProfileControlRejected>;
+    readonly setProfileSearchability: (
+      memberId: string,
+      searchable: boolean,
+      verification?: GitHubVerification,
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof setProfileSearchability>>,
+      DatabaseUnavailable | ProfileControlRejected
+    >;
+    readonly suppressKnownMinorProfile: (
+      githubAccountId: string,
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof suppressKnownMinorProfile>>,
+      DatabaseUnavailable | ProfileControlRejected
+    >;
+    readonly submitPublicProfileRequest: (
+      input: Parameters<typeof submitPublicProfileRequest>[1],
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof submitPublicProfileRequest>>,
+      DatabaseUnavailable | ProfileControlRejected
+    >;
     readonly searchProfiles: (
       filters: ProfileSearchFilters,
       options?: { cursor?: string; pageSize?: number },
@@ -193,6 +300,9 @@ export class Database extends Context.Service<
       filters: ProfileSearchFilters;
       cursor?: string;
       pageSize?: number;
+      memberId?: string;
+      apiKeyId?: string;
+      source?: "web" | "api" | "mcp";
     }) => Effect.Effect<
       Awaited<ReturnType<typeof runChargedProfileSearch>>["page"],
       DatabaseUnavailable | SearchRejected | SearchChargeRejected
@@ -258,7 +368,10 @@ export class Database extends Context.Service<
     >;
     readonly setPolarSubscriptionStatus: (
       input: Parameters<typeof setPolarSubscriptionStatus>[1],
-    ) => Effect.Effect<void, DatabaseUnavailable>;
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof setPolarSubscriptionStatus>>,
+      DatabaseUnavailable
+    >;
     readonly suspendPrincipal: (
       input: Parameters<typeof suspendPrincipal>[1],
     ) => Effect.Effect<

@@ -1,10 +1,9 @@
 import { sql } from "drizzle-orm";
 import { Effect, Layer } from "effect";
-
-import { runChargedProfileSearch } from "../charged-search";
 import {
   AbuseControlError,
   activateOrganizationEntitlement,
+  assertMemberActive,
   assertPrincipalActive,
   recordSecurityActivity,
   recordSecurityAudit,
@@ -12,6 +11,12 @@ import {
   setPolarSubscriptionStatus,
   suspendPrincipal,
 } from "../abuse-controls";
+import { runChargedProfileSearch } from "../charged-search";
+import {
+  getBillingCustomerSeed,
+  getOrganizationBillingOverview,
+  recordPolarCustomer,
+} from "../billing";
 import {
   ContactRevealError,
   getOrganizationContactRevealPolicy,
@@ -26,20 +31,26 @@ import {
   adjustCreditsAsOperator,
   getOperatorOverview,
   recordOperatorAudit,
+  redriveCreditUsageAsOperator,
   retryReconciliationAsOperator,
-  revokeSuspensionAsOperator,
   reviewClaimAsOperator,
   reviewRequestAsOperator,
+  revokeSuspensionAsOperator,
   suppressProfileAsOperator,
   suspendPrincipalAsOperator,
+  verifyRequestAsOperator,
 } from "../operations";
 import {
-  getSearchableProfile,
-  InvalidSearchCursor,
-  listProfileSearchFacets,
-  searchProfiles,
-  type ProfileSearchFilters,
-} from "../search-profiles";
+  editControlledProfile,
+  findClaimCandidates,
+  getMemberProfileClaim,
+  ProfileControlError,
+  requestProfileClaim,
+  setMemberStatements,
+  setProfileSearchability,
+  suppressKnownMinorProfile,
+  submitPublicProfileRequest,
+} from "../profile-control";
 import {
   addSavedListEntry,
   createSavedList,
@@ -49,12 +60,20 @@ import {
   renameSavedList,
   updateSavedListEntryNote,
 } from "../saved-lists";
+import {
+  getSearchableProfile,
+  InvalidSearchCursor,
+  listProfileSearchFacets,
+  type ProfileSearchFilters,
+  searchProfiles,
+} from "../search-profiles";
 import { makeClerkService } from "./clerk";
 import { Database } from "./context";
 import {
   AbuseControlRejected,
   ContactRevealRejected,
   DatabaseUnavailable,
+  ProfileControlRejected,
   SearchChargeRejected,
   SearchRejected,
 } from "./errors";
@@ -66,6 +85,7 @@ export {
   AbuseControlRejected,
   ContactRevealRejected,
   DatabaseUnavailable,
+  ProfileControlRejected,
   ProfileRejected,
   SearchChargeRejected,
   SearchRejected,
@@ -122,6 +142,9 @@ export const makeDatabaseService = (
     filters: ProfileSearchFilters;
     cursor?: string;
     pageSize?: number;
+    memberId?: string;
+    apiKeyId?: string;
+    source?: "web" | "api" | "mcp";
   }) =>
     Effect.tryPromise({
       try: async () =>
@@ -163,18 +186,75 @@ export const makeDatabaseService = (
           : new DatabaseUnavailable({ cause }),
     }).pipe(Effect.withSpan(name));
 
+  const profileControl = <A>(name: string, operation: () => Promise<A>) =>
+    Effect.tryPromise({
+      try: operation,
+      catch: (cause) =>
+        cause instanceof ProfileControlError
+          ? new ProfileControlRejected({ reason: cause.code })
+          : new DatabaseUnavailable({ cause }),
+    }).pipe(Effect.withSpan(name));
+
   return Database.of({
     activateOrganizationEntitlement: (input) =>
       abuse("Database.activateOrganizationEntitlement", () =>
         activateOrganizationEntitlement(database, input),
+      ),
+    assertMemberActive: (memberId) =>
+      abuse("Database.assertMemberActive", () =>
+        assertMemberActive(database, memberId),
       ),
     assertPrincipalActive: (input) =>
       abuse("Database.assertPrincipalActive", () =>
         assertPrincipalActive(database, input),
       ),
     check,
+    getBillingCustomerSeed: (input) =>
+      saved("Database.getBillingCustomerSeed", () =>
+        getBillingCustomerSeed(database, input),
+      ),
+    getOrganizationBillingOverview: (organizationId) =>
+      saved("Database.getOrganizationBillingOverview", () =>
+        getOrganizationBillingOverview(database, organizationId),
+      ),
+    recordPolarCustomer: (input) =>
+      saved("Database.recordPolarCustomer", () =>
+        recordPolarCustomer(database, input),
+      ),
     ...makeClerkService(database),
     ...makeProfileService(database),
+    editControlledProfile: (input) =>
+      profileControl("Database.editControlledProfile", () =>
+        editControlledProfile(database, input),
+      ),
+    findClaimCandidates: (identity) =>
+      saved("Database.findClaimCandidates", () =>
+        findClaimCandidates(database, identity),
+      ),
+    getMemberProfileClaim: (memberId) =>
+      saved("Database.getMemberProfileClaim", () =>
+        getMemberProfileClaim(database, memberId),
+      ),
+    requestProfileClaim: (input) =>
+      profileControl("Database.requestProfileClaim", () =>
+        requestProfileClaim(database, input),
+      ),
+    setMemberStatements: (input) =>
+      profileControl("Database.setMemberStatements", () =>
+        setMemberStatements(database, input),
+      ),
+    setProfileSearchability: (memberId, searchable, verification) =>
+      profileControl("Database.setProfileSearchability", () =>
+        setProfileSearchability(database, memberId, searchable, verification),
+      ),
+    suppressKnownMinorProfile: (githubAccountId) =>
+      profileControl("Database.suppressKnownMinorProfile", () =>
+        suppressKnownMinorProfile(database, githubAccountId),
+      ),
+    submitPublicProfileRequest: (input) =>
+      profileControl("Database.submitPublicProfileRequest", () =>
+        submitPublicProfileRequest(database, input),
+      ),
     addSavedListEntry: (memberId, organizationId, listId, profileId) =>
       saved("Database.addSavedListEntry", () =>
         addSavedListEntry(
@@ -230,6 +310,10 @@ export const makeDatabaseService = (
       saved("Database.reviewRequestAsOperator", () =>
         reviewRequestAsOperator(database, requestId, confirmed, context),
       ),
+    verifyRequestAsOperator: (requestId, context) =>
+      saved("Database.verifyRequestAsOperator", () =>
+        verifyRequestAsOperator(database, requestId, context),
+      ),
     suppressProfileAsOperator: (input, context) =>
       saved("Database.suppressProfileAsOperator", () =>
         suppressProfileAsOperator(database, input, context),
@@ -238,9 +322,18 @@ export const makeDatabaseService = (
       saved("Database.adjustCreditsAsOperator", () =>
         adjustCreditsAsOperator(database, input, context),
       ),
-    retryReconciliationAsOperator: (reconciliationId, context) =>
+    retryReconciliationAsOperator: (reconciliationId, context, readMeter) =>
       saved("Database.retryReconciliationAsOperator", () =>
-        retryReconciliationAsOperator(database, reconciliationId, context),
+        retryReconciliationAsOperator(
+          database,
+          reconciliationId,
+          context,
+          readMeter,
+        ),
+      ),
+    redriveCreditUsageAsOperator: (ids, context) =>
+      saved("Database.redriveCreditUsageAsOperator", () =>
+        redriveCreditUsageAsOperator(database, ids, context),
       ),
     suspendPrincipalAsOperator: (input, context) =>
       saved("Database.suspendPrincipalAsOperator", () =>

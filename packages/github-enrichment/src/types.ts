@@ -73,9 +73,16 @@ export type Observation = {
 };
 
 export type Stage =
-  "account" | "repositories" | "normalization" | "persistence";
+  | "account"
+  | "repositories"
+  | "normalization"
+  | "persistence";
 export type RunStatus =
-  "pending" | "running" | "succeeded" | "failed" | "stale";
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "stale";
 
 export type EnrichmentRun = {
   id: string;
@@ -105,6 +112,43 @@ export class PermanentEnrichmentError extends Error {
     this.name = "PermanentEnrichmentError";
   }
 }
+
+export class GitHubCheckpointError extends PermanentEnrichmentError {
+  constructor() {
+    super("GitHub provider result could not be checkpointed");
+    this.name = "GitHubCheckpointError";
+  }
+}
+
+export class InvalidGitHubResponseError extends GitHubProviderError {
+  constructor(message = "GitHub returned an invalid response") {
+    super(message, 502);
+    this.name = "InvalidGitHubResponseError";
+  }
+}
+
+export class InvalidOpenAIResponseError extends PermanentEnrichmentError {
+  constructor(message = "OpenAI returned an invalid normalization response") {
+    super(message);
+    this.name = "InvalidOpenAIResponseError";
+  }
+}
+
+export class OpenAIProviderError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly retryAfter?: Date,
+  ) {
+    super(message);
+    this.name = "OpenAIProviderError";
+  }
+}
+
+export type FetchLike = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Promise<Response>;
 
 export interface GitHubProvider {
   getUser(login: string): Promise<GitHubUser>;

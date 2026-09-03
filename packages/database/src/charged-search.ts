@@ -22,6 +22,9 @@ export const runChargedProfileSearch = async (
     filters: ProfileSearchFilters;
     cursor?: string;
     pageSize?: number;
+    memberId?: string;
+    apiKeyId?: string;
+    source?: "web" | "api" | "mcp";
     now?: Date;
     cursorSecret?: string;
   },
@@ -36,6 +39,12 @@ export const runChargedProfileSearch = async (
     referenceId: `profile-search:${requestFingerprint}`,
     idempotencyKey: input.idempotencyKey,
     reservationKey: "idempotency-key",
+    ...(input.apiKeyId
+      ? { actor: { type: "api_key" as const, id: input.apiKeyId } }
+      : input.memberId
+        ? { actor: { type: "member" as const, id: input.memberId } }
+        : {}),
+    operation: `profile_search.${input.source ?? "unknown"}`,
   } satisfies CreditReservation;
   const result = await database.transaction(async (tx) => {
     const reservation = await reserveCredit(tx, operation);

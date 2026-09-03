@@ -1,9 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import repositoryPages from "./fixtures/repository-pages.json" with { type: "json" };
+import repositoryPages from "./fixtures/repository-pages.json" with {
+  type: "json",
+};
 
 import {
+  GitHubCheckpointError,
   GitHubProviderError,
+  OpenAIProviderError,
   PIPELINE_VERSION,
   PROVIDER_SNAPSHOT_RETENTION_DAYS,
   createGitHubEnrichmentStages,
@@ -50,6 +54,7 @@ class MemoryStore implements EnrichmentStore {
   observationsStaleAt?: string;
   failPersistenceOnce = false;
   failPersistenceCheckpointOnce = false;
+  normalizationCheckpointFailures = 0;
   persistedRunIds = new Set<string>();
   persistCalls = 0;
 
@@ -80,6 +85,8 @@ class MemoryStore implements EnrichmentStore {
     value: T,
     options?: { expiresAt?: string },
   ) {
+    if (stage === "normalization" && this.normalizationCheckpointFailures-- > 0)
+      throw new Error("checkpoint unavailable");
     if (stage === "persistence" && this.failPersistenceCheckpointOnce) {
       this.failPersistenceCheckpointOnce = false;
       throw new Error("checkpoint unavailable");
@@ -100,9 +107,8 @@ class MemoryStore implements EnrichmentStore {
     if (this.persistedRunIds.has(runId)) return;
     this.persistedRunIds.add(runId);
     this.observations = observations;
-    const account = observations.find(
-      ({ kind }) => kind === "github-account",
-    )?.value as typeof user | undefined;
+    const account = observations.find(({ kind }) => kind === "github-account")
+      ?.value as typeof user | undefined;
     if (account === undefined) throw new Error("GitHub account is required");
     this.immutableId = account.id;
   }
@@ -254,6 +260,49 @@ describe("GitHub enrichment workflow", () => {
     ).toBe(true);
   });
 
+  it("does not repeat OpenAI normalization when its first checkpoint write fails", async () => {
+    const store = new MemoryStore();
+    store.normalizationCheckpointFailures = 1;
+    const provider = makeProvider();
+
+    await expect(
+      createGitHubEnrichmentWorkflow({
+        provider,
+        normalizer,
+        store,
+        now: fixedNow,
+      })({
+        profileId: "profile-1",
+        githubLogin: "ada",
+        runId: "normalization-checkpoint-retry",
+      }),
+    ).resolves.toMatchObject({ status: "succeeded" });
+    expect(normalizer.normalize).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when an expensive checkpoint cannot be persisted", async () => {
+    const store = new MemoryStore();
+    store.normalizationCheckpointFailures = 2;
+    const provider = makeProvider();
+
+    const error = await createGitHubEnrichmentWorkflow({
+      provider,
+      normalizer,
+      store,
+      now: fixedNow,
+    })({
+      profileId: "profile-1",
+      githubLogin: "ada",
+      runId: "normalization-checkpoint-failure",
+    }).catch((failure: unknown) => failure);
+
+    expect(error).toBeInstanceOf(GitHubCheckpointError);
+    expect(retryOptionsForGitHubError(error)).toEqual({ skipRetrying: true });
+    expect(normalizer.normalize).toHaveBeenCalledTimes(1);
+    expect(store.observationsStaleAt).toBe(fixedNow().toISOString());
+    expect(store.run).toMatchObject({ status: "failed", currentStage: null });
+  });
+
   it("rejects immutable identity changes and unsupported AI evidence", async () => {
     const identityStore = new MemoryStore();
     identityStore.immutableId = 99;
@@ -300,15 +349,18 @@ describe("GitHub enrichment workflow", () => {
     ).rejects.toThrow("not found");
     expect(store.run?.status).toBe("stale");
     expect(store.observationsStaleAt).toBe("2026-09-01T00:00:00.000Z");
+    const inaccessibleSince = store.inaccessibleSince;
+    if (inaccessibleSince === undefined)
+      throw new Error("Expected an inaccessible timestamp");
     expect(
       isSuppressionEligible(
-        store.inaccessibleSince!,
+        inaccessibleSince,
         new Date("2026-09-30T23:59:59.999Z"),
       ),
     ).toBe(false);
     expect(
       isSuppressionEligible(
-        store.inaccessibleSince!,
+        inaccessibleSince,
         new Date("2026-10-01T00:00:00.000Z"),
       ),
     ).toBe(true);
@@ -370,6 +422,15 @@ describe("GitHub enrichment workflow", () => {
         ),
       ),
     ).toEqual({ retryAt: new Date("2026-09-01T00:02:00.000Z") });
+    expect(
+      retryOptionsForGitHubError(
+        new OpenAIProviderError(
+          "OpenAI rate limited",
+          429,
+          new Date("2026-09-01T00:03:00.000Z"),
+        ),
+      ),
+    ).toEqual({ retryAt: new Date("2026-09-01T00:03:00.000Z") });
   });
 
   it("runs stages independently and preserves the first inaccessible time", async () => {
@@ -497,12 +558,15 @@ describe("GitHub enrichment workflow", () => {
     expect(store.run?.status).toBe("failed");
     expect(store.inaccessibleSince).toBeUndefined();
 
+    if (store.run === undefined) throw new Error("Expected an enrichment run");
     store.run = {
-      ...store.run!,
+      ...store.run,
       status: "running",
-      currentStage: "repositories",
+      currentStage: "persistence",
     };
+    store.observationsStaleAt = undefined;
     await stages.retryExhausted(input, new Error("retries exhausted"));
+    expect(store.observationsStaleAt).toBe(fixedNow().toISOString());
     expect(store.run).toMatchObject({
       status: "failed",
       currentStage: null,

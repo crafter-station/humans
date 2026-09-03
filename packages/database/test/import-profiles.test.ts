@@ -1,8 +1,9 @@
-import { PostgreSqlContainer } from "@testcontainers/postgresql";
-import { drizzle } from "drizzle-orm/node-postgres";
-import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { PostgreSqlContainer } from "@testcontainers/postgresql";
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -79,6 +80,27 @@ describe("Profile importer", () => {
         validRows: 2,
       }),
     ]);
+    await expect(
+      database
+        .select({
+          source: schema.professionalLinks.source,
+          sourceRecordId: schema.professionalLinks.sourceRecordId,
+        })
+        .from(schema.professionalLinks)
+        .where(
+          eq(schema.professionalLinks.url, "https://github.com/ana-example"),
+        ),
+    ).resolves.toEqual([
+      { source: "approved-partner", sourceRecordId: "person-001" },
+    ]);
+    await expect(database.select().from(schema.employments)).resolves.toEqual([
+      expect.objectContaining({
+        current: true,
+        source: "approved-partner",
+        sourceRecordId: "person-001",
+        staleAt: null,
+      }),
+    ]);
 
     const rerun = await importProfiles(database, csv, { dryRun: false });
     expect(rerun).toMatchObject({
@@ -90,6 +112,9 @@ describe("Profile importer", () => {
         noops: 2,
       },
     });
+    await expect(
+      database.select().from(schema.employments),
+    ).resolves.toHaveLength(1);
   });
 
   it("imports unrelated valid rows while reporting malformed rows and duplicate identities", async () => {
@@ -177,5 +202,70 @@ humans-profiles-v1,concurrent-batch,concurrent-1,Fernanda Example,,40001,fernand
       first.appliedChanges.addObservations +
         second.appliedChanges.addObservations,
     ).toBe(1);
+  });
+
+  it("canonicalizes GitHub IDs and rejects invalid numeric aliases", async () => {
+    const csv = `contract_version,source,source_record_id,name,current_company,github_account_id,github_login,qualifying_evidence,adult_confirmed,professional_links
+humans-profiles-v1,canonical-batch,canonical-1,Canonical One,,00050042,canonical-one,owned_repository,true,https://github.com/canonical-one
+humans-profiles-v1,canonical-batch,canonical-2,Canonical Two,,50042,canonical-two,owned_repository,true,https://github.com/canonical-two
+humans-profiles-v1,canonical-batch,zero,Zero,,0,zero,owned_repository,true,https://github.com/zero
+humans-profiles-v1,canonical-batch,unsafe,Unsafe,,9007199254740992,unsafe,owned_repository,true,https://github.com/unsafe`;
+
+    const report = await importProfiles(database, csv, { dryRun: true });
+
+    expect(report.validRows).toBe(2);
+    expect(report.invalidRows).toEqual([
+      { row: 4, errors: ["github_account_id_invalid"] },
+      { row: 5, errors: ["github_account_id_invalid"] },
+    ]);
+    expect(report.duplicateCandidates).toEqual([
+      {
+        canonicalProvider: "github",
+        canonicalProviderId: "50042",
+        row: 3,
+        duplicateOfRow: 2,
+      },
+    ]);
+  });
+
+  it("serializes import and suppression for one canonical identity", async () => {
+    const csv = `contract_version,source,source_record_id,name,current_company,github_account_id,github_login,qualifying_evidence,adult_confirmed,professional_links
+humans-profiles-v1,race-batch,race-1,Race Person,,00060042,race-person,owned_repository,true,https://github.com/race-person`;
+
+    await Promise.all([
+      importProfiles(database, csv, { dryRun: false }),
+      suppressProviderIdentity(database, {
+        canonicalProvider: "github",
+        canonicalProviderId: "60042",
+        reason: "person_requested_removal",
+      }),
+    ]);
+
+    const matchingProfiles = await database
+      .select()
+      .from(schema.profiles)
+      .where(eq(schema.profiles.githubAccountId, "60042"));
+    expect(matchingProfiles).toEqual(
+      matchingProfiles.length === 0
+        ? []
+        : [
+            expect.objectContaining({
+              name: "Suppressed Profile",
+              searchable: false,
+            }),
+          ],
+    );
+    await expect(
+      database
+        .select()
+        .from(schema.profileObservations)
+        .where(eq(schema.profileObservations.sourceRecordId, "race-1")),
+    ).resolves.toEqual([]);
+    await expect(
+      database
+        .select()
+        .from(schema.suppressionRecords)
+        .where(eq(schema.suppressionRecords.canonicalProviderId, "60042")),
+    ).resolves.toHaveLength(1);
   });
 });

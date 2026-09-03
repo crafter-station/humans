@@ -1,0 +1,1 @@
+CREATE INDEX "polar_webhook_events_subscription_idx" ON "polar_webhook_events" USING btree ("subscription_id");

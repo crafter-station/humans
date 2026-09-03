@@ -4,6 +4,7 @@ import {
   InvalidTikHubPayloadError,
   TIKHUB_PIPELINE_VERSION,
   TIKHUB_SNAPSHOT_RETENTION_DAYS,
+  TikHubCheckpointError,
   TikHubProviderError,
   createTikHubEnrichmentStages,
   createTikHubEnrichmentWorkflow,
@@ -23,6 +24,7 @@ class MemoryStore implements TikHubStore {
   observations: TikHubObservation[] = [];
   staleAt?: string;
   persistFailures = 0;
+  fetchCheckpointFailures = 0;
   async getRun(runId: string) {
     return this.run?.id === runId ? structuredClone(this.run) : undefined;
   }
@@ -50,6 +52,8 @@ class MemoryStore implements TikHubStore {
     value: T,
     options?: { expiresAt?: string },
   ) {
+    if (stage === "fetch" && this.fetchCheckpointFailures-- > 0)
+      throw new Error("checkpoint unavailable");
     this.checkpoints.set(`${runId}:${stage}`, structuredClone(value));
     if (options?.expiresAt)
       this.expirations.set(`${runId}:${stage}`, options.expiresAt);
@@ -114,7 +118,9 @@ describe("TikHub LinkedIn enrichment", () => {
     expect(store.expirations.has("run-1:normalization")).toBe(false);
     expect(parseTikHubProfile(fixture).contacts).toHaveLength(2);
 
-    const publicObservation = toPublicTikHubObservation(store.observations[0]!);
+    const observation = store.observations[0];
+    if (observation === undefined) throw new Error("Expected an Observation");
+    const publicObservation = toPublicTikHubObservation(observation);
     expect(publicObservation).toMatchObject({
       sourceCategory: "professional-network",
     });
@@ -138,6 +144,39 @@ describe("TikHub LinkedIn enrichment", () => {
         providerMetadata: { requestId: "sanitized-request-id" },
       },
     });
+  });
+
+  it("does not repeat a paid provider fetch when its first checkpoint write fails", async () => {
+    const store = new MemoryStore();
+    store.fetchCheckpointFailures = 1;
+    const api = provider();
+
+    await expect(
+      createTikHubEnrichmentWorkflow({
+        provider: api,
+        store,
+        now: fixedNow,
+      })(input),
+    ).resolves.toMatchObject({ status: "succeeded" });
+    expect(api.getLinkedInProfile).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when a paid provider checkpoint cannot be persisted", async () => {
+    const store = new MemoryStore();
+    store.fetchCheckpointFailures = 2;
+    const api = provider();
+
+    const error = await createTikHubEnrichmentWorkflow({
+      provider: api,
+      store,
+      now: fixedNow,
+    })(input).catch((failure: unknown) => failure);
+
+    expect(error).toBeInstanceOf(TikHubCheckpointError);
+    expect(retryOptionsForTikHubError(error)).toEqual({ skipRetrying: true });
+    expect(api.getLinkedInProfile).toHaveBeenCalledTimes(1);
+    expect(store.staleAt).toBe(fixedNow().toISOString());
+    expect(store.run).toMatchObject({ status: "failed", currentStage: null });
   });
 
   it("rejects malformed provider payloads at the provider boundary", async () => {
@@ -219,8 +258,15 @@ describe("TikHub LinkedIn enrichment", () => {
       retryOptionsForTikHubError(new InvalidTikHubPayloadError("bad")),
     ).toEqual({ skipRetrying: true });
 
-    store.run = { ...store.run!, status: "running", currentStage: "fetch" };
+    store.staleAt = undefined;
+    if (store.run === undefined) throw new Error("Expected an enrichment run");
+    store.run = {
+      ...store.run,
+      status: "running",
+      currentStage: "persistence",
+    };
     await stages.retryExhausted(input, new Error("retries exhausted"));
+    expect(store.staleAt).toBe(fixedNow().toISOString());
     expect(store.run).toMatchObject({
       status: "failed",
       currentStage: null,

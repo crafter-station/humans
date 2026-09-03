@@ -1,8 +1,8 @@
 .page {
   min-height: 100vh;
   padding: 48px;
-  color: #e8ecdf;
-  background: #10130f;
+  color: var(--foreground);
+  background: var(--background);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .header {
@@ -11,7 +11,7 @@
   justify-content: space-between;
   gap: 32px;
   padding-bottom: 28px;
-  border-bottom: 1px solid #394134;
+  border-bottom: 1px solid var(--border);
 }
 .header h1 {
   font:
@@ -21,12 +21,12 @@
 }
 .header > p {
   max-width: 480px;
-  color: #aeb9a5;
+  color: var(--muted-foreground);
   line-height: 1.6;
 }
 .eyebrow {
   margin-bottom: 12px;
-  color: #c8ff5a;
+  color: var(--foreground);
   font-size: 0.72rem;
   letter-spacing: 0.18em;
 }
@@ -35,50 +35,67 @@
   grid-template-columns: repeat(4, 1fr);
   gap: 1px;
   margin: 28px 0;
-  background: #394134;
-  border: 1px solid #394134;
+  background: var(--border);
+  border: 1px solid var(--border);
 }
-.metrics article {
+.metrics article,
+.metricCard {
+  min-width: 0;
+  height: 100%;
+}
+.metricCard {
+  padding: 0;
+  border-radius: 0;
+  box-shadow: none;
+  --card-spacing: 0;
+}
+.metricCard [data-slot="card-content"] {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 24px;
-  background: #171b15;
 }
 .metrics strong {
-  color: #c8ff5a;
+  color: var(--foreground);
   font:
     500 2.5rem / 1 Georgia,
     serif;
 }
 .metrics span {
-  color: #aeb9a5;
+  color: var(--muted-foreground);
   font-size: 0.75rem;
   text-transform: uppercase;
 }
-.panel {
+.panelSection {
   margin: 18px 0;
-  padding: 22px;
+}
+.panel {
+  gap: 0;
   overflow: hidden;
-  border: 1px solid #394134;
-  background: #171b15;
+  padding: 0;
+  border-radius: 0;
+  box-shadow: none;
+  --card-spacing: 22px;
 }
 .panelHead {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 24px;
-  margin-bottom: 18px;
+  padding: 22px 22px 18px;
 }
-.panelHead h2 {
+.panelHead [data-slot="card-title"] h2 {
   font:
     500 1.2rem Georgia,
     serif;
 }
-.panelHead p,
+.panelHead [data-slot="card-description"] p,
 .empty {
-  color: #879181;
+  color: var(--muted-foreground);
   font-size: 0.75rem;
+}
+.panelContent {
+  padding: 0 22px 22px;
 }
 .split {
   display: grid;
@@ -89,22 +106,22 @@
   overflow-x: auto;
   margin-top: 12px;
 }
-.tableWrap table {
+.dataTable {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.72rem;
 }
-.tableWrap th {
-  color: #879181;
+.dataTable [data-slot="table-head"] {
+  color: var(--muted-foreground);
   text-align: left;
   text-transform: uppercase;
 }
-.tableWrap th,
-.tableWrap td {
+.dataTable [data-slot="table-head"],
+.dataTable [data-slot="table-cell"] {
   max-width: 280px;
   padding: 10px;
   overflow: hidden;
-  border-bottom: 1px solid #2b3127;
+  border-bottom: 1px solid var(--border);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -115,31 +132,22 @@
   gap: 10px;
   margin: 10px 0;
   padding: 12px;
-  background: #10130f;
+  background: var(--muted);
 }
 .queueItem code {
   flex: 1;
-  color: #bdc6b5;
+  color: var(--muted-foreground);
 }
-.actionForm input,
-.queueItem input,
-.actionForm select {
+.actionForm [data-slot="input"],
+.queueItem [data-slot="input"],
+.actionForm [data-slot="native-select"] {
   min-width: 0;
-  padding: 9px 11px;
-  color: #e8ecdf;
-  border: 1px solid #495344;
-  background: transparent;
 }
-.actionForm select {
-  appearance: none;
+.actionForm [data-slot="native-select-wrapper"] {
+  min-width: 0;
 }
-.actionForm button,
-.queueItem button {
-  padding: 9px 12px;
-  color: #10130f;
-  border: 0;
-  background: #c8ff5a;
-  cursor: pointer;
+.actionForm [data-slot="button"],
+.queueItem [data-slot="button"] {
   text-transform: capitalize;
 }
 .queueItem div {
@@ -149,6 +157,16 @@
 .queueItem .correctionFields {
   display: grid;
   grid-template-columns: 1fr 1fr;
+}
+.correctionFields label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.correctionFields [data-slot="input"][type="checkbox"] {
+  width: 1rem;
+  height: 1rem;
+  padding: 0;
 }
 @media (max-width: 800px) {
   .page {
@@ -173,7 +191,7 @@
   .queueItem div {
     width: 100%;
   }
-  .queueItem button {
+  .queueItem [data-slot="button"] {
     flex: 1;
   }
 }

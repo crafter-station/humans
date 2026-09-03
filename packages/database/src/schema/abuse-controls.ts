@@ -19,7 +19,15 @@ export const organizationEntitlements = pgTable(
     tier: text("tier").notNull(),
     status: text("status").notNull(),
     polarSubscriptionId: text("polar_subscription_id"),
+    polarStatus: text("polar_status"),
+    polarEventId: text("polar_event_id"),
     polarEventAt: timestamp("polar_event_at", { withTimezone: true }),
+    periodStart: timestamp("period_start", { withTimezone: true }),
+    periodEnd: timestamp("period_end", { withTimezone: true }),
+    cancelAtPeriodEnd: boolean("cancel_at_period_end").notNull().default(false),
+    pendingFreeAtPeriodEnd: boolean("pending_free_at_period_end")
+      .notNull()
+      .default(false),
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -31,12 +39,26 @@ export const organizationEntitlements = pgTable(
   ],
 );
 
-export const polarWebhookEvents = pgTable("polar_webhook_events", {
-  id: text("id").primaryKey(),
-  processedAt: timestamp("processed_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-});
+export const polarWebhookEvents = pgTable(
+  "polar_webhook_events",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id").references(
+      () => organizations.clerkId,
+    ),
+    subscriptionId: text("subscription_id"),
+    eventType: text("event_type"),
+    status: text("status"),
+    occurredAt: timestamp("occurred_at", { withTimezone: true }),
+    applied: boolean("applied").notNull().default(false),
+    processedAt: timestamp("processed_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("polar_webhook_events_subscription_idx").on(table.subscriptionId),
+  ],
+);
 
 export const memberFreeCreditClaims = pgTable(
   "member_free_credit_claims",

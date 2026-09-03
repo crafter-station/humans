@@ -3,27 +3,41 @@
   "version": "0.0.0",
   "type": "module",
   "private": true,
+  "exports": {
+    ".": "./src/index.ts",
+    "./trigger": "./src/trigger/index.ts"
+  },
   "scripts": {
     "dev": "trigger dev",
-    "deploy:trigger": "trigger deploy --env prod",
-    "deploy:trigger:dry-run": "trigger deploy --env prod --dry-run",
-    "deploy:preview": "trigger deploy --env staging",
-    "deploy:preview:dry-run": "trigger deploy --env staging --dry-run",
-    "deploy:production": "trigger deploy --env prod",
-    "deploy:production:dry-run": "trigger deploy --env prod --dry-run",
+    "deploy:trigger": "SENTRY_RELEASE=$(git rev-parse HEAD) TRIGGER_PROJECT_REF=proj_umusurvkybxuonbiopal trigger deploy --env prod --external-id $(git rev-parse HEAD)",
+    "deploy:trigger:dry-run": "SENTRY_RELEASE=$(git rev-parse HEAD) TRIGGER_PROJECT_REF=proj_umusurvkybxuonbiopal trigger deploy --env prod --external-id $(git rev-parse HEAD) --dry-run",
+    "deploy:preview": "SENTRY_RELEASE=$(git rev-parse HEAD) TRIGGER_PROJECT_REF=proj_bzchfkbbyztlvsntroom trigger deploy --env prod --external-id $(git rev-parse HEAD)",
+    "deploy:preview:dry-run": "SENTRY_RELEASE=$(git rev-parse HEAD) TRIGGER_PROJECT_REF=proj_bzchfkbbyztlvsntroom trigger deploy --env prod --external-id $(git rev-parse HEAD) --dry-run",
+    "deploy:production": "SENTRY_RELEASE=$(git rev-parse HEAD) TRIGGER_PROJECT_REF=proj_umusurvkybxuonbiopal trigger deploy --env prod --external-id $(git rev-parse HEAD)",
+    "deploy:production:dry-run": "SENTRY_RELEASE=$(git rev-parse HEAD) TRIGGER_PROJECT_REF=proj_umusurvkybxuonbiopal trigger deploy --env prod --external-id $(git rev-parse HEAD) --dry-run",
     "format": "biome format --write .",
     "lint": "biome lint .",
-    "check-types": "node ../../node_modules/@typescript/native/bin/tsc --noEmit"
+    "check-types": "node ../../node_modules/@typescript/native/bin/tsc --noEmit",
+    "tikhub:run": "bun ./scripts/run-tikhub.ts",
+    "test": "vitest run"
   },
   "dependencies": {
-    "@trigger.dev/sdk": "4.5.15"
+    "@humans/database": "*",
+    "@humans/deepline-enrichment": "*",
+    "@humans/github-enrichment": "*",
+    "@humans/polar-billing": "*",
+    "@humans/tikhub-enrichment": "*",
+    "@sentry/node": "10.73.0",
+    "@trigger.dev/sdk": "4.5.16"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.11",
     "@repo/typescript-config": "*",
+    "@trigger.dev/build": "4.5.16",
     "@types/node": "26.3.0",
     "@typescript/native": "npm:typescript@7.0.2",
-    "trigger.dev": "4.5.15",
-    "typescript": "6.0.2"
+    "trigger.dev": "4.5.16",
+    "typescript": "6.0.2",
+    "vitest": "4.1.11"
   }
 }

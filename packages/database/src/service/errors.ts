@@ -17,6 +17,11 @@ export class ProfileRejected extends Schema.TaggedError<ProfileRejected>()(
   { reason: Schema.String },
 ) {}
 
+export class ProfileControlRejected extends Schema.TaggedError<ProfileControlRejected>()(
+  "ProfileControlRejected",
+  { reason: Schema.String },
+) {}
+
 export class SearchRejected extends Schema.TaggedError<SearchRejected>()(
   "SearchRejected",
   {},

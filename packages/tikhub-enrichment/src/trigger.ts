@@ -1,7 +1,7 @@
 import { idempotencyKeys, task } from "@trigger.dev/sdk";
 
 import {
-  InvalidTikHubPayloadError,
+  PermanentTikHubError,
   TIKHUB_CONCURRENCY_LIMIT,
   TikHubProviderError,
   type TikHubEnrichmentInput,
@@ -18,7 +18,7 @@ const retry = {
 } as const;
 
 export const retryOptionsForTikHubError = (error: unknown) => {
-  if (error instanceof InvalidTikHubPayloadError)
+  if (error instanceof PermanentTikHubError)
     return { skipRetrying: true } as const;
   if (!(error instanceof TikHubProviderError)) return undefined;
   const classification = classifyTikHubError(error);

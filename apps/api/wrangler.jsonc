@@ -3,7 +3,10 @@
   "name": "humans-api-local",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-31",
+  "compatibility_flags": ["nodejs_compat"],
   "placement": { "region": "aws:us-east-1" },
+  "upload_source_maps": true,
+  "version_metadata": { "binding": "CF_VERSION_METADATA" },
   "ratelimits": [
     {
       "name": "ORGANIZATION_RATE_LIMITER",
@@ -29,11 +32,21 @@
       "name": "NATURAL_SEARCH_RATE_LIMITER",
       "namespace_id": "1002",
       "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "PUBLIC_PROFILE_REQUEST_RATE_LIMITER",
+      "namespace_id": "1006",
+      "simple": { "limit": 5, "period": 60 }
     }
   ],
   "env": {
     "preview": {
       "name": "humans-api-preview",
+      "vars": {
+        "BILLING_REQUIRED": "true",
+        "SENTRY_ENVIRONMENT": "preview"
+      },
+      "version_metadata": { "binding": "CF_VERSION_METADATA" },
       "ratelimits": [
         {
           "name": "ORGANIZATION_RATE_LIMITER",
@@ -59,11 +72,21 @@
           "name": "NATURAL_SEARCH_RATE_LIMITER",
           "namespace_id": "1102",
           "simple": { "limit": 10, "period": 60 }
+        },
+        {
+          "name": "PUBLIC_PROFILE_REQUEST_RATE_LIMITER",
+          "namespace_id": "1106",
+          "simple": { "limit": 5, "period": 60 }
         }
       ]
     },
     "production": {
       "name": "humans-api-production",
+      "vars": {
+        "BILLING_REQUIRED": "true",
+        "SENTRY_ENVIRONMENT": "production"
+      },
+      "version_metadata": { "binding": "CF_VERSION_METADATA" },
       "ratelimits": [
         {
           "name": "ORGANIZATION_RATE_LIMITER",
@@ -89,6 +112,11 @@
           "name": "NATURAL_SEARCH_RATE_LIMITER",
           "namespace_id": "1202",
           "simple": { "limit": 10, "period": 60 }
+        },
+        {
+          "name": "PUBLIC_PROFILE_REQUEST_RATE_LIMITER",
+          "namespace_id": "1206",
+          "simple": { "limit": 5, "period": 60 }
         }
       ]
     }

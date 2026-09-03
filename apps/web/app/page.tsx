@@ -1,4 +1,5 @@
 import { Show, SignInButton, SignUpButton } from "@clerk/nextjs";
+import { Button } from "@repo/ui/components/button";
 import Link from "next/link";
 
 import styles from "./page.module.css";
@@ -9,22 +10,28 @@ export default function Home() {
       <nav className={styles.nav}>
         <span className={styles.wordmark}>Humans</span>
         <div className={styles.actions}>
+          <Link className={styles.requestLink} href="/profile-request">
+            Correct or remove a Profile
+          </Link>
           <Show when="signed-out">
             <SignInButton>
-              <button className={styles.textButton} type="button">
+              <Button className={styles.textButton} type="button">
                 Sign in
-              </button>
+              </Button>
             </SignInButton>
             <SignUpButton>
-              <button className={styles.primaryButton} type="button">
+              <Button className={styles.primaryButton} type="button">
                 Join Humans
-              </button>
+              </Button>
             </SignUpButton>
           </Show>
           <Show when="signed-in">
-            <Link className={styles.primaryButton} href="/workspace">
+            <Button
+              className={styles.primaryButton}
+              render={<Link href="/workspace" />}
+            >
               Open workspace
-            </Link>
+            </Button>
           </Show>
         </div>
       </nav>
@@ -39,23 +46,26 @@ export default function Home() {
         </p>
         <Show when="signed-out">
           <SignUpButton>
-            <button className={styles.heroButton} type="button">
+            <Button className={styles.heroButton} type="button">
               Create your workspace
-            </button>
+            </Button>
           </SignUpButton>
         </Show>
         <Show when="signed-in">
-          <Link className={styles.heroButton} href="/workspace">
+          <Button
+            className={styles.heroButton}
+            render={<Link href="/workspace" />}
+          >
             Continue to Humans
-          </Link>
+          </Button>
         </Show>
       </section>
 
       <aside className={styles.note}>
         <span>01</span>
         <p>
-          Not a public index. Search results and Profile data are available
-          only to authenticated Organization Members.
+          Not a public index. Search results and Profile data are available only
+          to authenticated Organization Members.
         </p>
       </aside>
     </main>

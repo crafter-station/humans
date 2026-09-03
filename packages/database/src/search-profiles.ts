@@ -1,8 +1,8 @@
-import { and, desc, eq, inArray, notExists } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, notExists } from "drizzle-orm";
 import {
   memberStatements,
-  profileObservations,
   professionalLinks,
+  profileObservations,
   profiles,
   suppressionRecords,
 } from "./schema";
@@ -257,7 +257,12 @@ const loadDocuments = async (
       collectedAt: profileObservations.collectedAt,
     })
     .from(profileObservations)
-    .where(inArray(profileObservations.profileId, profileIds))
+    .where(
+      and(
+        inArray(profileObservations.profileId, profileIds),
+        isNull(profileObservations.staleAt),
+      ),
+    )
     .orderBy(desc(profileObservations.collectedAt));
   const links = await database
     .select({
@@ -305,39 +310,44 @@ const loadDocuments = async (
       ownObservations,
     );
     const freshness = [
-      profile.updatedAt,
       ...ownStatements.map(({ collectedAt }) => collectedAt),
       ...ownObservations.map(({ collectedAt }) => collectedAt),
     ]
-      .sort((left, right) => right.getTime() - left.getTime())[0]!
+      .reduce(
+        (latest, collectedAt) =>
+          collectedAt.getTime() > latest.getTime() ? collectedAt : latest,
+        profile.updatedAt,
+      )
       .toISOString();
     const hasMemberEvidence = ownStatements.length > 0;
     const strongestConfidence = Math.max(
       0,
       ...ownObservations.map(({ confidence }) => confidence),
     );
-    const roles = strings(values.roles ?? values.role);
+    const roles = strings(values.role);
     const skills = strings(values.skills);
 
     return {
       profileId: profile.profileId,
-      name: stringValue(values.name) ?? profile.name,
+      name:
+        profile.memberId === null
+          ? (stringValue(values.name) ?? profile.name)
+          : profile.name,
       headline: stringValue(values.headline ?? values.summary),
-      currentResidence: stringValue(
-        values.current_residence ?? values.currentResidence ?? values.location,
-      ),
+      currentResidence: stringValue(values.current_residence),
       primaryRole: roles[0] ?? null,
       skills,
       currentCompany:
-        stringValue(values.current_company ?? values.currentCompany) ??
-        profile.currentCompany,
+        profile.memberId === null
+          ? Object.hasOwn(values, "current_company")
+            ? stringValue(values.current_company)
+            : profile.currentCompany
+          : profile.currentCompany,
       seniority: stringValue(values.seniority),
       experienceYears: numberValue(
         values.experience_years ?? values.experienceYears ?? values.experience,
       ),
-      opportunityStatus: opportunityStatus(
-        values.opportunity_status ?? values.opportunityStatus,
-      ),
+      opportunityStatus: opportunityStatus(values.opportunity_status),
       freshness,
       evidence: hasMemberEvidence
         ? "member"
@@ -348,11 +358,7 @@ const loadDocuments = async (
       memberFields,
       confidenceByField,
       opportunityRank:
-        opportunityStatus(
-          values.opportunity_status ?? values.opportunityStatus,
-        ) === "open"
-          ? 1
-          : 0,
+        opportunityStatus(values.opportunity_status) === "open" ? 1 : 0,
       links: (linksByProfile.get(profile.profileId) ?? []).map(
         ({ url }) => url,
       ),
@@ -374,46 +380,88 @@ const effectiveValues = (
 ) => {
   const values: Record<string, unknown> = {};
   const confidenceByField = new Map<string, number>();
+  const sourceRankByField = new Map<string, number>();
+  const setObservation = (
+    field: string,
+    value: unknown,
+    observation: (typeof observations)[number],
+  ) => {
+    if (
+      observation.source !== "public-profile-request" &&
+      (value === null ||
+        value === undefined ||
+        (typeof value === "string" && value.trim() === "") ||
+        (Array.isArray(value) && value.length === 0))
+    )
+      return;
+    const evidenceField = canonicalField(field);
+    const sourceRank =
+      observation.source === "public-profile-request"
+        ? 3
+        : ["github", "github-ai-normalization", "tikhub"].includes(
+              observation.source,
+            )
+          ? 2
+          : observation.source === "deepline"
+            ? 1
+            : 0;
+    const currentSourceRank = sourceRankByField.get(evidenceField) ?? -1;
+    if (
+      sourceRank > currentSourceRank ||
+      (sourceRank === currentSourceRank &&
+        (confidenceByField.get(evidenceField) ?? -1) <= observation.confidence)
+    ) {
+      values[evidenceField] = value;
+      confidenceByField.set(evidenceField, observation.confidence);
+      sourceRankByField.set(evidenceField, sourceRank);
+    }
+  };
   for (const observation of [...observations].reverse()) {
     if (
       observation.field === "github-normalization" &&
       isRecord(observation.value)
     ) {
       for (const [field, value] of Object.entries(observation.value)) {
-        const evidenceField = canonicalField(field);
-        if (
-          (confidenceByField.get(evidenceField) ?? -1) <= observation.confidence
-        ) {
-          values[field] = value;
-          confidenceByField.set(evidenceField, observation.confidence);
-        }
+        setObservation(field, value, observation);
+      }
+    } else if (
+      observation.field === "linkedin-career" &&
+      isRecord(observation.value)
+    ) {
+      for (const field of ["headline", "currentCompany", "skills"] as const) {
+        if (observation.value[field] !== undefined)
+          setObservation(field, observation.value[field], observation);
       }
     } else if (
       observation.field === "github-account" &&
       isRecord(observation.value)
     ) {
       for (const field of ["location", "company"] as const) {
-        if (
-          observation.value[field] !== undefined &&
-          values[field] === undefined
-        ) {
-          values[field] = observation.value[field];
-          confidenceByField.set(canonicalField(field), observation.confidence);
-        }
+        if (observation.value[field] !== undefined)
+          setObservation(field, observation.value[field], observation);
       }
     } else if (
-      (confidenceByField.get(canonicalField(observation.field)) ?? -1) <=
-      observation.confidence
+      observation.field === "currentPosition" &&
+      Array.isArray(observation.value)
     ) {
-      values[observation.field] = observation.value;
-      confidenceByField.set(
-        canonicalField(observation.field),
-        observation.confidence,
-      );
-    }
+      const positions = observation.value.filter(isRecord);
+      const company = positions.find(
+        (position) =>
+          typeof position.companyName === "string" &&
+          position.companyName.trim() !== "",
+      )?.companyName;
+      const role = positions.find(
+        (position) =>
+          typeof position.position === "string" &&
+          position.position.trim() !== "",
+      )?.position;
+      if (company !== undefined)
+        setObservation("currentCompany", company, observation);
+      if (role !== undefined) setObservation("role", role, observation);
+    } else setObservation(observation.field, observation.value, observation);
   }
   for (const statement of [...statements].reverse()) {
-    values[statement.field] = statement.value;
+    values[canonicalField(statement.field)] = statement.value;
   }
   return {
     values,
@@ -483,16 +531,16 @@ const rank = (profile: SearchDocument, filters: NormalizedFilters) => {
   const role = profile.primaryRole?.toLocaleLowerCase() ?? "";
   const skills = profile.skills.map((skill) => skill.toLocaleLowerCase());
   const residence = profile.currentResidence?.toLocaleLowerCase() ?? "";
+  const query = filters.query;
   const queryMatches =
-    filters.query === undefined
+    query === undefined
       ? 0
       : [
           profile.name,
           profile.headline,
           profile.primaryRole,
           ...profile.skills,
-        ].filter((value) => value?.toLocaleLowerCase().includes(filters.query!))
-          .length;
+        ].filter((value) => value?.toLocaleLowerCase().includes(query)).length;
   const relevantFields = [
     ...(filters.roles.length > 0 ? ["role"] : []),
     ...(filters.skills.length > 0 ? ["skills"] : []),
@@ -580,7 +628,8 @@ const decodeCursor = async (
 ): Promise<Cursor> => {
   try {
     const encoded = fromBase64Url(value);
-    if (encoded.length <= 28) throw new Error("invalid cursor");
+    if (encoded.length <= 28 || base64Url(encoded) !== value)
+      throw new Error("invalid cursor");
     const decoded = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv: encoded.slice(0, 12) },
       await encryptionKey(secret),
@@ -686,12 +735,16 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const canonicalField = (field: string) => {
   if (field === "roles") return "role";
+  if (field === "summary") return "headline";
   if (
     field === "currentResidence" ||
     field === "location" ||
     field === "current_residence"
   )
     return "current_residence";
+  if (field === "currentCompany" || field === "company")
+    return "current_company";
+  if (field === "opportunityStatus") return "opportunity_status";
   return field;
 };
 

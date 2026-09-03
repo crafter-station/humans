@@ -1,0 +1,2 @@
+DROP INDEX "profile_requests_active_profile_unique";--> statement-breakpoint
+CREATE UNIQUE INDEX "profile_requests_active_profile_unique" ON "profile_requests" USING btree ("profile_id") WHERE "profile_requests"."status" = 'pending';

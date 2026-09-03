@@ -107,7 +107,8 @@ export const createSavedList = async (
     .insert(savedLists)
     .values({ organizationId, createdBy: memberId, name: name.trim() })
     .returning();
-  return list!;
+  if (!list) throw new Error("saved_list_insert_failed");
+  return list;
 };
 
 export const renameSavedList = async (
@@ -123,7 +124,8 @@ export const renameSavedList = async (
     .set({ name: name.trim(), updatedAt: new Date() })
     .where(eq(savedLists.id, listId))
     .returning();
-  return list!;
+  if (!list) throw new Error("saved_list_update_failed");
+  return list;
 };
 
 export const deleteSavedList = async (

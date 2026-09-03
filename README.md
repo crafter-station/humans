@@ -53,8 +53,10 @@ bun run --cwd packages/database --env-file=../../apps/api/.dev.vars db:migrate
 ```
 
 `db:generate` creates the initial pgvector extension migration from a declared
-extension list because Drizzle has no extension schema primitive. Migration SQL
-is generated and should not be edited by hand.
+extension list because Drizzle has no extension schema primitive. Required
+legacy-data repairs are likewise declared in the generator and checked against
+their custom migration artifacts byte for byte. Migration SQL is generated and
+should not be edited by hand.
 
 Production database access uses Drizzle's transactional Neon serverless adapter
 behind an Effect service. The integration test supplies Drizzle's Node
@@ -65,8 +67,10 @@ PostgreSQL adapter to the same service boundary.
 No secrets are committed. The API requires `DATABASE_URL`, `CLERK_SECRET_KEY`,
 `CLERK_PUBLISHABLE_KEY`, and `CLERK_WEBHOOK_SIGNING_SECRET`. Deployed Workers
 also require dedicated `SEARCH_CURSOR_SECRET` and `WEB_PROXY_SECRET` values.
-Natural-language search and billing require `OPENAI_API_KEY` and
-`POLAR_WEBHOOK_SECRET`, respectively. The web application requires
+Natural-language search requires `OPENAI_API_KEY` and a pinned `OPENAI_MODEL`.
+Billing requires the Polar Customer, product, meter, usage-event, checkout-origin,
+access-token, and webhook settings documented in `apps/api/.dev.vars.example`.
+The web application requires
 `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, and
 `HUMANS_PROXY_SECRET`; set `HUMANS_API_URL` when the API is not available at
 `http://localhost:8787`.

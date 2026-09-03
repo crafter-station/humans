@@ -97,8 +97,11 @@ export class NaturalSearchInterpreter {
       expiresAt: now + (this.options.ttlMs ?? 5 * 60_000),
       value,
     });
-    while (this.cache.size > (this.options.capacity ?? 100))
-      this.cache.delete(this.cache.keys().next().value!);
+    while (this.cache.size > (this.options.capacity ?? 100)) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.cache.delete(oldestKey);
+    }
     return structuredClone(value);
   }
 }

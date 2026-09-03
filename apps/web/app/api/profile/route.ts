@@ -2,6 +2,7 @@ import { auth } from "@clerk/nextjs/server";
 
 import { env } from "@/env";
 import {
+  protectedLocalResponseHeaders,
   protectedProxyHeaders,
   protectedResponseHeaders,
 } from "../proxy-security";
@@ -14,7 +15,7 @@ const forward = async (request: Request, path: string) => {
       {
         error: { code: "unauthorized", message: "Authentication is required" },
       },
-      { status: 401 },
+      { status: 401, headers: protectedLocalResponseHeaders() },
     );
   }
 

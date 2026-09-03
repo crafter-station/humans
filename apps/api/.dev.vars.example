@@ -7,10 +7,23 @@ CLERK_BOT_PROTECTION_ENABLED=true
 
 # Optional. Enables natural-language search.
 # OPENAI_API_KEY=sk-replace_me
+# OPENAI_MODEL=gpt-5-mini
 
 # Optional. Falls back to CLERK_SECRET_KEY when omitted.
 # SEARCH_CURSOR_SECRET=replace-with-a-dedicated-random-secret
 
 # Optional locally; required with a deployed web proxy to preserve client IP isolation.
 WEB_PROXY_SECRET=replace-with-the-web-shared-random-secret
+# POLAR_ACCESS_TOKEN=polar_oat_replace_me
+# POLAR_BASE_URL=https://sandbox-api.polar.sh/v1
+# POLAR_ORGANIZATION_ID=00000000-0000-4000-8000-000000000000
+# POLAR_PRO_PRODUCT_ID=00000000-0000-4000-8000-000000000000
+# POLAR_USAGE_METER_ID=00000000-0000-4000-8000-000000000000
+# POLAR_USAGE_EVENT_NAME=credit_consumed
 # POLAR_WEBHOOK_SECRET=replace-with-the-polar-webhook-secret
+# BILLING_APP_ORIGIN=http://localhost:3000
+# BILLING_REQUIRED=true
+
+# Optional. Enables privacy-restricted exception and trace reporting.
+# SENTRY_DSN=https://public-key@o0.ingest.sentry.io/0
+# SENTRY_ENVIRONMENT=local

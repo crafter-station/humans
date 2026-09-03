@@ -2,13 +2,20 @@ import { and, eq, inArray, or } from "drizzle-orm";
 import type { NeonDatabase } from "drizzle-orm/neon-serverless";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
+import { recordEmployment, staleCurrentEmployment } from "./companies";
+import {
+  canonicalGitHubAccountId,
+  lockGitHubIdentity,
+} from "./github-identity";
+import { isProfessionalLink } from "./professional-links";
+import { suppressGitHubIdentityInTransaction } from "./profile-suppression";
 import {
   importRowFailures,
   importRuns,
   operatorAuditEvents,
+  professionalLinks,
   profileObservations,
   profiles,
-  professionalLinks,
   suppressionRecords,
 } from "./schema";
 
@@ -81,7 +88,7 @@ export const importProfiles = async (
   const identities = [
     ...new Set(parsed.valid.map((row) => row.githubAccountId)),
   ];
-  const sourceKeys = parsed.valid.map((row) => [
+  const sourceKeys = parsed.valid.map<[string, string]>((row) => [
     row.source,
     row.sourceRecordId,
   ]);
@@ -109,8 +116,8 @@ export const importProfiles = async (
               or(
                 ...sourceKeys.map(([source, sourceRecordId]) =>
                   and(
-                    eq(profileObservations.source, source!),
-                    eq(profileObservations.sourceRecordId, sourceRecordId!),
+                    eq(profileObservations.source, source),
+                    eq(profileObservations.sourceRecordId, sourceRecordId),
                   ),
                 ),
               ),
@@ -307,34 +314,31 @@ export const suppressProviderIdentity = async (
     correlationId: string;
   },
 ) => {
+  const canonicalProviderId = canonicalGitHubAccountId(
+    suppression.canonicalProviderId,
+  );
+  if (canonicalProviderId === null)
+    throw new ImportContractError("Invalid GitHub account ID");
   await database.transaction(async (tx) => {
-    await tx
-      .insert(suppressionRecords)
-      .values(suppression)
-      .onConflictDoUpdate({
-        target: [
-          suppressionRecords.canonicalProvider,
-          suppressionRecords.canonicalProviderId,
-        ],
-        set: { reason: suppression.reason },
-      });
-    await tx
-      .update(profiles)
-      .set({ searchable: false, searchabilityReason: "operator_suppression" })
-      .where(eq(profiles.githubAccountId, suppression.canonicalProviderId));
+    await suppressGitHubIdentityInTransaction(tx, {
+      githubAccountId: canonicalProviderId,
+      reason: suppression.reason,
+      purge: true,
+    });
     if (operator)
       await tx.insert(operatorAuditEvents).values({
         ...operator,
         reason: suppression.reason,
         action: "profile.suppress",
         subjectType: "github_account",
-        subjectId: suppression.canonicalProviderId,
+        subjectId: canonicalProviderId,
       });
   });
 };
 
 const applyRow = (database: ImportDatabase, row: ImportRow) =>
   database.transaction(async (transaction) => {
+    await lockGitHubIdentity(transaction, row.githubAccountId);
     const [suppression] = await transaction
       .select()
       .from(suppressionRecords)
@@ -374,17 +378,28 @@ const applyRow = (database: ImportDatabase, row: ImportRow) =>
       .select({
         profileId: profiles.profileId,
         searchable: profiles.searchable,
+        searchabilityReason: profiles.searchabilityReason,
       })
       .from(profiles)
       .where(eq(profiles.githubAccountId, row.githubAccountId))
       .limit(1);
     if (profile === undefined) throw new Error("canonical_profile_not_found");
+    if (profile.searchabilityReason === "operator_suppression") {
+      return {
+        created: false,
+        observed: false,
+        searchable: false,
+        suppressed: true,
+      };
+    }
 
     if (created !== undefined && row.professionalLinks.length > 0) {
       await transaction.insert(professionalLinks).values(
         row.professionalLinks.map((url) => ({
           profileId: profile.profileId,
           url,
+          source: row.source,
+          sourceRecordId: row.sourceRecordId,
         })),
       );
     }
@@ -402,7 +417,27 @@ const applyRow = (database: ImportDatabase, row: ImportRow) =>
         })),
       )
       .onConflictDoNothing()
-      .returning({ id: profileObservations.id });
+      .returning({ field: profileObservations.field });
+    if (observations.some(({ field }) => field === "current_company")) {
+      const collectedAt = new Date();
+      await staleCurrentEmployment(
+        transaction,
+        profile.profileId,
+        row.source,
+        collectedAt,
+      );
+      if (row.currentCompany !== null)
+        await recordEmployment(transaction, {
+          profileId: profile.profileId,
+          companyName: row.currentCompany,
+          current: true,
+          source: row.source,
+          sourceRecordId: row.sourceRecordId,
+          pipelineVersion: contractVersion,
+          confidence: 1,
+          collectedAt,
+        });
+    }
     return {
       created: created !== undefined,
       observed: observations.length > 0,
@@ -414,8 +449,9 @@ const applyRow = (database: ImportDatabase, row: ImportRow) =>
 const parseContract = (csv: string) => {
   const lines = csv.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
   while (lines.at(-1)?.trim() === "") lines.pop();
-  if (lines.length === 0) throw new ImportContractError("CSV is empty");
-  const parsedHeader = parseCsvLine(lines[0]!);
+  const header = lines[0];
+  if (header === undefined) throw new ImportContractError("CSV is empty");
+  const parsedHeader = parseCsvLine(header);
   if (
     parsedHeader.error !== null ||
     parsedHeader.values.length !== contractHeaders.length ||
@@ -468,8 +504,8 @@ const parseContract = (csv: string) => {
     if (source.trim() === "") errors.push("source_required");
     if (sourceRecordId.trim() === "") errors.push("source_record_id_required");
     if (name.trim() === "") errors.push("name_required");
-    if (!/^\d+$/.test(githubAccountId))
-      errors.push("github_account_id_invalid");
+    const canonicalAccountId = canonicalGitHubAccountId(githubAccountId);
+    if (canonicalAccountId === null) errors.push("github_account_id_invalid");
     if (!/^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?$/i.test(githubLogin)) {
       errors.push("github_login_invalid");
     }
@@ -486,7 +522,7 @@ const parseContract = (csv: string) => {
       .filter(Boolean);
     if (
       professionalLinks.length === 0 ||
-      professionalLinks.some((value) => !isHttpUrl(value))
+      professionalLinks.some((value) => !isProfessionalLink(value))
     ) {
       errors.push("professional_links_invalid");
     }
@@ -494,6 +530,8 @@ const parseContract = (csv: string) => {
       invalid.push({ row: rowNumber, errors });
       continue;
     }
+    if (canonicalAccountId === null)
+      throw new ImportContractError("Invalid canonical GitHub account ID");
     const sourceKey = `${source}\0${sourceRecordId}`;
     if (sourceRecords.has(sourceKey)) {
       invalid.push({ row: rowNumber, errors: ["duplicate_source_record"] });
@@ -506,7 +544,7 @@ const parseContract = (csv: string) => {
       sourceRecordId,
       name,
       currentCompany: currentCompany || null,
-      githubAccountId,
+      githubAccountId: canonicalAccountId,
       githubLogin,
       qualifyingEvidence: qualifyingEvidence as ImportRow["qualifyingEvidence"],
       professionalLinks,
@@ -533,7 +571,7 @@ const parseCsvLine = (line: string) => {
   let value = "";
   let quoted = false;
   for (let index = 0; index < line.length; index += 1) {
-    const character = line[index]!;
+    const character = line.charAt(index);
     if (character === '"') {
       if (quoted && line[index + 1] === '"') {
         value += '"';
@@ -552,15 +590,6 @@ const parseCsvLine = (line: string) => {
   }
   values.push(value);
   return { values, error: quoted ? "unclosed_quote" : null };
-};
-
-const isHttpUrl = (value: string) => {
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:";
-  } catch {
-    return false;
-  }
 };
 
 const emptyChanges = (): ChangeCounts => ({

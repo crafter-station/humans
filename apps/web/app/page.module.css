@@ -1,9 +1,7 @@
 .page {
   min-height: 100svh;
-  color: #17221b;
-  background:
-    linear-gradient(90deg, transparent 49.8%, rgba(23, 34, 27, 0.1) 50%, transparent 50.2%),
-    #f0eddf;
+  color: var(--foreground);
+  background: var(--background);
   padding: 28px 5vw 48px;
 }
 
@@ -11,7 +9,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  border-bottom: 1px solid rgba(23, 34, 27, 0.35);
+  border-bottom: 1px solid var(--border);
   padding-bottom: 20px;
 }
 
@@ -35,6 +33,12 @@
   cursor: pointer;
 }
 
+.requestLink {
+  padding: 8px 0;
+  font-size: 0.82rem;
+  border-bottom: 1px solid var(--border);
+}
+
 .textButton {
   padding: 10px 12px;
   color: inherit;
@@ -44,8 +48,8 @@
 .primaryButton {
   display: inline-flex;
   padding: 11px 17px;
-  color: #f7f2df;
-  background: #17221b;
+  color: var(--primary-foreground);
+  background: var(--primary);
 }
 
 .hero {
@@ -55,8 +59,8 @@
 
 .eyebrow {
   margin-bottom: 24px;
-  color: #ae3f25;
-  font: 650 0.73rem/1 var(--font-geist-mono);
+  color: var(--muted-foreground);
+  font: 650 0.73rem / 1 var(--font-geist-mono);
   letter-spacing: 0.13em;
   text-transform: uppercase;
 }
@@ -79,8 +83,8 @@
 .heroButton {
   display: inline-flex;
   padding: 15px 20px;
-  color: #fff9e9;
-  background: #ae3f25;
+  color: var(--primary-foreground);
+  background: var(--primary);
 }
 
 .note {
@@ -90,24 +94,29 @@
   align-items: start;
   margin-left: auto;
   padding-top: 20px;
-  border-top: 1px solid rgba(23, 34, 27, 0.35);
+  border-top: 1px solid var(--border);
   font-size: 0.88rem;
   line-height: 1.5;
 }
 
 .note span {
-  color: #ae3f25;
+  color: var(--muted-foreground);
   font-family: var(--font-geist-mono);
 }
 
 @media (max-width: 650px) {
   .page {
     padding: 20px 20px 36px;
-    background: #f0eddf;
+    background: var(--background);
   }
 
   .hero {
     padding-top: 100px;
+  }
+
+  .requestLink {
+    max-width: 100px;
+    text-align: right;
   }
 
   .hero h1 {

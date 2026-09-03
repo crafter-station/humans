@@ -6,6 +6,7 @@ import {
   type EnrichmentRun,
   type GitHubEnrichmentInput,
   PermanentEnrichmentError,
+  OpenAIProviderError,
 } from "./types.js";
 import { classifyGitHubError } from "./workflow.js";
 
@@ -20,10 +21,14 @@ const retry = {
 export const retryOptionsForGitHubError = (error: unknown) => {
   if (error instanceof PermanentEnrichmentError)
     return { skipRetrying: true } as const;
-  if (!(error instanceof GitHubProviderError)) return undefined;
+  if (
+    !(error instanceof GitHubProviderError) &&
+    !(error instanceof OpenAIProviderError)
+  )
+    return undefined;
   const classification = classifyGitHubError(error);
   if (classification === "rate-limit")
-    return { retryAt: (error as GitHubProviderError).retryAfter };
+    return { retryAt: error.retryAfter };
   if (classification === "retry") return undefined;
   return { skipRetrying: true } as const;
 };
@@ -55,10 +60,7 @@ export const createGitHubEnrichmentTasks = (
     error: unknown,
     attempt: number,
   ) => {
-    const options =
-      error instanceof PermanentEnrichmentError
-        ? ({ skipRetrying: true } as const)
-        : undefined;
+    const options = retryOptionsForGitHubError(error);
     if (options?.skipRetrying || attempt >= retry.maxAttempts)
       await stages.retryExhausted(input, error);
     return options;

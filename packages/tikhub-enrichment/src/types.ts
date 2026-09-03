@@ -11,6 +11,7 @@ export type TikHubEnrichmentInput = {
 export type CareerEntry = {
   sourceRecordId: string;
   organization: string;
+  companyId?: string;
   title?: string;
   field?: string;
   startedAt?: string;
@@ -30,6 +31,7 @@ export type TikHubProfile = {
   sourceRecordId: string;
   headline: string | null;
   currentCompany: string | null;
+  currentCompanyId?: string;
   experience: CareerEntry[];
   education: CareerEntry[];
   skills: string[];
@@ -84,7 +86,21 @@ export class TikHubProviderError extends Error {
   }
 }
 
-export class InvalidTikHubPayloadError extends Error {
+export class PermanentTikHubError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PermanentTikHubError";
+  }
+}
+
+export class TikHubCheckpointError extends PermanentTikHubError {
+  constructor() {
+    super("TikHub provider result could not be checkpointed");
+    this.name = "TikHubCheckpointError";
+  }
+}
+
+export class InvalidTikHubPayloadError extends PermanentTikHubError {
   constructor(message: string) {
     super(message);
     this.name = "InvalidTikHubPayloadError";
