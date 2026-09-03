@@ -1106,7 +1106,13 @@ describe("Humans API", () => {
       .select()
       .from(schema.profileRequests)
       .where(eq(schema.profileRequests.profileId, correctionProfile.profileId));
-    expect(correctionRequests).toHaveLength(1);
+    expect(correctionRequests).toHaveLength(2);
+    expect(correctionRequests).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ status: "awaiting_verification" }),
+        expect.objectContaining({ status: "awaiting_verification" }),
+      ]),
+    );
     const [correctionRequest] = correctionRequests;
     if (!correctionRequest)
       throw new Error("Correction request fixture was not created");
@@ -1346,6 +1352,10 @@ describe("Humans API", () => {
       tier: "free",
       status: "active",
     });
+    await database.insert(schema.memberFreeCreditClaims).values({
+      memberId: "reveal_member",
+      organizationId: "reveal_organization",
+    });
     await database.insert(schema.organizationMemberships).values({
       clerkId: "reveal_membership",
       memberId: "reveal_member",
@@ -1443,6 +1453,10 @@ describe("Humans API", () => {
       organizationId: "external_organization",
       tier: "free",
       status: "active",
+    });
+    await database.insert(schema.memberFreeCreditClaims).values({
+      memberId: "external_member",
+      organizationId: "external_organization",
     });
     await database.insert(schema.organizationMemberships).values({
       clerkId: "external_membership",
@@ -1741,6 +1755,10 @@ describe("Humans API", () => {
       organizationId: "empty_credit_organization",
       tier: "free",
       status: "active",
+    });
+    await database.insert(schema.memberFreeCreditClaims).values({
+      memberId: "empty_credit_member",
+      organizationId: "empty_credit_organization",
     });
     await database.insert(schema.organizationMemberships).values({
       clerkId: "empty_credit_membership",

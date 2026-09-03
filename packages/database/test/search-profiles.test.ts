@@ -41,6 +41,10 @@ describe("Profile search", () => {
       migrationsFolder: fileURLToPath(new URL("../drizzle", import.meta.url)),
     });
     await seedSearchProfiles(database);
+    await database.insert(schema.members).values({
+      clerkId: "member_search",
+      name: "Search Member",
+    });
     await database.insert(schema.organizations).values({
       clerkId: "organization_search",
       name: "Search",
@@ -49,6 +53,10 @@ describe("Profile search", () => {
       organizationId: "organization_search",
       tier: "free",
       status: "active",
+    });
+    await database.insert(schema.memberFreeCreditClaims).values({
+      memberId: "member_search",
+      organizationId: "organization_search",
     });
   });
 
