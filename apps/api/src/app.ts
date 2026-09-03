@@ -1252,10 +1252,6 @@ export const createApp = (
   });
 
   app.get("/v1/profiles/search", async (context) => {
-    const actor = await contactActor(context);
-    if (actor === null) return unauthorized(context);
-    if (actor instanceof Response) return actor;
-    const organizationId = actor.organizationId;
     const parsed = z
       .object({
         q: z.string().optional(),
@@ -1270,6 +1266,12 @@ export const createApp = (
         pageSize: z.coerce.number().int().min(1).max(100).optional(),
       })
       .safeParse(context.req.query());
+    const actor = await contactActor(context, {
+      recordOrganizationAccess: !parsed.success || Boolean(parsed.data.cursor),
+    });
+    if (actor === null) return unauthorized(context);
+    if (actor instanceof Response) return actor;
+    const organizationId = actor.organizationId;
     if (!parsed.success) return invalidSearch(context);
 
     const filters = {
@@ -1415,7 +1417,10 @@ export const createApp = (
       : value === "phone"
         ? "direct-professional-phone"
         : null;
-  const contactActor = async (context: AppContext) => {
+  const contactActor = async (
+    context: AppContext,
+    options: { recordOrganizationAccess?: boolean } = {},
+  ) => {
     const session = await identity.authenticate(context.req.raw, context.env);
     if (!session?.organizationId) return null;
     const actor = {
@@ -1428,7 +1433,8 @@ export const createApp = (
       );
       const limited = await enforcePrincipalRateLimits(context, actor);
       if (limited instanceof Response) return limited;
-      await recordActivity(context, actor, "organization_access");
+      if (options.recordOrganizationAccess !== false)
+        await recordActivity(context, actor, "organization_access");
       return actor;
     } catch (error) {
       return tagged(error, "WorkspaceForbidden") ||

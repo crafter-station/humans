@@ -1,10 +1,10 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 
 import {
   creditAccounts,
   creditLedgerEntries,
-  organizationEntitlements,
   operatorAuditEvents,
+  organizationEntitlements,
 } from "./schema";
 import type { DrizzleDatabase, Transaction } from "./service/types";
 
@@ -206,24 +206,31 @@ const inspectReservation = async (
     throw new CreditOperationError("idempotency_conflict");
 
   await lockOrganizationCredits(tx, input.organizationId);
-  const reservation = await findLedgerEntry(
-    tx,
-    input.organizationId,
-    keys.reservation,
-  );
-  const consumption = await findLedgerEntry(
-    tx,
-    input.organizationId,
-    keys.consumption,
-  );
-  const release = await findLedgerEntry(tx, input.organizationId, keys.release);
-  const alternateReservation = await findLedgerEntry(
-    tx,
-    input.organizationId,
+  const alternateReservationKey =
     input.reservationKey === "reservation-suffix"
       ? input.idempotencyKey
-      : `${input.idempotencyKey}:reservation`,
+      : `${input.idempotencyKey}:reservation`;
+  const entries = await tx
+    .select()
+    .from(creditLedgerEntries)
+    .where(
+      and(
+        eq(creditLedgerEntries.organizationId, input.organizationId),
+        inArray(creditLedgerEntries.idempotencyKey, [
+          keys.reservation,
+          keys.consumption,
+          keys.release,
+          alternateReservationKey,
+        ]),
+      ),
+    );
+  const entriesByKey = new Map(
+    entries.map((entry) => [entry.idempotencyKey, entry]),
   );
+  const reservation = entriesByKey.get(keys.reservation);
+  const consumption = entriesByKey.get(keys.consumption);
+  const release = entriesByKey.get(keys.release);
+  const alternateReservation = entriesByKey.get(alternateReservationKey);
   if (alternateReservation)
     throw new CreditOperationError("idempotency_conflict");
   if (reservation)

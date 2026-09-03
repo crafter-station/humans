@@ -1,4 +1,13 @@
-import { and, count, countDistinct, eq, gte, isNull, sql } from "drizzle-orm";
+import {
+  and,
+  count,
+  countDistinct,
+  eq,
+  gte,
+  isNull,
+  or,
+  sql,
+} from "drizzle-orm";
 
 import { applyCreditEntryInTransaction } from "./credits";
 import {
@@ -235,25 +244,32 @@ export const assertPrincipalActive = async (
   database: DrizzleDatabase | Transaction,
   input: Pick<SecurityPrincipal, "memberId" | "organizationId" | "apiKeyId">,
 ) => {
-  const principals = [
-    { type: "member", id: input.memberId },
-    { type: "organization", id: input.organizationId },
-    ...(input.apiKeyId ? [{ type: "api_key", id: input.apiKeyId }] : []),
-  ];
-  for (const principal of principals) {
-    const [suspension] = await database
-      .select({ id: principalSuspensions.id })
-      .from(principalSuspensions)
-      .where(
-        and(
-          eq(principalSuspensions.principalType, principal.type),
-          eq(principalSuspensions.principalId, principal.id),
-          isNull(principalSuspensions.revokedAt),
+  const [suspension] = await database
+    .select({ id: principalSuspensions.id })
+    .from(principalSuspensions)
+    .where(
+      and(
+        isNull(principalSuspensions.revokedAt),
+        or(
+          and(
+            eq(principalSuspensions.principalType, "member"),
+            eq(principalSuspensions.principalId, input.memberId),
+          ),
+          and(
+            eq(principalSuspensions.principalType, "organization"),
+            eq(principalSuspensions.principalId, input.organizationId),
+          ),
+          input.apiKeyId
+            ? and(
+                eq(principalSuspensions.principalType, "api_key"),
+                eq(principalSuspensions.principalId, input.apiKeyId),
+              )
+            : undefined,
         ),
-      )
-      .limit(1);
-    if (suspension) throw new AbuseControlError("suspended");
-  }
+      ),
+    )
+    .limit(1);
+  if (suspension) throw new AbuseControlError("suspended");
 };
 
 export const recordSecurityActivity = async (
@@ -271,8 +287,11 @@ export const recordSecurityActivity = async (
       `organization:${input.organizationId}`,
       ...(input.apiKeyId ? [`api-key:${input.apiKeyId}`] : []),
     ].sort();
-    for (const lockId of lockIds)
-      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${lockId}))`);
+    await tx.execute(sql`
+      select pg_advisory_xact_lock(hashtext(lock_id))
+      from jsonb_array_elements_text(${JSON.stringify(lockIds)}::jsonb) locks(lock_id)
+      order by lock_id
+    `);
     await assertPrincipalActive(tx, input);
     const now = input.now ?? new Date();
     await tx.insert(securityActivity).values({ ...input, createdAt: now });
