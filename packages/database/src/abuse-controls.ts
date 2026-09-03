@@ -1,8 +1,7 @@
 import { and, count, countDistinct, eq, gte, isNull, sql } from "drizzle-orm";
 
+import { applyCreditEntryInTransaction } from "./credits";
 import {
-  creditAccounts,
-  creditLedgerEntries,
   memberFreeCreditClaims,
   organizationEntitlements,
   organizationMemberships,
@@ -109,29 +108,13 @@ export const activateOrganizationEntitlement = async (
         target: organizationEntitlements.organizationId,
         set: { tier: "free", status: "active", updatedAt: new Date() },
       });
-    await tx
-      .insert(creditAccounts)
-      .values({ organizationId: input.organizationId })
-      .onConflictDoNothing();
-    const [grant] = await tx
-      .insert(creditLedgerEntries)
-      .values({
-        organizationId: input.organizationId,
-        idempotencyKey: `free-activation:${input.memberId}`,
-        kind: "grant",
-        amount: 100,
-        referenceId: input.memberId,
-      })
-      .onConflictDoNothing()
-      .returning();
-    if (grant)
-      await tx
-        .update(creditAccounts)
-        .set({
-          balance: sql`${creditAccounts.balance} + 100`,
-          updatedAt: new Date(),
-        })
-        .where(eq(creditAccounts.organizationId, input.organizationId));
+    await applyCreditEntryInTransaction(tx, {
+      organizationId: input.organizationId,
+      idempotencyKey: `free-activation:${input.memberId}`,
+      kind: "grant",
+      amount: 100,
+      referenceId: input.memberId,
+    });
     return { tier: "free" as const, status: "active" as const };
   });
 

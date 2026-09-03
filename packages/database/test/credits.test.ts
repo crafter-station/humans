@@ -5,7 +5,14 @@ import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { applyCreditEntry, getCreditBalance } from "../src/credits";
+import {
+  applyCreditEntry,
+  applyCreditEntryInTransaction,
+  finalizeCreditReservation,
+  getCreditBalance,
+  releaseCreditReservation,
+  reserveCredit,
+} from "../src/credits";
 import * as schema from "../src/schema";
 
 describe("Organization credit ledger", () => {
@@ -102,5 +109,183 @@ describe("Organization credit ledger", () => {
       }),
     ).rejects.toThrow("insufficient_credits");
     expect(await getCreditBalance(database, "organization_credits")).toBe(15);
+  });
+
+  it("enforces the Credit reservation lifecycle through one transaction-composable interface", async () => {
+    const operation = {
+      organizationId: "organization_credits",
+      amount: 3,
+      referenceId: "contact_reveal_one",
+      idempotencyKey: "contact:one",
+      reservationKey: "reservation-suffix" as const,
+    };
+    const initialBalance = await getCreditBalance(
+      database,
+      "organization_credits",
+    );
+
+    await expect(
+      database.transaction((tx) => reserveCredit(tx, operation)),
+    ).resolves.toEqual({ applied: true });
+    await expect(
+      database.transaction((tx) => reserveCredit(tx, operation)),
+    ).resolves.toEqual({ applied: false });
+    await expect(
+      database.transaction((tx) =>
+        reserveCredit(tx, {
+          ...operation,
+          reservationKey: "idempotency-key",
+        }),
+      ),
+    ).rejects.toThrow("idempotency_conflict");
+    await expect(
+      database.transaction((tx) =>
+        finalizeCreditReservation(tx, {
+          ...operation,
+          referenceId: "different_contact_reveal",
+        }),
+      ),
+    ).rejects.toThrow("idempotency_conflict");
+    await expect(
+      database.transaction((tx) => finalizeCreditReservation(tx, operation)),
+    ).resolves.toEqual({ applied: true });
+    await expect(
+      database.transaction((tx) => releaseCreditReservation(tx, operation)),
+    ).rejects.toThrow("idempotency_conflict");
+    expect(await getCreditBalance(database, "organization_credits")).toBe(
+      initialBalance - 3,
+    );
+
+    const releasedOperation = {
+      ...operation,
+      amount: 2,
+      referenceId: "profile-search:fingerprint",
+      idempotencyKey: "search:one",
+      reservationKey: "idempotency-key" as const,
+    };
+    await database.transaction((tx) => reserveCredit(tx, releasedOperation));
+    const releases = await Promise.all([
+      database.transaction((tx) =>
+        releaseCreditReservation(tx, releasedOperation),
+      ),
+      database.transaction((tx) =>
+        releaseCreditReservation(tx, releasedOperation),
+      ),
+    ]);
+    expect(releases.filter(({ applied }) => applied)).toHaveLength(1);
+    await expect(
+      database.transaction((tx) =>
+        finalizeCreditReservation(tx, releasedOperation),
+      ),
+    ).rejects.toThrow("idempotency_conflict");
+    await expect(
+      database.transaction((tx) =>
+        releaseCreditReservation(tx, {
+          ...releasedOperation,
+          idempotencyKey: "missing",
+        }),
+      ),
+    ).rejects.toThrow("idempotency_conflict");
+
+    const refunds = await Promise.all([
+      database.transaction((tx) =>
+        applyCreditEntryInTransaction(tx, {
+          organizationId: operation.organizationId,
+          idempotencyKey: `${operation.referenceId}:refund`,
+          kind: "refund",
+          amount: operation.amount,
+          referenceId: operation.referenceId,
+        }),
+      ),
+      database.transaction((tx) =>
+        applyCreditEntryInTransaction(tx, {
+          organizationId: operation.organizationId,
+          idempotencyKey: `${operation.referenceId}:refund`,
+          kind: "refund",
+          amount: operation.amount,
+          referenceId: operation.referenceId,
+        }),
+      ),
+    ]);
+    expect(refunds.filter(({ applied }) => applied)).toHaveLength(1);
+    expect(await getCreditBalance(database, "organization_credits")).toBe(
+      initialBalance,
+    );
+  });
+
+  it("settles persisted reservations using both existing key conventions", async () => {
+    await database.insert(schema.organizations).values({
+      clerkId: "organization_legacy_credits",
+      name: "Legacy Credits",
+    });
+    await database.insert(schema.organizationEntitlements).values({
+      organizationId: "organization_legacy_credits",
+      tier: "free",
+      status: "active",
+    });
+    await database.insert(schema.creditAccounts).values({
+      organizationId: "organization_legacy_credits",
+      balance: 8,
+    });
+    await database.insert(schema.creditLedgerEntries).values([
+      {
+        organizationId: "organization_legacy_credits",
+        idempotencyKey: "legacy:contact:reservation",
+        kind: "reservation",
+        amount: -2,
+        referenceId: "legacy_contact_reveal",
+      },
+      {
+        organizationId: "organization_legacy_credits",
+        idempotencyKey: "legacy:search",
+        kind: "reservation",
+        amount: -1,
+        referenceId: "profile-search:legacy",
+      },
+      {
+        organizationId: "organization_legacy_credits",
+        idempotencyKey: "legacy:search:release",
+        kind: "release",
+        amount: 1,
+        referenceId: "profile-search:legacy",
+      },
+    ]);
+
+    const contactOperation = {
+      organizationId: "organization_legacy_credits",
+      amount: 2,
+      referenceId: "legacy_contact_reveal",
+      idempotencyKey: "legacy:contact",
+      reservationKey: "reservation-suffix" as const,
+    };
+    await expect(
+      database.transaction((tx) =>
+        finalizeCreditReservation(tx, contactOperation),
+      ),
+    ).resolves.toEqual({ applied: true });
+    await expect(
+      database.transaction((tx) =>
+        finalizeCreditReservation(tx, contactOperation),
+      ),
+    ).resolves.toEqual({ applied: false });
+
+    const searchOperation = {
+      organizationId: "organization_legacy_credits",
+      amount: 1,
+      referenceId: "profile-search:legacy",
+      idempotencyKey: "legacy:search",
+      reservationKey: "idempotency-key" as const,
+    };
+    await expect(
+      database.transaction((tx) =>
+        releaseCreditReservation(tx, searchOperation),
+      ),
+    ).resolves.toEqual({ applied: false });
+    await expect(
+      database.transaction((tx) => reserveCredit(tx, searchOperation)),
+    ).rejects.toThrow("idempotency_conflict");
+    expect(
+      await getCreditBalance(database, "organization_legacy_credits"),
+    ).toBe(8);
   });
 });

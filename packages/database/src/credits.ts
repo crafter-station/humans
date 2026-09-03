@@ -1,6 +1,4 @@
 import { and, eq, sql } from "drizzle-orm";
-import type { NeonDatabase } from "drizzle-orm/neon-serverless";
-import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import {
   creditAccounts,
@@ -8,10 +6,7 @@ import {
   organizationEntitlements,
   operatorAuditEvents,
 } from "./schema";
-
-type Database =
-  | NeonDatabase<typeof import("./schema")>
-  | NodePgDatabase<typeof import("./schema")>;
+import type { DrizzleDatabase, Transaction } from "./service/types";
 
 export type CreditEntryKind = "grant" | "charge" | "refund";
 
@@ -26,207 +21,37 @@ export class CreditOperationError extends Error {
   }
 }
 
-/**
- * Applies a credit movement exactly once and returns the resulting balance.
- * Debits lock the Organization account and can never take it below zero.
- */
-export const applyCreditEntry = (
-  database: Database,
-  input: {
-    organizationId: string;
-    idempotencyKey: string;
-    kind: CreditEntryKind;
-    amount: number;
-    referenceId?: string;
-    operatorAudit?: {
-      operatorId: string;
-      correlationId: string;
-      reason?: string;
-      action: string;
-      subjectType: string;
-      subjectId: string;
-    };
-  },
-) =>
-  database.transaction(async (tx) => {
-    if (!Number.isSafeInteger(input.amount) || input.amount <= 0)
-      throw new Error("invalid_credit_amount");
-    const signedAmount = input.kind === "charge" ? -input.amount : input.amount;
-    if (signedAmount < 0)
-      await requireActiveEntitlement(tx, input.organizationId);
-
-    const [inserted] = await tx
-      .insert(creditLedgerEntries)
-      .values({
-        organizationId: input.organizationId,
-        idempotencyKey: input.idempotencyKey,
-        kind: input.kind,
-        amount: signedAmount,
-        referenceId: input.referenceId,
-      })
-      .onConflictDoNothing()
-      .returning();
-    if (!inserted) {
-      const [existing] = await tx
-        .select()
-        .from(creditLedgerEntries)
-        .where(
-          and(
-            eq(creditLedgerEntries.organizationId, input.organizationId),
-            eq(creditLedgerEntries.idempotencyKey, input.idempotencyKey),
-          ),
-        )
-        .limit(1);
-      if (!existing) throw new Error("credit_entry_not_found");
-      if (
-        existing.kind !== input.kind ||
-        existing.amount !== signedAmount ||
-        existing.referenceId !== (input.referenceId ?? null)
-      )
-        throw new CreditOperationError("idempotency_conflict");
-      const [account] = await tx
-        .select()
-        .from(creditAccounts)
-        .where(eq(creditAccounts.organizationId, input.organizationId));
-      return {
-        entry: existing,
-        balance: account?.balance ?? 0,
-        applied: false,
-      };
-    }
-
-    await tx
-      .insert(creditAccounts)
-      .values({ organizationId: input.organizationId })
-      .onConflictDoNothing();
-    const [account] = await tx
-      .update(creditAccounts)
-      .set({
-        balance: sql`${creditAccounts.balance} + ${signedAmount}`,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(creditAccounts.organizationId, input.organizationId),
-          sql`${creditAccounts.balance} + ${signedAmount} >= 0`,
-        ),
-      )
-      .returning();
-    if (!account) throw new CreditOperationError("insufficient_credits");
-    if (input.operatorAudit)
-      await tx.insert(operatorAuditEvents).values(input.operatorAudit);
-    return { entry: inserted, balance: account.balance, applied: true };
-  });
-
-export const getCreditBalance = async (
-  database: Database,
-  organizationId: string,
-) => {
-  const [account] = await database
-    .select({ balance: creditAccounts.balance })
-    .from(creditAccounts)
-    .where(eq(creditAccounts.organizationId, organizationId));
-  return account?.balance ?? 0;
+type CreditEntryInput = {
+  organizationId: string;
+  idempotencyKey: string;
+  kind: CreditEntryKind;
+  amount: number;
+  referenceId?: string;
+  operatorAudit?: {
+    operatorId: string;
+    correlationId: string;
+    reason?: string;
+    action: string;
+    subjectType: string;
+    subjectId: string;
+  };
 };
 
-/** Charges one Credit after a search page has completed successfully. */
-export const chargeSearchPage = (
-  database: Database,
-  input: {
-    organizationId: string;
-    idempotencyKey: string;
-    requestFingerprint: string;
-  },
-) =>
-  applyCreditEntry(database, {
-    organizationId: input.organizationId,
-    idempotencyKey: input.idempotencyKey,
-    kind: "charge",
-    amount: 1,
-    referenceId: `profile-search:${input.requestFingerprint}`,
-  });
+export type CreditReservation = {
+  organizationId: string;
+  amount: number;
+  referenceId: string;
+  idempotencyKey: string;
+  reservationKey: "idempotency-key" | "reservation-suffix";
+};
 
-export const reserveSearchPage = (
-  database: Database,
-  input: {
-    organizationId: string;
-    idempotencyKey: string;
-    requestFingerprint: string;
-  },
-) =>
-  database.transaction(async (tx) => {
-    await requireActiveEntitlement(tx, input.organizationId);
-    const referenceId = `profile-search:${input.requestFingerprint}`;
-    const [reservation] = await tx
-      .insert(creditLedgerEntries)
-      .values({
-        organizationId: input.organizationId,
-        idempotencyKey: input.idempotencyKey,
-        kind: "reservation",
-        amount: -1,
-        referenceId,
-      })
-      .onConflictDoNothing()
-      .returning();
-    if (!reservation) {
-      const [existing] = await tx
-        .select()
-        .from(creditLedgerEntries)
-        .where(
-          and(
-            eq(creditLedgerEntries.organizationId, input.organizationId),
-            eq(creditLedgerEntries.idempotencyKey, input.idempotencyKey),
-          ),
-        )
-        .limit(1);
-      if (
-        !existing ||
-        existing.kind !== "reservation" ||
-        existing.amount !== -1 ||
-        existing.referenceId !== referenceId
-      ) {
-        throw new CreditOperationError("idempotency_conflict");
-      }
-      const [released] = await tx
-        .select({ id: creditLedgerEntries.id })
-        .from(creditLedgerEntries)
-        .where(
-          and(
-            eq(creditLedgerEntries.organizationId, input.organizationId),
-            eq(
-              creditLedgerEntries.idempotencyKey,
-              `${input.idempotencyKey}:release`,
-            ),
-          ),
-        )
-        .limit(1);
-      if (released) throw new CreditOperationError("idempotency_conflict");
-      return { applied: false };
-    }
-
-    await tx
-      .insert(creditAccounts)
-      .values({ organizationId: input.organizationId })
-      .onConflictDoNothing();
-    const [account] = await tx
-      .update(creditAccounts)
-      .set({
-        balance: sql`${creditAccounts.balance} - 1`,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(creditAccounts.organizationId, input.organizationId),
-          sql`${creditAccounts.balance} >= 1`,
-        ),
-      )
-      .returning();
-    if (!account) throw new CreditOperationError("insufficient_credits");
-    return { applied: true };
-  });
+const validateAmount = (amount: number) => {
+  if (!Number.isSafeInteger(amount) || amount <= 0)
+    throw new Error("invalid_credit_amount");
+};
 
 const requireActiveEntitlement = async (
-  database: Parameters<Parameters<Database["transaction"]>[0]>[0],
+  database: Transaction,
   organizationId: string,
 ) => {
   const [entitlement] = await database
@@ -238,52 +63,273 @@ const requireActiveEntitlement = async (
     throw new CreditOperationError("credits_unavailable");
 };
 
-export const finalizeSearchPage = (
-  database: Database,
-  input: {
-    organizationId: string;
-    idempotencyKey: string;
-    requestFingerprint: string;
+const lockOrganizationCredits = (tx: Transaction, organizationId: string) =>
+  tx.execute(sql`select pg_advisory_xact_lock(hashtext(${organizationId}))`);
+
+const findLedgerEntry = async (
+  tx: Transaction,
+  organizationId: string,
+  idempotencyKey: string,
+) => {
+  const [entry] = await tx
+    .select()
+    .from(creditLedgerEntries)
+    .where(
+      and(
+        eq(creditLedgerEntries.organizationId, organizationId),
+        eq(creditLedgerEntries.idempotencyKey, idempotencyKey),
+      ),
+    )
+    .limit(1);
+  return entry;
+};
+
+const assertExactEntry = (
+  entry: typeof creditLedgerEntries.$inferSelect,
+  expected: {
+    kind: string;
+    amount: number;
+    referenceId: string | null;
   },
-) =>
-  database
+) => {
+  if (
+    entry.kind !== expected.kind ||
+    entry.amount !== expected.amount ||
+    entry.referenceId !== expected.referenceId
+  )
+    throw new CreditOperationError("idempotency_conflict");
+};
+
+/** Applies a Credit movement inside the caller's transaction. */
+export const applyCreditEntryInTransaction = async (
+  tx: Transaction,
+  input: CreditEntryInput,
+) => {
+  validateAmount(input.amount);
+  const signedAmount = input.kind === "charge" ? -input.amount : input.amount;
+  await lockOrganizationCredits(tx, input.organizationId);
+  if (signedAmount < 0)
+    await requireActiveEntitlement(tx, input.organizationId);
+
+  const expected = {
+    kind: input.kind,
+    amount: signedAmount,
+    referenceId: input.referenceId ?? null,
+  };
+  const existing = await findLedgerEntry(
+    tx,
+    input.organizationId,
+    input.idempotencyKey,
+  );
+  if (existing) {
+    assertExactEntry(existing, expected);
+    const [account] = await tx
+      .select()
+      .from(creditAccounts)
+      .where(eq(creditAccounts.organizationId, input.organizationId));
+    return {
+      entry: existing,
+      balance: account?.balance ?? 0,
+      applied: false,
+    };
+  }
+
+  const [entry] = await tx
     .insert(creditLedgerEntries)
     .values({
       organizationId: input.organizationId,
-      idempotencyKey: `${input.idempotencyKey}:consumption`,
+      idempotencyKey: input.idempotencyKey,
+      ...expected,
+    })
+    .returning();
+  if (!entry) throw new Error("credit_entry_insert_failed");
+  await tx
+    .insert(creditAccounts)
+    .values({ organizationId: input.organizationId })
+    .onConflictDoNothing();
+  const [account] = await tx
+    .update(creditAccounts)
+    .set({
+      balance: sql`${creditAccounts.balance} + ${signedAmount}`,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(creditAccounts.organizationId, input.organizationId),
+        sql`${creditAccounts.balance} + ${signedAmount} >= 0`,
+      ),
+    )
+    .returning();
+  if (!account) throw new CreditOperationError("insufficient_credits");
+  if (input.operatorAudit)
+    await tx.insert(operatorAuditEvents).values(input.operatorAudit);
+  return { entry, balance: account.balance, applied: true };
+};
+
+/**
+ * Applies a Credit movement exactly once and returns the resulting balance.
+ * Debits lock the Organization operation and can never take the balance below zero.
+ */
+export const applyCreditEntry = (
+  database: DrizzleDatabase,
+  input: CreditEntryInput,
+) => database.transaction((tx) => applyCreditEntryInTransaction(tx, input));
+
+export const getCreditBalance = async (
+  database: DrizzleDatabase,
+  organizationId: string,
+) => {
+  const [account] = await database
+    .select({ balance: creditAccounts.balance })
+    .from(creditAccounts)
+    .where(eq(creditAccounts.organizationId, organizationId));
+  return account?.balance ?? 0;
+};
+
+const inspectReservation = async (
+  tx: Transaction,
+  input: CreditReservation,
+) => {
+  validateAmount(input.amount);
+  if (input.referenceId.trim() === "" || input.idempotencyKey.trim() === "")
+    throw new CreditOperationError("idempotency_conflict");
+
+  const keys = {
+    reservation:
+      input.reservationKey === "reservation-suffix"
+        ? `${input.idempotencyKey}:reservation`
+        : input.idempotencyKey,
+    consumption: `${input.idempotencyKey}:consumption`,
+    release: `${input.idempotencyKey}:release`,
+  };
+  if (new Set(Object.values(keys)).size !== Object.keys(keys).length)
+    throw new CreditOperationError("idempotency_conflict");
+
+  await lockOrganizationCredits(tx, input.organizationId);
+  const reservation = await findLedgerEntry(
+    tx,
+    input.organizationId,
+    keys.reservation,
+  );
+  const consumption = await findLedgerEntry(
+    tx,
+    input.organizationId,
+    keys.consumption,
+  );
+  const release = await findLedgerEntry(tx, input.organizationId, keys.release);
+  const alternateReservation = await findLedgerEntry(
+    tx,
+    input.organizationId,
+    input.reservationKey === "reservation-suffix"
+      ? input.idempotencyKey
+      : `${input.idempotencyKey}:reservation`,
+  );
+  if (alternateReservation)
+    throw new CreditOperationError("idempotency_conflict");
+  if (reservation)
+    assertExactEntry(reservation, {
+      kind: "reservation",
+      amount: -input.amount,
+      referenceId: input.referenceId,
+    });
+  if (consumption)
+    assertExactEntry(consumption, {
       kind: "consumption",
       amount: 0,
-      referenceId: `profile-search:${input.requestFingerprint}`,
-    })
-    .onConflictDoNothing();
+      referenceId: input.referenceId,
+    });
+  if (release)
+    assertExactEntry(release, {
+      kind: "release",
+      amount: input.amount,
+      referenceId: input.referenceId,
+    });
+  if (!reservation && (consumption || release))
+    throw new CreditOperationError("idempotency_conflict");
+  return { reservation, consumption, release, keys };
+};
 
-export const releaseSearchPage = (
-  database: Database,
-  input: {
-    organizationId: string;
-    idempotencyKey: string;
-    requestFingerprint: string;
-  },
-) =>
-  database.transaction(async (tx) => {
-    const [release] = await tx
-      .insert(creditLedgerEntries)
-      .values({
-        organizationId: input.organizationId,
-        idempotencyKey: `${input.idempotencyKey}:release`,
-        kind: "release",
-        amount: 1,
-        referenceId: `profile-search:${input.requestFingerprint}`,
-      })
-      .onConflictDoNothing()
-      .returning();
-    if (release) {
-      await tx
-        .update(creditAccounts)
-        .set({
-          balance: sql`${creditAccounts.balance} + 1`,
-          updatedAt: new Date(),
-        })
-        .where(eq(creditAccounts.organizationId, input.organizationId));
-    }
+/** Reserves Credits atomically inside a caller-owned transaction. */
+export const reserveCredit = async (
+  tx: Transaction,
+  input: CreditReservation,
+) => {
+  const state = await inspectReservation(tx, input);
+  await requireActiveEntitlement(tx, input.organizationId);
+  if (state.release) throw new CreditOperationError("idempotency_conflict");
+  if (state.reservation) return { applied: false };
+
+  await tx
+    .insert(creditAccounts)
+    .values({ organizationId: input.organizationId })
+    .onConflictDoNothing();
+  await tx.insert(creditLedgerEntries).values({
+    organizationId: input.organizationId,
+    idempotencyKey: state.keys.reservation,
+    kind: "reservation",
+    amount: -input.amount,
+    referenceId: input.referenceId,
   });
+  const [account] = await tx
+    .update(creditAccounts)
+    .set({
+      balance: sql`${creditAccounts.balance} - ${input.amount}`,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(creditAccounts.organizationId, input.organizationId),
+        sql`${creditAccounts.balance} >= ${input.amount}`,
+      ),
+    )
+    .returning();
+  if (!account) throw new CreditOperationError("insufficient_credits");
+  return { applied: true };
+};
+
+/** Records successful consumption of an existing Credit reservation. */
+export const finalizeCreditReservation = async (
+  tx: Transaction,
+  input: CreditReservation,
+) => {
+  const state = await inspectReservation(tx, input);
+  if (!state.reservation || state.release)
+    throw new CreditOperationError("idempotency_conflict");
+  if (state.consumption) return { applied: false };
+  await tx.insert(creditLedgerEntries).values({
+    organizationId: input.organizationId,
+    idempotencyKey: state.keys.consumption,
+    kind: "consumption",
+    amount: 0,
+    referenceId: input.referenceId,
+  });
+  return { applied: true };
+};
+
+/** Releases an unconsumed reservation exactly once. */
+export const releaseCreditReservation = async (
+  tx: Transaction,
+  input: CreditReservation,
+) => {
+  const state = await inspectReservation(tx, input);
+  if (!state.reservation || state.consumption)
+    throw new CreditOperationError("idempotency_conflict");
+  if (state.release) return { applied: false };
+  await tx.insert(creditLedgerEntries).values({
+    organizationId: input.organizationId,
+    idempotencyKey: state.keys.release,
+    kind: "release",
+    amount: input.amount,
+    referenceId: input.referenceId,
+  });
+  const [account] = await tx
+    .update(creditAccounts)
+    .set({
+      balance: sql`${creditAccounts.balance} + ${input.amount}`,
+      updatedAt: new Date(),
+    })
+    .where(eq(creditAccounts.organizationId, input.organizationId))
+    .returning();
+  if (!account) throw new Error("credit_account_not_found");
+  return { applied: true };
+};

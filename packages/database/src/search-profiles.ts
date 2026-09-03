@@ -1,7 +1,4 @@
 import { and, desc, eq, inArray, notExists } from "drizzle-orm";
-import type { NeonDatabase } from "drizzle-orm/neon-serverless";
-import type { NodePgDatabase } from "drizzle-orm/node-postgres";
-
 import {
   memberStatements,
   profileObservations,
@@ -9,10 +6,9 @@ import {
   profiles,
   suppressionRecords,
 } from "./schema";
+import type { DrizzleDatabase, Transaction } from "./service/types";
 
-type SearchDatabase =
-  | NeonDatabase<typeof import("./schema")>
-  | NodePgDatabase<typeof import("./schema")>;
+type SearchDatabase = DrizzleDatabase | Transaction;
 
 export type OpportunityStatus = "open" | "not_open" | "unspecified";
 
@@ -241,22 +237,20 @@ const loadDocuments = async (
     );
   if (rows.length === 0) return [];
   const profileIds = rows.map(({ profileId: id }) => id);
-  const [statements, observations, links] = await Promise.all([
-    database
-      .select()
-      .from(memberStatements)
-      .where(inArray(memberStatements.profileId, profileIds))
-      .orderBy(desc(memberStatements.collectedAt)),
-    database
-      .select()
-      .from(profileObservations)
-      .where(inArray(profileObservations.profileId, profileIds))
-      .orderBy(desc(profileObservations.collectedAt)),
-    database
-      .select()
-      .from(professionalLinks)
-      .where(inArray(professionalLinks.profileId, profileIds)),
-  ]);
+  const statements = await database
+    .select()
+    .from(memberStatements)
+    .where(inArray(memberStatements.profileId, profileIds))
+    .orderBy(desc(memberStatements.collectedAt));
+  const observations = await database
+    .select()
+    .from(profileObservations)
+    .where(inArray(profileObservations.profileId, profileIds))
+    .orderBy(desc(profileObservations.collectedAt));
+  const links = await database
+    .select()
+    .from(professionalLinks)
+    .where(inArray(professionalLinks.profileId, profileIds));
 
   return rows.map((profile): SearchDocument => {
     const ownStatements = statements.filter(

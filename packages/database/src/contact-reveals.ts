@@ -10,18 +10,22 @@ import {
   or,
   sql,
 } from "drizzle-orm";
-import type { NeonDatabase } from "drizzle-orm/neon-serverless";
-import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
+import { organizationRevealLimit } from "./abuse-controls";
+import {
+  applyCreditEntryInTransaction,
+  type CreditReservation,
+  CreditOperationError,
+  finalizeCreditReservation,
+  releaseCreditReservation,
+  reserveCredit,
+} from "./credits";
 import {
   contactDetailInvalidations,
   contactDetailSuppressions,
   contactRevealRequests,
   contactReveals,
-  creditAccounts,
-  creditLedgerEntries,
   members,
-  organizationEntitlements,
   organizationMemberships,
   organizations,
   profileObservations,
@@ -31,11 +35,9 @@ import {
   securityAuditEvents,
   suppressionRecords,
 } from "./schema";
+import type { DrizzleDatabase, Transaction } from "./service/types";
 
-type Database =
-  | NeonDatabase<typeof import("./schema")>
-  | NodePgDatabase<typeof import("./schema")>;
-type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
+type Database = DrizzleDatabase;
 
 export type ContactDetailType =
   | "professional-email"
@@ -83,6 +85,29 @@ export class ContactRevealError extends Error {
 export const contactRevealPrices: Record<ContactDetailType, 5 | 10> = {
   "professional-email": 5,
   "direct-professional-phone": 10,
+};
+
+const contactRevealCreditReservation = (
+  reveal: typeof contactReveals.$inferSelect,
+  idempotencyKey: string,
+): CreditReservation => ({
+  organizationId: reveal.organizationId,
+  amount: reveal.price,
+  referenceId: reveal.id,
+  idempotencyKey,
+  reservationKey: "reservation-suffix",
+});
+
+const mapContactRevealCreditError = async <Result>(
+  operation: () => Promise<Result>,
+) => {
+  try {
+    return await operation();
+  } catch (cause) {
+    if (cause instanceof CreditOperationError)
+      throw new ContactRevealError(cause.code);
+    throw cause;
+  }
 };
 
 const parseContactDetail = (
@@ -504,20 +529,10 @@ export const purchaseContactReveal = async (
             gte(contactRevealRequests.createdAt, startOfDay),
           ),
         );
-      const [entitlement] = await tx
-        .select({
-          status: organizationEntitlements.status,
-          tier: organizationEntitlements.tier,
-        })
-        .from(organizationEntitlements)
-        .where(
-          eq(organizationEntitlements.organizationId, input.organizationId),
-        )
-        .limit(1);
-      const dailyLimit =
-        entitlement?.status === "active" && entitlement.tier === "pro"
-          ? 100
-          : 10;
+      const dailyLimit = await organizationRevealLimit(
+        tx,
+        input.organizationId,
+      );
       if (Number(usage?.total ?? 0) >= dailyLimit)
         throw new ContactRevealError("daily_limit");
 
@@ -575,6 +590,22 @@ export const purchaseContactReveal = async (
             operationIdempotencyKey: input.idempotencyKey,
           };
         }
+        const [reservationRequest] =
+          existing.status === "reserved"
+            ? await tx
+                .select({
+                  idempotencyKey: contactRevealRequests.idempotencyKey,
+                })
+                .from(contactRevealRequests)
+                .where(
+                  and(
+                    eq(contactRevealRequests.revealId, existing.id),
+                    eq(contactRevealRequests.status, "reserved"),
+                  ),
+                )
+                .orderBy(desc(contactRevealRequests.createdAt))
+                .limit(1)
+            : [];
         await tx.insert(contactRevealRequests).values({
           organizationId: input.organizationId,
           idempotencyKey: input.idempotencyKey,
@@ -589,7 +620,8 @@ export const purchaseContactReveal = async (
           observation,
           reveal: existing,
           newlyReserved: false,
-          operationIdempotencyKey: input.idempotencyKey,
+          operationIdempotencyKey:
+            reservationRequest?.idempotencyKey ?? input.idempotencyKey,
         };
       }
 
@@ -642,20 +674,19 @@ export const purchaseContactReveal = async (
             .limit(1);
           if (blocked || suppressed)
             throw new ContactRevealError("invalid_contact_detail");
+          await mapContactRevealCreditError(() =>
+            finalizeCreditReservation(
+              tx,
+              contactRevealCreditReservation(
+                reserved.reveal,
+                reserved.operationIdempotencyKey,
+              ),
+            ),
+          );
           await tx
             .update(contactReveals)
             .set({ status: "finalized", finalizedAt: new Date() })
             .where(eq(contactReveals.id, reserved.reveal.id));
-          await tx
-            .insert(creditLedgerEntries)
-            .values({
-              organizationId: input.organizationId,
-              idempotencyKey: `${reserved.operationIdempotencyKey}:consumption`,
-              kind: "consumption",
-              amount: 0,
-              referenceId: reserved.reveal.id,
-            })
-            .onConflictDoNothing();
           await tx
             .update(contactRevealRequests)
             .set({ status: "finalized" })
@@ -707,40 +738,10 @@ const reserveCredits = async (
   tx: Transaction,
   reveal: typeof contactReveals.$inferSelect,
   idempotencyKey: string,
-) => {
-  const [entitlement] = await tx
-    .select({ status: organizationEntitlements.status })
-    .from(organizationEntitlements)
-    .where(eq(organizationEntitlements.organizationId, reveal.organizationId))
-    .limit(1);
-  if (entitlement?.status !== "active")
-    throw new ContactRevealError("credits_unavailable");
-  await tx
-    .insert(creditAccounts)
-    .values({ organizationId: reveal.organizationId })
-    .onConflictDoNothing();
-  const [account] = await tx
-    .update(creditAccounts)
-    .set({
-      balance: sql`${creditAccounts.balance} - ${reveal.price}`,
-      updatedAt: new Date(),
-    })
-    .where(
-      and(
-        eq(creditAccounts.organizationId, reveal.organizationId),
-        sql`${creditAccounts.balance} >= ${reveal.price}`,
-      ),
-    )
-    .returning();
-  if (!account) throw new ContactRevealError("insufficient_credits");
-  await tx.insert(creditLedgerEntries).values({
-    organizationId: reveal.organizationId,
-    idempotencyKey: `${idempotencyKey}:reservation`,
-    kind: "reservation",
-    amount: -reveal.price,
-    referenceId: reveal.id,
-  });
-};
+) =>
+  mapContactRevealCreditError(() =>
+    reserveCredit(tx, contactRevealCreditReservation(reveal, idempotencyKey)),
+  );
 
 const releaseReservation = async (
   database: Database,
@@ -748,6 +749,12 @@ const releaseReservation = async (
   idempotencyKey: string,
 ) =>
   database.transaction(async (tx) => {
+    await mapContactRevealCreditError(() =>
+      releaseCreditReservation(
+        tx,
+        contactRevealCreditReservation(reveal, idempotencyKey),
+      ),
+    );
     await tx
       .update(contactReveals)
       .set({ status: "released" })
@@ -761,20 +768,6 @@ const releaseReservation = async (
           eq(contactRevealRequests.idempotencyKey, idempotencyKey),
         ),
       );
-    await tx
-      .update(creditAccounts)
-      .set({
-        balance: sql`${creditAccounts.balance} + ${reveal.price}`,
-        updatedAt: new Date(),
-      })
-      .where(eq(creditAccounts.organizationId, reveal.organizationId));
-    await tx.insert(creditLedgerEntries).values({
-      organizationId: reveal.organizationId,
-      idempotencyKey: `${idempotencyKey}:release`,
-      kind: "release",
-      amount: reveal.price,
-      referenceId: reveal.id,
-    });
   });
 
 export const setOrganizationContactRevealPolicy = async (
@@ -904,21 +897,18 @@ export const reportInvalidContactDetail = async (
         ),
       )
       .returning();
-    for (const reveal of reveals) {
-      await tx
-        .update(creditAccounts)
-        .set({
-          balance: sql`${creditAccounts.balance} + ${reveal.price}`,
-          updatedAt: new Date(),
-        })
-        .where(eq(creditAccounts.organizationId, reveal.organizationId));
-      await tx.insert(creditLedgerEntries).values({
-        organizationId: reveal.organizationId,
-        idempotencyKey: `${reveal.id}:refund`,
-        kind: "refund",
-        amount: reveal.price,
-        referenceId: reveal.id,
-      });
+    for (const reveal of reveals.sort((left, right) =>
+      left.organizationId.localeCompare(right.organizationId),
+    )) {
+      await mapContactRevealCreditError(() =>
+        applyCreditEntryInTransaction(tx, {
+          organizationId: reveal.organizationId,
+          idempotencyKey: `${reveal.id}:refund`,
+          kind: "refund",
+          amount: reveal.price,
+          referenceId: reveal.id,
+        }),
+      );
     }
     await tx
       .insert(reenrichmentOutbox)

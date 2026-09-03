@@ -16,7 +16,7 @@ import {
   setPolarSubscriptionStatus,
   suspendPrincipal,
 } from "../src/abuse-controls";
-import { applyCreditEntry, reserveSearchPage } from "../src/credits";
+import { applyCreditEntry, reserveCredit } from "../src/credits";
 import * as schema from "../src/schema";
 
 describe("abuse controls", () => {
@@ -89,11 +89,15 @@ describe("abuse controls", () => {
       amount: 100,
     });
     await expect(
-      reserveSearchPage(database, {
-        organizationId: "organization_one",
-        idempotencyKey: "premature-search",
-        requestFingerprint: "fingerprint",
-      }),
+      database.transaction((tx) =>
+        reserveCredit(tx, {
+          organizationId: "organization_one",
+          amount: 1,
+          referenceId: "profile-search:fingerprint",
+          idempotencyKey: "premature-search",
+          reservationKey: "idempotency-key",
+        }),
+      ),
     ).rejects.toMatchObject({ code: "credits_unavailable" });
     await expect(
       activateOrganizationEntitlement(database, {
