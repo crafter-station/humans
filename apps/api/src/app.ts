@@ -448,7 +448,8 @@ export const createApp = (
   const apiKeyRequests = new Map<string, number[]>();
   const ipRequests = new Map<string, number[]>();
   const naturalSearchRequests = new Map<string, number[]>();
-  const internalMcpToken = crypto.randomUUID();
+  let internalMcpToken: string | undefined;
+  const getInternalMcpToken = () => (internalMcpToken ??= crypto.randomUUID());
 
   app.openapi(healthRoute, async (context) => {
     try {
@@ -843,7 +844,7 @@ export const createApp = (
       async (path, init) => {
         const headers = new Headers(init?.headers);
         headers.set("Authorization", authorization);
-        headers.set("X-Humans-Internal-MCP", internalMcpToken);
+        headers.set("X-Humans-Internal-MCP", getInternalMcpToken());
         headers.set("X-Correlation-ID", mcpCorrelationId);
         headers.set(
           "X-Humans-Client-IP",
@@ -1439,13 +1440,13 @@ export const createApp = (
     context: AppContext,
     apiKey = false,
   ): "web" | "api" | "mcp" =>
-    context.req.header("X-Humans-Internal-MCP") === internalMcpToken
+    context.req.header("X-Humans-Internal-MCP") === getInternalMcpToken()
       ? "mcp"
       : apiKey
         ? "api"
         : "web";
   const clientIp = (context: AppContext) =>
-    context.req.header("X-Humans-Internal-MCP") === internalMcpToken
+    context.req.header("X-Humans-Internal-MCP") === getInternalMcpToken()
       ? (context.req.header("X-Humans-Client-IP") ?? "unknown")
       : context.env?.WEB_PROXY_SECRET &&
           context.req.header("X-Humans-Web-Proxy") ===
