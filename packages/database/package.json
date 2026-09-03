@@ -20,6 +20,7 @@
   "scripts": {
     "db:generate": "node ./scripts/generate-migrations.mjs",
     "db:migrate": "drizzle-kit migrate",
+    "db:rehearse": "vitest run test/migration-rehearsal.test.ts",
     "profiles:import": "bun ./src/import-profiles-cli.ts",
     "format": "biome format --write .",
     "lint": "biome lint .",

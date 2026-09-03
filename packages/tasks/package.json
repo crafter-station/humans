@@ -5,8 +5,12 @@
   "private": true,
   "scripts": {
     "dev": "trigger dev",
-    "deploy:trigger": "trigger deploy",
-    "deploy:trigger:dry-run": "trigger deploy --dry-run",
+    "deploy:trigger": "trigger deploy --env prod",
+    "deploy:trigger:dry-run": "trigger deploy --env prod --dry-run",
+    "deploy:preview": "trigger deploy --env staging",
+    "deploy:preview:dry-run": "trigger deploy --env staging --dry-run",
+    "deploy:production": "trigger deploy --env prod",
+    "deploy:production:dry-run": "trigger deploy --env prod --dry-run",
     "format": "biome format --write .",
     "lint": "biome lint .",
     "check-types": "node ../../node_modules/@typescript/native/bin/tsc --noEmit"

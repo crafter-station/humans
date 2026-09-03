@@ -1,6 +1,10 @@
 import { auth } from "@clerk/nextjs/server";
 
 import { env } from "@/env";
+import {
+  protectedProxyHeaders,
+  protectedResponseHeaders,
+} from "../proxy-security";
 
 const forward = async (request: Request, path: string) => {
   const session = await auth();
@@ -14,15 +18,21 @@ const forward = async (request: Request, path: string) => {
     );
   }
 
-  return fetch(`${env.HUMANS_API_URL}${path}`, {
+  const response = await fetch(`${env.HUMANS_API_URL}${path}`, {
     method: request.method,
-    headers: {
-      authorization: `Bearer ${token}`,
-      ...(request.method === "GET"
-        ? {}
-        : { "content-type": "application/json" }),
-    },
+    headers: protectedProxyHeaders(
+      request,
+      token,
+      request.method === "GET"
+        ? undefined
+        : { "content-type": "application/json" },
+    ),
     body: request.method === "GET" ? undefined : await request.text(),
+    cache: "no-store",
+  });
+  return new Response(response.body, {
+    status: response.status,
+    headers: protectedResponseHeaders(response),
   });
 };
 

@@ -5,6 +5,8 @@
   "private": true,
   "scripts": {
     "build": "wrangler deploy --dry-run --env='' --outdir dist",
+    "deploy:preview": "wrangler deploy --env preview",
+    "deploy:production": "wrangler deploy --env production",
     "dev": "wrangler dev",
     "format": "biome format --write .",
     "lint": "biome lint .",

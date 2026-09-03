@@ -436,6 +436,8 @@ describe("Humans API", () => {
       searchable: false,
     });
     expect(draft.status).toBe(200);
+    expect(draft.headers.get("cache-control")).toBe("private, no-store");
+    expect(draft.headers.get("x-robots-tag")).toBe("noindex, nofollow");
     await expect(draft.json()).resolves.toMatchObject({
       profile: {
         eligibilityBasis: "owned_repository",
@@ -463,6 +465,8 @@ describe("Humans API", () => {
       body: JSON.stringify({ searchable: false }),
     });
     expect(disable.status).toBe(200);
+    expect(disable.headers.get("cache-control")).toBe("private, no-store");
+    expect(disable.headers.get("x-robots-tag")).toBe("noindex, nofollow");
     await expect(disable.json()).resolves.toMatchObject({
       profile: { searchable: false, searchabilityReason: "member_opt_out" },
     });
@@ -476,6 +480,13 @@ describe("Humans API", () => {
       body: JSON.stringify({ searchable: true }),
     });
     expect(unsafeReenable.status).toBe(422);
+
+    const ownerRead = await app.request("/v1/profile", {
+      headers: { authorization: "Bearer profile_session" },
+    });
+    expect(ownerRead.status).toBe(200);
+    expect(ownerRead.headers.get("cache-control")).toBe("private, no-store");
+    expect(ownerRead.headers.get("x-robots-tag")).toBe("noindex, nofollow");
 
     const protectedRead = await app.request("/v1/profile");
     expect(protectedRead.status).toBe(401);

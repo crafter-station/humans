@@ -1079,6 +1079,7 @@ export const createApp = (
           return yield* database.getProfile(session.memberId);
         }).pipe(Effect.provide(databaseLayer(context.env))),
       );
+      privateResponse(context);
       return context.json({ profile }, 200);
     } catch {
       return serviceUnavailable(context);
@@ -1105,6 +1106,7 @@ export const createApp = (
           );
         }).pipe(Effect.provide(databaseLayer(context.env))),
       );
+      privateResponse(context);
       return context.json({ profile }, 200);
     } catch (error) {
       return taggedReason(error) === null
@@ -1128,6 +1130,7 @@ export const createApp = (
           return yield* database.disableProfileSearchability(session.memberId);
         }).pipe(Effect.provide(databaseLayer(context.env))),
       );
+      privateResponse(context);
       return context.json({ profile }, 200);
     } catch (error) {
       return taggedReason(error) === null

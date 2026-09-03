@@ -63,17 +63,22 @@ PostgreSQL adapter to the same service boundary.
 ## Configuration
 
 No secrets are committed. The API requires `DATABASE_URL`, `CLERK_SECRET_KEY`,
-`CLERK_PUBLISHABLE_KEY`, and `CLERK_WEBHOOK_SIGNING_SECRET`. The web application
-requires `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` and `CLERK_SECRET_KEY`; set
-`HUMANS_API_URL` when the API is not available at `http://localhost:8787`.
+`CLERK_PUBLISHABLE_KEY`, and `CLERK_WEBHOOK_SIGNING_SECRET`. Deployed Workers
+also require dedicated `SEARCH_CURSOR_SECRET` and `WEB_PROXY_SECRET` values.
+Natural-language search and billing require `OPENAI_API_KEY` and
+`POLAR_WEBHOOK_SECRET`, respectively. The web application requires
+`NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, and
+`HUMANS_PROXY_SECRET`; set `HUMANS_API_URL` when the API is not available at
+`http://localhost:8787`.
 
 | Environment | Cloudflare environment | Worker name             | Secret source                    |
 | ----------- | ---------------------- | ----------------------- | -------------------------------- |
 | Local       | default                | `humans-api-local`      | `apps/api/.dev.vars`             |
-| Preview     | `preview`              | `humans-api-preview`    | Cloudflare secret `DATABASE_URL` |
-| Production  | `production`           | `humans-api-production` | Cloudflare secret `DATABASE_URL` |
+| Preview     | `preview`              | `humans-api-preview`    | Cloudflare environment secrets   |
+| Production  | `production`           | `humans-api-production` | Cloudflare environment secrets   |
 
-Set deployed secrets from `apps/api` without writing their values to files:
+Set deployed secrets from `apps/api` without writing their values to files. Do
+this for every secret listed above and both environments:
 
 ```sh
 bunx wrangler secret put DATABASE_URL --env preview
@@ -83,6 +88,9 @@ bunx wrangler secret put DATABASE_URL --env production
 Use separate Neon databases or branches for local, preview, and production.
 Configure Clerk to deliver Member, Organization, and Organization membership
 events to `/webhooks/clerk` in each environment.
+
+The complete environment inventory, deployment sequence, MCP Inspector checks,
+and release signoff are in [`docs/v1-release.md`](docs/v1-release.md).
 
 ## Profile Imports
 
