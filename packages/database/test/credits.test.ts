@@ -41,6 +41,8 @@ describe("Organization credit ledger", () => {
       organizationId: "organization_credits",
       tier: "free",
       status: "active",
+      periodStart: new Date("2026-01-01T00:00:00.000Z"),
+      periodEnd: new Date("2100-01-01T00:00:00.000Z"),
     });
   });
 
@@ -222,6 +224,8 @@ describe("Organization credit ledger", () => {
       organizationId: "organization_legacy_credits",
       tier: "free",
       status: "active",
+      periodStart: new Date("2026-01-01T00:00:00.000Z"),
+      periodEnd: new Date("2100-01-01T00:00:00.000Z"),
     });
     await database.insert(schema.creditAccounts).values({
       organizationId: "organization_legacy_credits",
