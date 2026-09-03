@@ -7,10 +7,7 @@ import {
 import { Scalar } from "@scalar/hono-api-reference";
 import { Effect } from "effect";
 import type { Context } from "hono";
-import {
-  contactRevealLogFields,
-  type ContactDetailType,
-} from "@humans/database/contact-reveals";
+import type { ContactDetailType } from "@humans/database/contact-reveals";
 import { profileSearchRequestFingerprint } from "@humans/database/search-profiles";
 
 import {
@@ -19,6 +16,11 @@ import {
   type ApiScope,
   type IdentityBoundary,
 } from "./clerk";
+import {
+  createContactRevealAction,
+  type ContactRevealFailure,
+  toContactRevealFailure,
+} from "./contact-reveal-action";
 import {
   interpretedFiltersSchema,
   NaturalSearchError,
@@ -836,12 +838,9 @@ export const createApp = (
     if (actor === null) return unauthorized(context);
 
     const origin = new URL(context.req.url).origin;
-    const mcpCorrelationId =
-      context.req.header("X-Correlation-ID")?.slice(0, 200) ??
-      crypto.randomUUID();
-    const response = await handleMcpRequest(
-      context.req.raw,
-      async (path, init) => {
+    const mcpCorrelationId = correlationId(context);
+    const response = await handleMcpRequest(context.req.raw, {
+      callApi: async (path, init) => {
         const headers = new Headers(init?.headers);
         headers.set("Authorization", authorization);
         headers.set("X-Humans-Internal-MCP", getInternalMcpToken());
@@ -856,7 +855,22 @@ export const createApp = (
           context.env,
         );
       },
-    );
+      revealContact: async (input) =>
+        contactRevealResponse(
+          context,
+          await contactRevealAction(context).execute({
+            authentication: {
+              kind: "api-key",
+              request: context.req.raw,
+              actor,
+            },
+            environment: context.env,
+            ...input,
+            source: "mcp",
+            correlationId: mcpCorrelationId,
+          }),
+        ),
+    });
     const headers = new Headers(response.headers);
     headers.set("Cache-Control", "private, no-store");
     headers.set("X-Robots-Tag", "noindex, nofollow");
@@ -1473,6 +1487,7 @@ export const createApp = (
     actor: { memberId: string; organizationId: string; keyId?: string },
     kind: "organization_access" | "search" | "profile_read" | "reveal",
     details?: { fingerprint?: string; profileId?: string },
+    source?: "web" | "api" | "mcp",
   ) => {
     const ipHash = await hashIp(clientIp(context));
     return runDatabase(context, (database) =>
@@ -1481,7 +1496,7 @@ export const createApp = (
         organizationId: actor.organizationId,
         apiKeyId: actor.keyId,
         ipHash,
-        source: requestSource(context, actor.keyId !== undefined),
+        source: source ?? requestSource(context, actor.keyId !== undefined),
         kind,
         ...details,
       }),
@@ -1580,60 +1595,66 @@ export const createApp = (
     return actor;
   };
 
+  const contactRevealAction = (context: AppContext) =>
+    createContactRevealAction<Bindings>({
+      authenticateSession: (request, bindings) =>
+        identity.authenticate(request, bindings),
+      authenticateApiKey: (request, bindings) =>
+        identity.authenticateApiKey(request, bindings),
+      requireWorkspace: (actor) =>
+        runDatabase(context, (database) =>
+          database.getWorkspace(actor.memberId, actor.organizationId),
+        ).then(() => undefined),
+      enforcePrincipalRateLimits: async (actor) => {
+        const response = await enforcePrincipalRateLimits(context, {
+          ...actor,
+          apiKeyId: actor.keyId,
+        });
+        return response instanceof Response
+          ? {
+              ok: false,
+              status: 429,
+              error: {
+                code: "rate_limited",
+                message: "The Organization request limit was exceeded",
+              },
+            }
+          : null;
+      },
+      recordActivity: (actor, kind, source, details) =>
+        recordActivity(context, actor, kind, details, source),
+      purchase: (input) =>
+        runDatabase(context, (database) =>
+          database.purchaseContactReveal(input),
+        ),
+      log: console.info,
+    });
+
   const revealWithApiKey = async (
     context: AppContext,
     type: ContactDetailType,
   ) => {
-    try {
-      const actor = await authorizeApiKey(context, [
-        "profiles:read",
-        "contacts:reveal",
-      ]);
-      if (actor instanceof Response) return actor;
-      const profileId = context.req.param("profileId");
-      await recordActivity(context, actor, "reveal", { profileId });
-      const idempotencyKey = context.req.header("Idempotency-Key")?.trim();
-      const input = z
-        .object({ observationId: z.string().min(1).optional() })
-        .strict()
-        .safeParse(await context.req.json().catch(() => ({})));
-      if (
-        !input.success ||
-        !profileId ||
-        !idempotencyKey ||
-        idempotencyKey.length > 200
-      ) {
-        return validationError(context, "invalid_reveal");
-      }
-      const reveal = await runDatabase(context, (database) =>
-        database.purchaseContactReveal({
-          memberId: actor.memberId,
-          organizationId: actor.organizationId,
-          profileId,
-          type,
-          idempotencyKey,
-          observationId: input.data.observationId,
-          apiKeyId: actor.keyId,
-          source: requestSource(context, true),
-          correlationId: correlationId(context),
-        }),
-      );
-      console.info({
-        ...contactRevealLogFields({
-          memberId: actor.memberId,
-          organizationId: actor.organizationId,
-          profileId,
-          observationId: reveal.observationId,
-          type,
-          result: reveal.previouslyPurchased ? "reopened" : "finalized",
-        }),
-        apiKeyId: actor.keyId,
-      });
-      privateResponse(context);
-      return context.json({ reveal }, 200);
-    } catch (error) {
-      return contactError(context, error);
-    }
+    const profileId = context.req.param("profileId");
+    const idempotencyKey = context.req.header("Idempotency-Key")?.trim();
+    const input = z
+      .object({ observationId: z.string().min(1).optional() })
+      .strict()
+      .safeParse(await context.req.json().catch(() => ({})));
+    return contactRevealResponse(
+      context,
+      await contactRevealAction(context).execute({
+        authentication: { kind: "api-key", request: context.req.raw },
+        environment: context.env,
+        profileId,
+        type,
+        idempotencyKey,
+        observation: input.success
+          ? { valid: true, observationId: input.data.observationId }
+          : { valid: false },
+        source: requestSource(context, true),
+        correlationId: correlationId(context),
+      }),
+    );
   };
 
   app.post("/v1/profiles/:profileId/reveal-email", (context) =>
@@ -1682,54 +1703,28 @@ export const createApp = (
   app.post(
     "/v1/profiles/:profileId/contact-reveals/:contactType",
     async (context) => {
-      const actor = await contactActor(context);
-      if (actor === null) return unauthorized(context);
-      if (actor instanceof Response) return actor;
       const type = contactType(context.req.param("contactType"));
       const idempotencyKey = context.req.header("Idempotency-Key")?.trim();
       const body = z
         .object({ observationId: z.string().min(1) })
         .strict()
         .safeParse(await context.req.json().catch(() => null));
-      if (type === null || !idempotencyKey || idempotencyKey.length > 200)
-        return context.json(
-          {
-            error: {
-              code: "invalid_reveal",
-              message: "A Contact Detail type and idempotency key are required",
-            },
-          },
-          400,
-        );
-      try {
-        await recordActivity(context, actor, "reveal", {
+      return contactRevealResponse(
+        context,
+        await contactRevealAction(context).execute({
+          authentication: { kind: "session", request: context.req.raw },
+          environment: context.env,
           profileId: context.req.param("profileId"),
-        });
-        const reveal = await runDatabase(context, (database) =>
-          database.purchaseContactReveal({
-            ...actor,
-            profileId: context.req.param("profileId"),
-            type,
-            idempotencyKey,
+          type,
+          idempotencyKey,
+          observation: {
+            valid: true,
             observationId: body.success ? body.data.observationId : undefined,
-            source: "web",
-            correlationId: correlationId(context),
-          }),
-        );
-        console.info(
-          contactRevealLogFields({
-            ...actor,
-            profileId: context.req.param("profileId"),
-            observationId: reveal.observationId,
-            type,
-            result: reveal.previouslyPurchased ? "reopened" : "finalized",
-          }),
-        );
-        privateContactResponse(context);
-        return context.json({ reveal }, 200);
-      } catch (error) {
-        return contactError(context, error);
-      }
+          },
+          source: "web",
+          correlationId: correlationId(context),
+        }),
+      );
     },
   );
 
@@ -2211,85 +2206,24 @@ const privateContactResponse = (context: Context) => {
   privateResponse(context);
 };
 
+const contactRevealResponse = (
+  context: Context<{ Bindings: Bindings }>,
+  result: { ok: true; reveal: unknown } | ContactRevealFailure,
+) => {
+  privateContactResponse(context);
+  if (result.ok) return context.json({ reveal: result.reveal }, 200);
+  const headers = new Headers(context.res.headers);
+  headers.set("Content-Type", "application/json; charset=UTF-8");
+  return new Response(JSON.stringify({ error: result.error }), {
+    status: result.status,
+    headers,
+  });
+};
+
 const contactError = (
   context: Context<{ Bindings: Bindings }>,
   error: unknown,
-) => {
-  if (tagged(error, "AbuseControlRejected")) return forbidden(context);
-  const reason =
-    typeof error === "object" &&
-    error !== null &&
-    "_tag" in error &&
-    error._tag === "ContactRevealRejected" &&
-    "reason" in error &&
-    typeof error.reason === "string"
-      ? error.reason
-      : null;
-  privateContactResponse(context);
-  if (reason === "forbidden")
-    return context.json(
-      { error: { code: reason, message: "Contact Reveal access is denied" } },
-      403,
-    );
-  if (reason === "not_found")
-    return context.json(
-      {
-        error: {
-          code: reason,
-          message: "No valid Contact Detail was found",
-        },
-      },
-      404,
-    );
-  if (reason === "insufficient_credits")
-    return context.json(
-      {
-        error: {
-          code: reason,
-          message: "The Organization has insufficient Credits",
-        },
-      },
-      402,
-    );
-  if (reason === "credits_unavailable")
-    return context.json(
-      {
-        error: {
-          code: reason,
-          message: "The Organization has no active Credit entitlement",
-        },
-      },
-      403,
-    );
-  if (reason === "idempotency_conflict")
-    return context.json(
-      {
-        error: {
-          code: reason,
-          message: "The idempotency key was already used",
-        },
-      },
-      409,
-    );
-  if (reason === "invalid_contact_detail")
-    return context.json(
-      {
-        error: { code: reason, message: "The Contact Detail is invalid" },
-      },
-      410,
-    );
-  if (reason === "daily_limit")
-    return context.json(
-      {
-        error: {
-          code: reason,
-          message: "The Organization daily Contact Reveal limit was reached",
-        },
-      },
-      429,
-    );
-  return serviceUnavailable(context);
-};
+) => contactRevealResponse(context, toContactRevealFailure(error));
 
 const invalidSearch = (context: {
   json: (body: z.infer<typeof errorResponse>, status: 400) => Response;

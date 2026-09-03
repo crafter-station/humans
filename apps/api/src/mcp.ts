@@ -7,6 +7,17 @@ import { z } from "zod";
 import { interpretedFiltersSchema } from "./natural-search";
 
 type ApiCall = (path: string, init?: RequestInit) => Promise<Response>;
+type RevealContact = (input: {
+  profileId: string;
+  type: "professional-email" | "direct-professional-phone";
+  observation: { valid: true; observationId?: string };
+  idempotencyKey: string;
+}) => Promise<Response>;
+
+type McpOperations = {
+  callApi: ApiCall;
+  revealContact: RevealContact;
+};
 
 const profileId = z.string().min(1).describe("The Profile identifier");
 const idempotencyKey = z
@@ -39,8 +50,11 @@ const searchInput = z
     },
   );
 
-export const handleMcpRequest = async (request: Request, callApi: ApiCall) => {
-  const server = createMcpServer(callApi);
+export const handleMcpRequest = async (
+  request: Request,
+  operations: McpOperations,
+) => {
+  const server = createMcpServer(operations);
   const transport = new WebStandardStreamableHTTPServerTransport({
     enableJsonResponse: true,
     sessionIdGenerator: undefined,
@@ -49,7 +63,7 @@ export const handleMcpRequest = async (request: Request, callApi: ApiCall) => {
   return transport.handleRequest(request);
 };
 
-const createMcpServer = (callApi: ApiCall) => {
+const createMcpServer = ({ callApi, revealContact }: McpOperations) => {
   const server = new McpServer({ name: "Humans", version: "1.0.0" });
 
   server.registerTool(
@@ -130,19 +144,15 @@ const createMcpServer = (callApi: ApiCall) => {
       },
       async ({ profileId: id, observationId, idempotencyKey: key }) =>
         apiResult(
-          await callApi(
-            `/v1/profiles/${encodeURIComponent(id)}/reveal-${contact}`,
-            {
-              method: "POST",
-              headers: {
-                "content-type": "application/json",
-                "Idempotency-Key": key,
-              },
-              body: JSON.stringify(
-                observationId === undefined ? {} : { observationId },
-              ),
-            },
-          ),
+          await revealContact({
+            profileId: id,
+            type:
+              contact === "email"
+                ? "professional-email"
+                : "direct-professional-phone",
+            observation: { valid: true, observationId },
+            idempotencyKey: key,
+          }),
         ),
     );
 

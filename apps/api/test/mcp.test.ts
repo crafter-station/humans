@@ -63,26 +63,6 @@ describe("Humans MCP", () => {
       path: "/v1/search/facets",
       method: "GET",
     },
-    {
-      tool: "reveal_profile_email",
-      args: {
-        profileId: "profile-a",
-        observationId: "email-a",
-        idempotencyKey: "mcp:email",
-      },
-      path: "/v1/profiles/profile-a/reveal-email",
-      method: "POST",
-      body: { observationId: "email-a" },
-      idempotencyKey: "mcp:email",
-    },
-    {
-      tool: "reveal_profile_phone",
-      args: { profileId: "profile-a", idempotencyKey: "mcp:phone" },
-      path: "/v1/profiles/profile-a/reveal-phone",
-      method: "POST",
-      body: {},
-      idempotencyKey: "mcp:phone",
-    },
   ];
 
   it.each(operations)(
@@ -123,6 +103,51 @@ describe("Humans MCP", () => {
           idempotencyKey,
         );
       }
+    },
+  );
+
+  it.each([
+    {
+      tool: "reveal_profile_email",
+      args: {
+        profileId: "profile-a",
+        observationId: "email-a",
+        idempotencyKey: "mcp:email",
+      },
+      type: "professional-email",
+    },
+    {
+      tool: "reveal_profile_phone",
+      args: { profileId: "profile-a", idempotencyKey: "mcp:phone" },
+      type: "direct-professional-phone",
+    },
+  ])(
+    "delegates $tool directly to the protected action",
+    async ({ tool, args, type }) => {
+      const callApi = vi.fn(async () => Response.json({}));
+      const revealContact = vi.fn(async () =>
+        Response.json({ revealed: true }),
+      );
+
+      const response = await mcpRequest(
+        "tools/call",
+        { name: tool, arguments: args },
+        callApi,
+        revealContact,
+      );
+
+      expect(response.status).toBe(200);
+      expect(callApi).not.toHaveBeenCalled();
+      expect(revealContact).toHaveBeenCalledWith({
+        profileId: args.profileId,
+        type,
+        observation: {
+          valid: true,
+          observationId:
+            "observationId" in args ? args.observationId : undefined,
+        },
+        idempotencyKey: args.idempotencyKey,
+      });
     },
   );
 
@@ -168,7 +193,10 @@ describe("Humans MCP", () => {
 const mcpRequest = (
   method: string,
   params: Record<string, unknown>,
-  callApi: Parameters<typeof handleMcpRequest>[1],
+  callApi: Parameters<typeof handleMcpRequest>[1]["callApi"],
+  revealContact: Parameters<
+    typeof handleMcpRequest
+  >[1]["revealContact"] = async () => Response.json({}),
 ) =>
   handleMcpRequest(
     new Request("http://localhost/mcp", {
@@ -180,5 +208,5 @@ const mcpRequest = (
       },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
     }),
-    callApi,
+    { callApi, revealContact },
   );
