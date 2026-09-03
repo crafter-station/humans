@@ -196,7 +196,7 @@ export const clerkIdentityBoundary: IdentityBoundary = {
     const result = await clerk.apiKeys.list({
       subject: organizationId,
       includeInvalid: true,
-      limit: 500,
+      limit: 100,
     });
     return result.data.map(organizationApiKey);
   },
@@ -206,7 +206,7 @@ export const clerkIdentityBoundary: IdentityBoundary = {
     const keys = await clerk.apiKeys.list({
       subject: organizationId,
       includeInvalid: true,
-      limit: 500,
+      limit: 100,
     });
     if (!keys.data.some((key) => key.id === apiKeyId)) return null;
     return organizationApiKey(
