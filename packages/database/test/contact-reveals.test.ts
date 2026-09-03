@@ -352,7 +352,7 @@ describe("Contact Reveals", () => {
     ).resolves.toEqual([
       expect.objectContaining({
         observationId: refreshed.id,
-        maskedValue: "a***@example.com",
+        maskedValue: "a***@e***.com",
         previouslyPurchased: false,
       }),
       expect.objectContaining({ observationId: "phone_observation" }),

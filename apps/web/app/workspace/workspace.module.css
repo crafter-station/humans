@@ -1,5 +1,5 @@
 .page {
-  min-height: 100svh;
+  min-height: calc(100svh - 3.5rem);
   padding: 24px 5vw;
   color: var(--foreground);
   background: var(--background);
@@ -694,22 +694,12 @@
   border: 1px solid var(--input);
   cursor: pointer;
 }
-:global(.panelBackdrop) {
-  position: fixed;
-  inset: 0;
-  z-index: 30;
-  background: rgb(0 0 0 / 50%);
-}
 :global(.profilePanel) {
-  position: absolute;
-  inset: 0 0 0 auto;
   width: min(520px, 94vw);
   padding: 34px;
   overflow-y: auto;
   color: var(--card-foreground);
   background: var(--card);
-  border-left: 1px solid var(--border);
-  box-shadow: -20px 0 60px rgb(0 0 0 / 30%);
 }
 :global(.panelClose) {
   display: block;
