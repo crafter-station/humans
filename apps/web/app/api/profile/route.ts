@@ -30,6 +30,7 @@ const forward = async (request: Request, path: string) => {
     ),
     body: request.method === "GET" ? undefined : await request.text(),
     cache: "no-store",
+    redirect: "error",
   });
   return new Response(response.body, {
     status: response.status,

@@ -26,6 +26,7 @@ vi.mock("@trigger.dev/sdk", () => {
   });
   return {
     idempotencyKeys: { create: vi.fn(async (key: string) => key) },
+    runs: { retrieve: vi.fn() },
     task: vi.fn((configuration: (typeof sdk.tasks)[number]) => {
       sdk.tasks.push(configuration);
       return registered(configuration);
@@ -80,8 +81,7 @@ describe("Trigger.dev composition root", () => {
     ).toEqual({
       "billing-credit-reconciliation-daily-v1": "20 3 * * *",
       "billing-usage-delivery-every-five-minutes-v1": "*/5 * * * *",
-      "billing-usage-recovery-every-fifteen-minutes-v1":
-        "2,17,32,47 * * * *",
+      "billing-usage-recovery-every-fifteen-minutes-v1": "2,17,32,47 * * * *",
       "enrichment-refresh-dispatch-producer-daily-v1": "5 0 * * *",
       "enrichment-dispatch-recovery-daily-v1": "35 0 * * *",
       "enrichment-checkpoint-cleanup-daily-v1": "5 1 * * *",

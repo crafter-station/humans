@@ -28,6 +28,7 @@ export async function GET(request: Request) {
           request.headers.get("Idempotency-Key") ?? crypto.randomUUID(),
       }),
       cache: "no-store",
+      redirect: "error",
     },
   );
   return new Response(response.body, {

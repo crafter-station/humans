@@ -18,11 +18,25 @@ export const polarCustomers = pgTable(
       .primaryKey()
       .references(() => organizations.clerkId),
     polarCustomerId: text("polar_customer_id").notNull(),
+    checkoutClaimId: text("checkout_claim_id"),
+    checkoutClaimExpiresAt: timestamp("checkout_claim_expires_at", {
+      withTimezone: true,
+    }),
+    checkoutId: text("checkout_id"),
+    checkoutUrl: text("checkout_url"),
+    checkoutExpiresAt: timestamp("checkout_expires_at", {
+      withTimezone: true,
+    }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
   },
-  (table) => [unique("polar_customers_customer_unique").on(table.polarCustomerId)],
+  (table) => [
+    unique("polar_customers_customer_unique").on(table.polarCustomerId),
+  ],
 );
 
 export const creditUsageOutbox = pgTable(

@@ -3,10 +3,12 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import {
   creditAccounts,
   creditLedgerEntries,
+  creditReconciliations,
   creditUsageOutbox,
   memberFreeCreditClaims,
   operatorAuditEvents,
   organizationEntitlements,
+  polarCustomers,
   polarWebhookEvents,
 } from "./schema";
 import type { DrizzleDatabase, Transaction } from "./service/types";
@@ -284,12 +286,42 @@ const hasFreeCreditClaim = async (tx: Transaction, organizationId: string) => {
   return claim !== undefined;
 };
 
+const queueCreditReconciliationPeriodInTransaction = async (
+  tx: Transaction,
+  input: { organizationId: string; periodStart: Date; periodEnd: Date },
+) => {
+  validatePeriod(input.periodStart, input.periodEnd);
+  const [customer] = await tx
+    .select({ organizationId: polarCustomers.organizationId })
+    .from(polarCustomers)
+    .where(eq(polarCustomers.organizationId, input.organizationId))
+    .limit(1);
+  if (!customer) return;
+  await tx
+    .insert(creditReconciliations)
+    .values({
+      organizationId: input.organizationId,
+      localCredits: 0,
+      polarCredits: 0,
+      periodStart: input.periodStart,
+      periodEnd: input.periodEnd,
+      status: "pending",
+    })
+    .onConflictDoNothing();
+};
+
 const expireCreditPeriodInTransaction = async (
   tx: Transaction,
   entitlement: typeof organizationEntitlements.$inferSelect,
   actor: CreditActor,
   operation: string,
 ) => {
+  if (entitlement.periodStart && entitlement.periodEnd)
+    await queueCreditReconciliationPeriodInTransaction(tx, {
+      organizationId: entitlement.organizationId,
+      periodStart: entitlement.periodStart,
+      periodEnd: entitlement.periodEnd,
+    });
   const [account] = await tx
     .select({ balance: creditAccounts.balance })
     .from(creditAccounts)
@@ -360,6 +392,12 @@ export const replaceCreditPeriodInTransaction = async (
     entitlement.periodEnd?.getTime() !== input.periodEnd.getTime()
   )
     throw new CreditOperationError("idempotency_conflict");
+  if (entitlement?.periodStart && entitlement.periodEnd && !samePeriod)
+    await queueCreditReconciliationPeriodInTransaction(tx, {
+      organizationId: input.organizationId,
+      periodStart: entitlement.periodStart,
+      periodEnd: entitlement.periodEnd,
+    });
   if (samePeriod) {
     const existingGrant = await findLedgerEntry(
       tx,
@@ -805,10 +843,7 @@ export const finalizeCreditReservation = async (
       })),
     )
     .onConflictDoNothing({
-      target: [
-        creditUsageOutbox.consumptionEntryId,
-        creditUsageOutbox.ordinal,
-      ],
+      target: [creditUsageOutbox.consumptionEntryId, creditUsageOutbox.ordinal],
     });
   return { applied: !state.consumption };
 };

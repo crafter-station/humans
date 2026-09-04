@@ -42,7 +42,11 @@ export const enrichmentDispatcherTask = task({
             `enrichment-dispatch:${dispatch.runId}`,
             { scope: "global" },
           );
-          const options = { idempotencyKey, idempotencyKeyTTL: "365d" };
+          const options = {
+            idempotencyKey,
+            idempotencyKeyTTL: "365d",
+            ttl: "1d",
+          };
           if (dispatch.provider === "github")
             return githubProfileEnrichmentTask.trigger(
               dispatch.payload,

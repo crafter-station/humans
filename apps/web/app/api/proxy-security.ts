@@ -28,11 +28,8 @@ export const trustedClientIp = (request: Request) =>
   undefined;
 
 const proxyMetadataHeaders = (request: Request) => {
-  const correlationId =
-    request.headers.get("X-Correlation-ID")?.slice(0, 200) ??
-    crypto.randomUUID();
   return {
-    "X-Correlation-ID": correlationId,
+    "X-Correlation-ID": crypto.randomUUID(),
     "X-Humans-Web-Proxy": env.HUMANS_PROXY_SECRET,
     "X-Humans-Client-IP": trustedClientIp(request) ?? "unknown",
   };

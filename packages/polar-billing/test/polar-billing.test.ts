@@ -14,12 +14,14 @@ const PRO_PRODUCT_ID = "22222222-2222-4222-8222-222222222222";
 const USAGE_METER_ID = "33333333-3333-4333-8333-333333333333";
 const CUSTOMER_ID = "44444444-4444-4444-8444-444444444444";
 const CHECKOUT_ID = "55555555-5555-4555-8555-555555555555";
+const CHECKOUT_CLAIM_ID = "99999999-9999-4999-8999-999999999999";
 const SESSION_ID = "66666666-6666-4666-8666-666666666666";
 const SUBSCRIPTION_ID = "77777777-7777-4777-8777-777777777777";
 const OTHER_PRODUCT_ID = "88888888-8888-4888-8888-888888888888";
+const CUSTOMER_MEMBER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const LEGACY_CUSTOMER_MEMBER_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const CLERK_ORGANIZATION_ID = "org_2xYZaBc123";
 const OTHER_CLERK_ORGANIZATION_ID = "org_3aBCdEf456";
-const MEMBER_EXTERNAL_ID = "user_2xYZaBc123";
 const OWNER_EMAIL = "owner@acme.example";
 const ACCESS_TOKEN = "polar_oat_test_only";
 const NOW = new Date("2026-09-03T12:00:00.000Z");
@@ -77,9 +79,65 @@ const checkoutResponse = (overrides: Record<string, unknown> = {}) => ({
   product_id: PRO_PRODUCT_ID,
   customer_id: CUSTOMER_ID,
   external_customer_id: CLERK_ORGANIZATION_ID,
-  metadata: { humansOrganizationId: CLERK_ORGANIZATION_ID },
+  metadata: {
+    humansCheckoutClaimId: CHECKOUT_CLAIM_ID,
+    humansOrganizationId: CLERK_ORGANIZATION_ID,
+  },
   ...overrides,
 });
+
+const checkoutListResponse = (
+  items: unknown[] = [],
+  pagination = {
+    totalCount: items.length,
+    maxPage: items.length ? 1 : 0,
+  },
+) =>
+  jsonResponse({
+    items,
+    pagination: {
+      total_count: pagination.totalCount,
+      max_page: pagination.maxPage,
+    },
+  });
+
+const customerMemberResponse = (overrides: Record<string, unknown> = {}) => ({
+  id: CUSTOMER_MEMBER_ID,
+  created_at: "2026-09-01T00:00:00Z",
+  modified_at: null,
+  customer_id: CUSTOMER_ID,
+  email: OWNER_EMAIL,
+  name: null,
+  external_id: "humans-billing-owner",
+  role: "owner",
+  ...overrides,
+});
+
+const legacyCustomerMemberResponse = (
+  overrides: Record<string, unknown> = {},
+) =>
+  customerMemberResponse({
+    id: LEGACY_CUSTOMER_MEMBER_ID,
+    email: "legacy-owner@acme.example",
+    external_id: "user_legacyOwner",
+    role: "billing_manager",
+    ...overrides,
+  });
+
+const customerMemberListResponse = (
+  items: unknown[] = [],
+  pagination = {
+    totalCount: items.length,
+    maxPage: items.length ? 1 : 0,
+  },
+) =>
+  jsonResponse({
+    items,
+    pagination: {
+      total_count: pagination.totalCount,
+      max_page: pagination.maxPage,
+    },
+  });
 
 const portalResponse = (overrides: Record<string, unknown> = {}) => ({
   id: SESSION_ID,
@@ -138,6 +196,7 @@ const makeClient = (
     proProductId: PRO_PRODUCT_ID,
     usageMeterId: USAGE_METER_ID,
     usageEventName: "credit.finalized",
+    customerOwnerEmail: OWNER_EMAIL,
     successUrlAllowlist: [
       "https://app.humans.example",
       "http://localhost:3000",
@@ -201,9 +260,14 @@ describe("configuration", () => {
       [{ proProductId: "not-a-uuid" }, "proProductId"],
       [{ usageMeterId: "not-a-uuid" }, "usageMeterId"],
       [{ usageEventName: "" }, "usageEventName"],
+      [{ customerOwnerEmail: "not-an-email" }, "customerOwnerEmail"],
       [{ successUrlAllowlist: [] }, "successUrlAllowlist"],
       [
         { successUrlAllowlist: ["https://app.humans.example/path"] },
+        "successUrlAllowlist",
+      ],
+      [
+        { successUrlAllowlist: ["http://app.humans.example"] },
         "successUrlAllowlist",
       ],
     ];
@@ -249,10 +313,6 @@ describe("Customers", () => {
     await client.ensureCustomer({
       clerkOrganizationId: CLERK_ORGANIZATION_ID,
       name: "Acme",
-      owner: {
-        externalId: MEMBER_EXTERNAL_ID,
-        email: OWNER_EMAIL,
-      },
     });
 
     expect(requests).toHaveLength(1);
@@ -269,10 +329,6 @@ describe("Customers", () => {
       client.ensureCustomer({
         clerkOrganizationId: CLERK_ORGANIZATION_ID,
         name: "Acme",
-        owner: {
-          externalId: MEMBER_EXTERNAL_ID,
-          email: OWNER_EMAIL,
-        },
       }),
     ).resolves.toMatchObject({ id: CUSTOMER_ID });
 
@@ -286,7 +342,7 @@ describe("Customers", () => {
         name: "Acme",
         organization_id: ORGANIZATION_ID,
         owner: {
-          external_id: MEMBER_EXTERNAL_ID,
+          external_id: "humans-billing-owner",
           email: OWNER_EMAIL,
         },
       },
@@ -312,10 +368,6 @@ describe("Customers", () => {
         client.ensureCustomer({
           clerkOrganizationId: CLERK_ORGANIZATION_ID,
           name: "Acme",
-          owner: {
-            externalId: MEMBER_EXTERNAL_ID,
-            email: OWNER_EMAIL,
-          },
         }),
       ).resolves.toMatchObject({ id: CUSTOMER_ID });
 
@@ -337,10 +389,6 @@ describe("Customers", () => {
     const promise = client.ensureCustomer({
       clerkOrganizationId: CLERK_ORGANIZATION_ID,
       name: "Acme",
-      owner: {
-        externalId: MEMBER_EXTERNAL_ID,
-        email: OWNER_EMAIL,
-      },
     });
     await expect(promise).rejects.toMatchObject({
       code: "invalid_request",
@@ -348,7 +396,7 @@ describe("Customers", () => {
     });
   });
 
-  it("allows one Member email to own multiple Team Customers", async () => {
+  it("uses one service-controlled owner for multiple Team Customers", async () => {
     const otherCustomerId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const { client, requests } = makeClient([
       errorResponse(404),
@@ -366,12 +414,10 @@ describe("Customers", () => {
     await client.ensureCustomer({
       clerkOrganizationId: CLERK_ORGANIZATION_ID,
       name: "Acme",
-      owner: { externalId: MEMBER_EXTERNAL_ID, email: OWNER_EMAIL },
     });
     await client.ensureCustomer({
       clerkOrganizationId: OTHER_CLERK_ORGANIZATION_ID,
       name: "Another Team",
-      owner: { externalId: MEMBER_EXTERNAL_ID, email: OWNER_EMAIL },
     });
 
     const createBodies = requests
@@ -384,7 +430,7 @@ describe("Customers", () => {
         name: "Acme",
         organization_id: ORGANIZATION_ID,
         owner: {
-          external_id: MEMBER_EXTERNAL_ID,
+          external_id: "humans-billing-owner",
           email: OWNER_EMAIL,
         },
       },
@@ -394,7 +440,7 @@ describe("Customers", () => {
         name: "Another Team",
         organization_id: ORGANIZATION_ID,
         owner: {
-          external_id: MEMBER_EXTERNAL_ID,
+          external_id: "humans-billing-owner",
           email: OWNER_EMAIL,
         },
       },
@@ -404,41 +450,18 @@ describe("Customers", () => {
     );
   });
 
-  it.each([
-    [
-      {
-        clerkOrganizationId: CLERK_ORGANIZATION_ID,
-        name: "Acme",
-        owner: { externalId: "", email: OWNER_EMAIL },
-      },
-      "owner.externalId",
-    ],
-    [
-      {
-        clerkOrganizationId: CLERK_ORGANIZATION_ID,
-        name: "Acme",
-        owner: { externalId: MEMBER_EXTERNAL_ID, email: "not-an-email" },
-      },
-      "owner.email",
-    ],
-    [
-      {
-        clerkOrganizationId: CLERK_ORGANIZATION_ID,
-        name: "Acme",
-        owner: {
-          externalId: MEMBER_EXTERNAL_ID,
-          email: OWNER_EMAIL,
-          name: "Unexpected",
-        },
-      },
-      "owner",
-    ],
-  ])("rejects an invalid Team Customer owner at %s", async (input, field) => {
+  it("rejects a caller-supplied Customer owner", async () => {
     const { client, requests } = makeClient([]);
 
-    await expect(client.ensureCustomer(input as never)).rejects.toMatchObject({
+    await expect(
+      client.ensureCustomer({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        name: "Acme",
+        owner: { externalId: "user_untrusted", email: "member@example.com" },
+      } as never),
+    ).rejects.toMatchObject({
       code: "invalid_input",
-      details: { field },
+      details: { field: "input" },
     });
     expect(requests).toHaveLength(0);
   });
@@ -467,6 +490,7 @@ describe("Pro checkout", () => {
 
     await expect(
       client.createProCheckout({
+        checkoutClaimId: CHECKOUT_CLAIM_ID,
         clerkOrganizationId: CLERK_ORGANIZATION_ID,
         successUrl,
       }),
@@ -486,7 +510,10 @@ describe("Pro checkout", () => {
         success_url: successUrl,
         allow_discount_codes: false,
         allow_trial: false,
-        metadata: { humansOrganizationId: CLERK_ORGANIZATION_ID },
+        metadata: {
+          humansCheckoutClaimId: CHECKOUT_CLAIM_ID,
+          humansOrganizationId: CLERK_ORGANIZATION_ID,
+        },
       },
     });
     expect(Object.keys(requests[0]?.body as object).sort()).toEqual([
@@ -508,11 +535,13 @@ describe("Pro checkout", () => {
     ]);
 
     await client.createProCheckout({
+      checkoutClaimId: CHECKOUT_CLAIM_ID,
       clerkOrganizationId: CLERK_ORGANIZATION_ID,
       successUrl: "https://app.humans.example/settings/billing/success",
     });
     await expect(
       client.createProCheckout({
+        checkoutClaimId: CHECKOUT_CLAIM_ID,
         clerkOrganizationId: CLERK_ORGANIZATION_ID,
         successUrl: "https://app.humans.example.evil.test/success",
       }),
@@ -528,6 +557,7 @@ describe("Pro checkout", () => {
 
     await expect(
       client.createProCheckout({
+        checkoutClaimId: CHECKOUT_CLAIM_ID,
         clerkOrganizationId: CLERK_ORGANIZATION_ID,
         successUrl: "https://app.humans.example/success",
         productId: OTHER_PRODUCT_ID,
@@ -544,9 +574,11 @@ describe("Pro checkout", () => {
         checkoutResponse({ product_id: OTHER_PRODUCT_ID, url: secretUrl }),
         201,
       ),
+      checkoutListResponse(),
     ]);
 
     const promise = client.createProCheckout({
+      checkoutClaimId: CHECKOUT_CLAIM_ID,
       clerkOrganizationId: CLERK_ORGANIZATION_ID,
       successUrl: "https://app.humans.example/settings/billing/success",
     });
@@ -556,11 +588,384 @@ describe("Pro checkout", () => {
       secretUrl,
     );
   });
+
+  it("reuses an existing open checkout instead of creating another", async () => {
+    const successUrl = "https://app.humans.example/settings/billing/success";
+    const { client, requests } = makeClient([
+      checkoutListResponse([checkoutResponse({ success_url: successUrl })]),
+    ]);
+
+    await expect(
+      client.findOpenProCheckout({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        successUrl,
+      }),
+    ).resolves.toMatchObject({ id: CHECKOUT_ID });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.method).toBe("GET");
+  });
+
+  it("selects only an open checkout with the exact current success URL", async () => {
+    const successUrl = "https://app.humans.example/settings/billing/success";
+    const oldCheckoutId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const oldClaimId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const { client } = makeClient([
+      checkoutListResponse([
+        checkoutResponse({
+          id: oldCheckoutId,
+          success_url: "https://old.humans.example/workspace?billing=success",
+          metadata: {
+            humansCheckoutClaimId: oldClaimId,
+            humansOrganizationId: CLERK_ORGANIZATION_ID,
+          },
+        }),
+        checkoutResponse({ success_url: successUrl }),
+      ]),
+    ]);
+
+    await expect(
+      client.findOpenProCheckout({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        successUrl,
+      }),
+    ).resolves.toMatchObject({ id: CHECKOUT_ID });
+  });
+
+  it("does not reuse an open checkout from a rotated application origin", async () => {
+    const { client } = makeClient([
+      checkoutListResponse([
+        checkoutResponse({
+          success_url: "https://old.humans.example/workspace?billing=success",
+        }),
+      ]),
+    ]);
+
+    await expect(
+      client.findOpenProCheckout({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        successUrl: "https://app.humans.example/workspace?billing=success",
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it("treats Polar's open status as authoritative over a skewed clock", async () => {
+    const successUrl = "https://app.humans.example/settings/billing/success";
+    const { clock } = makeClock(new Date("2026-09-03T14:00:00Z"));
+    const { client, requests } = makeClient(
+      [checkoutListResponse([checkoutResponse({ success_url: successUrl })])],
+      { clock },
+    );
+
+    await expect(
+      client.findOpenProCheckout({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        successUrl,
+      }),
+    ).resolves.toMatchObject({ id: CHECKOUT_ID });
+    expect(requests.map(({ method }) => method)).toEqual(["GET"]);
+  });
+
+  it("rejects an exact checkout from an older application origin", async () => {
+    for (const status of [
+      "open",
+      "expired",
+      "confirmed",
+      "succeeded",
+      "failed",
+    ] as const) {
+      const { client, requests } = makeClient([
+        jsonResponse(
+          checkoutResponse({
+            status,
+            success_url: "https://old.humans.example/billing/success",
+          }),
+        ),
+      ]);
+      await expect(
+        client.getProCheckout({
+          checkoutId: CHECKOUT_ID,
+          clerkOrganizationId: CLERK_ORGANIZATION_ID,
+          successUrl: "https://app.humans.example/settings/billing/success",
+        }),
+      ).rejects.toMatchObject({
+        code: "malformed_response",
+        details: { operation: "get_checkout" },
+      });
+      expect(requests[0]?.url).toBe(
+        `${POLAR_PRODUCTION_BASE_URL}/checkouts/${CHECKOUT_ID}`,
+      );
+    }
+  });
+
+  it("finds an uncertain checkout by its durable claim across all statuses", async () => {
+    const otherClaimId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const { client, requests } = makeClient([
+      checkoutListResponse([
+        checkoutResponse({
+          id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          success_url: "https://old.humans.example/workspace?billing=success",
+          metadata: {
+            humansCheckoutClaimId: otherClaimId,
+            humansOrganizationId: CLERK_ORGANIZATION_ID,
+          },
+        }),
+        checkoutResponse({
+          status: "succeeded",
+        }),
+      ]),
+    ]);
+
+    await expect(
+      client.findProCheckoutByClaim({
+        checkoutClaimId: CHECKOUT_CLAIM_ID,
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        successUrl: "https://app.humans.example/settings/billing/success",
+      }),
+    ).resolves.toMatchObject({ id: CHECKOUT_ID, status: "succeeded" });
+    const lookup = new URL(requests[0]?.url ?? "");
+    expect(lookup.searchParams.getAll("status")).toEqual([]);
+  });
+
+  it("finds a checkout claim on record 101", async () => {
+    const successUrl = "https://app.humans.example/settings/billing/success";
+    const firstPage = Array.from({ length: 100 }, (_, index) => {
+      const ordinal = (index + 1).toString(16).padStart(8, "0");
+      return checkoutResponse({
+        id: `${ordinal}-0000-4000-8000-000000000001`,
+        success_url: successUrl,
+        metadata: {
+          humansCheckoutClaimId: `${ordinal}-0000-4001-8000-000000000002`,
+          humansOrganizationId: CLERK_ORGANIZATION_ID,
+        },
+      });
+    });
+    const { client, requests } = makeClient([
+      checkoutListResponse(firstPage, { totalCount: 101, maxPage: 2 }),
+      checkoutListResponse(
+        [checkoutResponse({ status: "succeeded", success_url: successUrl })],
+        { totalCount: 101, maxPage: 2 },
+      ),
+    ]);
+
+    await expect(
+      client.findProCheckoutByClaim({
+        checkoutClaimId: CHECKOUT_CLAIM_ID,
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        successUrl,
+      }),
+    ).resolves.toMatchObject({ id: CHECKOUT_ID, status: "succeeded" });
+    expect(
+      requests.map(({ url }) => new URL(url).searchParams.get("page")),
+    ).toEqual(["1", "2"]);
+  });
+
+  it("rejects a duplicate checkout claim on a later page", async () => {
+    const successUrl = "https://app.humans.example/settings/billing/success";
+    const firstPage = [
+      checkoutResponse({ success_url: successUrl }),
+      ...Array.from({ length: 99 }, (_, index) => {
+        const ordinal = (index + 1).toString(16).padStart(8, "0");
+        return checkoutResponse({
+          id: `${ordinal}-0000-4000-8000-000000000001`,
+          success_url: successUrl,
+          metadata: {
+            humansCheckoutClaimId: `${ordinal}-0000-4001-8000-000000000002`,
+            humansOrganizationId: CLERK_ORGANIZATION_ID,
+          },
+        });
+      }),
+    ];
+    const { client, requests } = makeClient([
+      checkoutListResponse(firstPage, { totalCount: 101, maxPage: 2 }),
+      checkoutListResponse(
+        [
+          checkoutResponse({
+            id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            success_url: successUrl,
+          }),
+        ],
+        { totalCount: 101, maxPage: 2 },
+      ),
+    ]);
+
+    await expect(
+      client.findProCheckoutByClaim({
+        checkoutClaimId: CHECKOUT_CLAIM_ID,
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        successUrl,
+      }),
+    ).rejects.toMatchObject({
+      code: "malformed_response",
+      details: { operation: "list_checkouts" },
+    });
+    expect(
+      requests.map(({ url }) => new URL(url).searchParams.get("page")),
+    ).toEqual(["1", "2"]);
+  });
+
+  it("rejects a claimed checkout with a mismatched success URL", async () => {
+    const { client } = makeClient([
+      checkoutListResponse([
+        checkoutResponse({
+          success_url: "https://old.humans.example/workspace?billing=success",
+        }),
+      ]),
+    ]);
+
+    await expect(
+      client.findProCheckoutByClaim({
+        checkoutClaimId: CHECKOUT_CLAIM_ID,
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        successUrl: "https://app.humans.example/workspace?billing=success",
+      }),
+    ).rejects.toMatchObject({
+      code: "malformed_response",
+      details: { operation: "list_checkouts" },
+    });
+  });
+
+  it("rejects a mismatched exact checkout without releasing state", async () => {
+    const { client } = makeClient([
+      jsonResponse(checkoutResponse({ id: OTHER_PRODUCT_ID })),
+    ]);
+    await expect(
+      client.getProCheckout({
+        checkoutId: CHECKOUT_ID,
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        successUrl: "https://app.humans.example/settings/billing/success",
+      }),
+    ).rejects.toMatchObject({ code: "malformed_response" });
+  });
+
+  it("refuses to trust checkout-list pagination when it is incomplete", async () => {
+    const malformedResponses = [
+      jsonResponse({ items: [] }),
+      jsonResponse({
+        items: [],
+        pagination: { total_count: 1, max_page: 1 },
+      }),
+      jsonResponse({
+        items: [],
+        pagination: { total_count: 1_001, max_page: 11 },
+      }),
+      checkoutListResponse([checkoutResponse(), checkoutResponse()]),
+      checkoutListResponse([
+        checkoutResponse(),
+        checkoutResponse({ product_id: OTHER_PRODUCT_ID }),
+      ]),
+    ];
+    for (const response of malformedResponses) {
+      const { client, requests } = makeClient([response]);
+      await expect(
+        client.findOpenProCheckout({
+          clerkOrganizationId: CLERK_ORGANIZATION_ID,
+          successUrl: "https://app.humans.example/settings/billing/success",
+        }),
+      ).rejects.toMatchObject({ code: "malformed_response" });
+      expect(requests.map(({ method }) => method)).toEqual(["GET"]);
+    }
+  });
+
+  it("recovers a provider-created checkout after losing the create response", async () => {
+    const successUrl = "https://app.humans.example/settings/billing/success";
+    const { client, requests } = makeClient([
+      new Error("provider response contained a secret"),
+      checkoutListResponse([checkoutResponse({ success_url: successUrl })]),
+    ]);
+
+    await expect(
+      client.createProCheckout({
+        checkoutClaimId: CHECKOUT_CLAIM_ID,
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        successUrl,
+      }),
+    ).resolves.toMatchObject({ id: CHECKOUT_ID });
+    expect(requests.map(({ method }) => method)).toEqual(["POST", "GET"]);
+  });
+
+  it.each([
+    ["definitive absence", checkoutListResponse()],
+    [
+      "malformed pagination",
+      jsonResponse({
+        items: [],
+        pagination: { total_count: 101, max_page: 2 },
+      }),
+    ],
+    ["lookup network failure", new Error("claim lookup failed")],
+  ] as const)(
+    "preserves ambiguous create state after %s",
+    async (_case, recoveryResponse) => {
+      const { client, requests } = makeClient([
+        new Error("create response lost"),
+        recoveryResponse,
+      ]);
+
+      await expect(
+        client.createProCheckout({
+          checkoutClaimId: CHECKOUT_CLAIM_ID,
+          clerkOrganizationId: CLERK_ORGANIZATION_ID,
+          successUrl: "https://app.humans.example/workspace?billing=success",
+        }),
+      ).rejects.toMatchObject({
+        code: "network_error",
+        details: { operation: "create_checkout" },
+      });
+      expect(requests.map(({ method }) => method)).toEqual(["POST", "GET"]);
+    },
+  );
+
+  it("accepts an exact allowlisted HTTP loopback success URL", async () => {
+    const successUrl = "http://localhost:3000/workspace?billing=success";
+    const { client } = makeClient([
+      jsonResponse(checkoutResponse({ success_url: successUrl }), 201),
+    ]);
+
+    await expect(
+      client.createProCheckout({
+        checkoutClaimId: CHECKOUT_CLAIM_ID,
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        successUrl,
+      }),
+    ).resolves.toMatchObject({ id: CHECKOUT_ID });
+  });
+
+  it("requires an exact HTTP loopback success URL even when both origins are allowlisted", async () => {
+    const { client } = makeClient(
+      [
+        jsonResponse(
+          checkoutResponse({
+            success_url: "http://127.0.0.1:3000/workspace?billing=success",
+          }),
+          201,
+        ),
+        checkoutListResponse(),
+      ],
+      {
+        successUrlAllowlist: ["http://localhost:3000", "http://127.0.0.1:3000"],
+      },
+    );
+
+    await expect(
+      client.createProCheckout({
+        checkoutClaimId: CHECKOUT_CLAIM_ID,
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        successUrl: "http://localhost:3000/workspace?billing=success",
+      }),
+    ).rejects.toMatchObject({
+      code: "malformed_response",
+      details: { operation: "create_checkout" },
+    });
+  });
 });
 
 describe("Customer Portal", () => {
   it("creates a short-lived portal session without exposing its raw token", async () => {
     const { client, requests } = makeClient([
+      jsonResponse(customerResponse()),
+      jsonResponse(customerMemberResponse()),
+      customerMemberListResponse([customerMemberResponse()]),
+      customerMemberListResponse([customerMemberResponse()]),
       jsonResponse(portalResponse(), 201),
     ]);
 
@@ -575,14 +980,456 @@ describe("Customer Portal", () => {
       expiresAt: new Date("2026-09-03T12:30:00Z"),
     });
     expect(session).not.toHaveProperty("token");
-    expect(requests[0]).toMatchObject({
+    expect(requests[4]).toMatchObject({
       url: `${POLAR_PRODUCTION_BASE_URL}/customer-sessions/`,
       method: "POST",
       body: {
         external_customer_id: CLERK_ORGANIZATION_ID,
+        external_member_id: "humans-billing-owner",
         return_url: "https://app.humans.example/settings/billing",
       },
     });
+    expect(requests.slice(0, 4)).toEqual([
+      expect.objectContaining({
+        method: "GET",
+        url: `${POLAR_PRODUCTION_BASE_URL}/customers/external/${CLERK_ORGANIZATION_ID}`,
+      }),
+      expect.objectContaining({
+        method: "GET",
+        url: `${POLAR_PRODUCTION_BASE_URL}/customers/external/${CLERK_ORGANIZATION_ID}/members/humans-billing-owner`,
+      }),
+      expect.objectContaining({
+        method: "GET",
+        url: `${POLAR_PRODUCTION_BASE_URL}/customers/external/${CLERK_ORGANIZATION_ID}/members?page=1&limit=100`,
+      }),
+      expect.objectContaining({
+        method: "GET",
+        url: `${POLAR_PRODUCTION_BASE_URL}/customers/external/${CLERK_ORGANIZATION_ID}/members?page=1&limit=100`,
+      }),
+    ]);
+  });
+
+  it("transfers ownership and demotes the old Clerk Member", async () => {
+    const { client, requests } = makeClient([
+      jsonResponse(customerResponse()),
+      errorResponse(404),
+      jsonResponse(customerMemberResponse({ role: "billing_manager" }), 201),
+      jsonResponse(customerMemberResponse()),
+      customerMemberListResponse([
+        customerMemberResponse(),
+        legacyCustomerMemberResponse(),
+      ]),
+      jsonResponse(legacyCustomerMemberResponse({ role: "member" })),
+      customerMemberListResponse([
+        customerMemberResponse(),
+        legacyCustomerMemberResponse({ role: "member" }),
+      ]),
+      jsonResponse(portalResponse(), 201),
+    ]);
+
+    await expect(
+      client.createCustomerPortalSession({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+      }),
+    ).resolves.toMatchObject({ id: SESSION_ID });
+    expect(requests.map(({ method }) => method)).toEqual([
+      "GET",
+      "GET",
+      "POST",
+      "PATCH",
+      "GET",
+      "PATCH",
+      "GET",
+      "POST",
+    ]);
+    expect(requests[2]).toMatchObject({
+      url: `${POLAR_PRODUCTION_BASE_URL}/customers/external/${CLERK_ORGANIZATION_ID}/members`,
+      body: {
+        email: OWNER_EMAIL,
+        external_id: "humans-billing-owner",
+        role: "billing_manager",
+      },
+    });
+    expect(requests[3]).toMatchObject({
+      url: `${POLAR_PRODUCTION_BASE_URL}/customers/external/${CLERK_ORGANIZATION_ID}/members/humans-billing-owner`,
+      body: { role: "owner" },
+    });
+    expect(requests[5]).toMatchObject({
+      url: `${POLAR_PRODUCTION_BASE_URL}/customers/${CUSTOMER_ID}/members/${LEGACY_CUSTOMER_MEMBER_ID}`,
+      body: { role: "member" },
+    });
+    expect(requests[7]?.body).toMatchObject({
+      external_customer_id: CLERK_ORGANIZATION_ID,
+      external_member_id: "humans-billing-owner",
+    });
+  });
+
+  it("finishes an existing partial service-owner migration idempotently", async () => {
+    const { client, requests } = makeClient([
+      jsonResponse(customerResponse()),
+      jsonResponse(
+        customerMemberResponse({
+          email: "old-billing@humans.example",
+          role: "billing_manager",
+        }),
+      ),
+      jsonResponse(customerMemberResponse()),
+      customerMemberListResponse([customerMemberResponse()]),
+      customerMemberListResponse([customerMemberResponse()]),
+      jsonResponse(portalResponse(), 201),
+    ]);
+
+    await expect(
+      client.createCustomerPortalSession({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+      }),
+    ).resolves.toMatchObject({ id: SESSION_ID });
+    expect(requests.map(({ method }) => method)).toEqual([
+      "GET",
+      "GET",
+      "PATCH",
+      "GET",
+      "GET",
+      "POST",
+    ]);
+    expect(requests[2]?.body).toEqual({
+      role: "owner",
+      email: OWNER_EMAIL,
+    });
+  });
+
+  it("recovers when another request concurrently creates and promotes the service owner", async () => {
+    const { client, requests } = makeClient([
+      jsonResponse(customerResponse()),
+      errorResponse(404),
+      errorResponse(422),
+      jsonResponse(customerMemberResponse()),
+      customerMemberListResponse([customerMemberResponse()]),
+      customerMemberListResponse([customerMemberResponse()]),
+      jsonResponse(portalResponse(), 201),
+    ]);
+
+    await expect(
+      client.createCustomerPortalSession({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+      }),
+    ).resolves.toMatchObject({ id: SESSION_ID });
+    expect(requests.map(({ method }) => method)).toEqual([
+      "GET",
+      "GET",
+      "POST",
+      "GET",
+      "GET",
+      "GET",
+      "POST",
+    ]);
+  });
+
+  it("recovers after losing the ownership-transfer response", async () => {
+    const { client, requests } = makeClient([
+      jsonResponse(customerResponse()),
+      jsonResponse(customerMemberResponse({ role: "billing_manager" })),
+      new Error("ownership response lost"),
+      jsonResponse(customerMemberResponse()),
+      customerMemberListResponse([customerMemberResponse()]),
+      customerMemberListResponse([customerMemberResponse()]),
+      jsonResponse(portalResponse(), 201),
+    ]);
+
+    await expect(
+      client.createCustomerPortalSession({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+      }),
+    ).resolves.toMatchObject({ id: SESSION_ID });
+    expect(requests.map(({ method }) => method)).toEqual([
+      "GET",
+      "GET",
+      "PATCH",
+      "GET",
+      "GET",
+      "GET",
+      "POST",
+    ]);
+  });
+
+  it("demotes a stale billing manager even when the service owner already exists", async () => {
+    const { client, requests } = makeClient([
+      jsonResponse(customerResponse()),
+      jsonResponse(customerMemberResponse()),
+      customerMemberListResponse([
+        customerMemberResponse(),
+        legacyCustomerMemberResponse(),
+      ]),
+      jsonResponse(legacyCustomerMemberResponse({ role: "member" })),
+      customerMemberListResponse([
+        customerMemberResponse(),
+        legacyCustomerMemberResponse({ role: "member" }),
+      ]),
+      jsonResponse(portalResponse(), 201),
+    ]);
+
+    await expect(
+      client.createCustomerPortalSession({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+      }),
+    ).resolves.toMatchObject({ id: SESSION_ID });
+    expect(requests.map(({ method }) => method)).toEqual([
+      "GET",
+      "GET",
+      "GET",
+      "PATCH",
+      "GET",
+      "POST",
+    ]);
+    expect(requests[3]).toMatchObject({
+      url: `${POLAR_PRODUCTION_BASE_URL}/customers/${CUSTOMER_ID}/members/${LEGACY_CUSTOMER_MEMBER_ID}`,
+      body: { role: "member" },
+    });
+  });
+
+  it("enumerates more than 100 members and preserves ordinary members", async () => {
+    const ordinaryMembers = Array.from({ length: 99 }, (_, index) => {
+      const ordinal = (index + 1).toString(16).padStart(8, "0");
+      return customerMemberResponse({
+        id: `${ordinal}-1000-4000-8000-000000000001`,
+        email: `member-${index + 1}@acme.example`,
+        external_id: `user_member_${index + 1}`,
+        role: "member",
+      });
+    });
+    const firstPage = [customerMemberResponse(), ...ordinaryMembers];
+    const { client, requests } = makeClient([
+      jsonResponse(customerResponse()),
+      jsonResponse(customerMemberResponse()),
+      customerMemberListResponse(firstPage, { totalCount: 101, maxPage: 2 }),
+      customerMemberListResponse([legacyCustomerMemberResponse()], {
+        totalCount: 101,
+        maxPage: 2,
+      }),
+      jsonResponse(legacyCustomerMemberResponse({ role: "member" })),
+      customerMemberListResponse(firstPage, { totalCount: 101, maxPage: 2 }),
+      customerMemberListResponse(
+        [legacyCustomerMemberResponse({ role: "member" })],
+        { totalCount: 101, maxPage: 2 },
+      ),
+      jsonResponse(portalResponse(), 201),
+    ]);
+
+    await expect(
+      client.createCustomerPortalSession({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+      }),
+    ).resolves.toMatchObject({ id: SESSION_ID });
+    expect(
+      requests
+        .filter(
+          ({ method, url }) =>
+            method === "GET" && new URL(url).pathname.endsWith("/members"),
+        )
+        .map(({ url }) => new URL(url).searchParams.get("page")),
+    ).toEqual(["1", "2", "1", "2"]);
+    expect(requests.filter(({ method }) => method === "PATCH")).toEqual([
+      expect.objectContaining({
+        url: `${POLAR_PRODUCTION_BASE_URL}/customers/${CUSTOMER_ID}/members/${LEGACY_CUSTOMER_MEMBER_ID}`,
+        body: { role: "member" },
+      }),
+    ]);
+  });
+
+  it.each([
+    ["missing pagination", jsonResponse({ items: [] })],
+    [
+      "incomplete page",
+      customerMemberListResponse([], { totalCount: 1, maxPage: 1 }),
+    ],
+    [
+      "out-of-bound traversal",
+      customerMemberListResponse([], { totalCount: 1_001, maxPage: 11 }),
+    ],
+  ] as const)("fails closed on %s", async (_case, memberListResponse) => {
+    const { client, requests } = makeClient([
+      jsonResponse(customerResponse()),
+      jsonResponse(customerMemberResponse()),
+      memberListResponse,
+    ]);
+
+    await expect(
+      client.createCustomerPortalSession({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+      }),
+    ).rejects.toMatchObject({
+      code: "malformed_response",
+      details: { operation: "list_customer_members" },
+    });
+    expect(requests.map(({ method }) => method)).toEqual(["GET", "GET", "GET"]);
+  });
+
+  it("fails closed when member pagination changes between pages", async () => {
+    const firstPage = [
+      customerMemberResponse(),
+      ...Array.from({ length: 99 }, (_, index) =>
+        customerMemberResponse({
+          id: `${(index + 1).toString(16).padStart(8, "0")}-2000-4000-8000-000000000001`,
+          email: `member-${index + 1}@acme.example`,
+          external_id: `user_unstable_${index + 1}`,
+          role: "member",
+        }),
+      ),
+    ];
+    const { client, requests } = makeClient([
+      jsonResponse(customerResponse()),
+      jsonResponse(customerMemberResponse()),
+      customerMemberListResponse(firstPage, { totalCount: 101, maxPage: 2 }),
+      customerMemberListResponse([], { totalCount: 100, maxPage: 1 }),
+    ]);
+
+    await expect(
+      client.createCustomerPortalSession({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+      }),
+    ).rejects.toMatchObject({
+      code: "malformed_response",
+      details: { operation: "list_customer_members" },
+    });
+    expect(requests.map(({ method }) => method)).toEqual([
+      "GET",
+      "GET",
+      "GET",
+      "GET",
+    ]);
+  });
+
+  it.each(["id", "external ID"] as const)(
+    "rejects a duplicate member %s across pages",
+    async (duplicate) => {
+      const ordinaryMembers = Array.from({ length: 99 }, (_, index) =>
+        customerMemberResponse({
+          id: `${(index + 1).toString(16).padStart(8, "0")}-3000-4000-8000-000000000001`,
+          email: `member-${index + 1}@acme.example`,
+          external_id: `user_duplicate_${index + 1}`,
+          role: "member",
+        }),
+      );
+      const duplicateMember = legacyCustomerMemberResponse({
+        ...(duplicate === "id" ? { id: ordinaryMembers[0]?.id } : {}),
+        ...(duplicate === "external ID"
+          ? { external_id: ordinaryMembers[0]?.external_id }
+          : {}),
+      });
+      const { client, requests } = makeClient([
+        jsonResponse(customerResponse()),
+        jsonResponse(customerMemberResponse()),
+        customerMemberListResponse(
+          [customerMemberResponse(), ...ordinaryMembers],
+          { totalCount: 101, maxPage: 2 },
+        ),
+        customerMemberListResponse([duplicateMember], {
+          totalCount: 101,
+          maxPage: 2,
+        }),
+      ]);
+
+      await expect(
+        client.createCustomerPortalSession({
+          clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        }),
+      ).rejects.toMatchObject({
+        code: "malformed_response",
+        details: { operation: "list_customer_members" },
+      });
+      expect(requests.map(({ method }) => method)).toEqual([
+        "GET",
+        "GET",
+        "GET",
+        "GET",
+      ]);
+    },
+  );
+
+  it("recovers a lost non-service demotion response by member ID", async () => {
+    const demotedMember = legacyCustomerMemberResponse({ role: "member" });
+    const { client, requests } = makeClient([
+      jsonResponse(customerResponse()),
+      jsonResponse(customerMemberResponse()),
+      customerMemberListResponse([
+        customerMemberResponse(),
+        legacyCustomerMemberResponse(),
+      ]),
+      new Error("demotion response lost"),
+      jsonResponse(demotedMember),
+      customerMemberListResponse([customerMemberResponse(), demotedMember]),
+      jsonResponse(portalResponse(), 201),
+    ]);
+
+    await expect(
+      client.createCustomerPortalSession({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+      }),
+    ).resolves.toMatchObject({ id: SESSION_ID });
+    expect(requests.map(({ method }) => method)).toEqual([
+      "GET",
+      "GET",
+      "GET",
+      "PATCH",
+      "GET",
+      "GET",
+      "POST",
+    ]);
+    expect(requests[4]?.url).toBe(
+      `${POLAR_PRODUCTION_BASE_URL}/customers/${CUSTOMER_ID}/members/${LEGACY_CUSTOMER_MEMBER_ID}`,
+    );
+  });
+
+  it("blocks portal creation when another request re-privileges a Member", async () => {
+    const { client, requests } = makeClient([
+      jsonResponse(customerResponse()),
+      jsonResponse(customerMemberResponse()),
+      customerMemberListResponse([
+        customerMemberResponse(),
+        legacyCustomerMemberResponse(),
+      ]),
+      jsonResponse(legacyCustomerMemberResponse({ role: "member" })),
+      customerMemberListResponse([
+        customerMemberResponse({ role: "billing_manager" }),
+        legacyCustomerMemberResponse({ role: "owner" }),
+      ]),
+    ]);
+
+    await expect(
+      client.createCustomerPortalSession({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+      }),
+    ).rejects.toMatchObject({
+      code: "malformed_response",
+      details: { operation: "list_customer_members" },
+    });
+    expect(requests.map(({ method }) => method)).toEqual([
+      "GET",
+      "GET",
+      "GET",
+      "PATCH",
+      "GET",
+    ]);
+    expect(
+      requests.some(({ url }) => url.endsWith("/customer-sessions/")),
+    ).toBe(false);
+  });
+
+  it("fails closed before creating a portal session for a malformed service owner", async () => {
+    const { client, requests } = makeClient([
+      jsonResponse(customerResponse()),
+      jsonResponse(customerMemberResponse({ customer_id: OTHER_PRODUCT_ID })),
+    ]);
+
+    await expect(
+      client.createCustomerPortalSession({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+      }),
+    ).rejects.toMatchObject({
+      code: "malformed_response",
+      details: { operation: "get_customer_member" },
+    });
+    expect(requests.map(({ method }) => method)).toEqual(["GET", "GET"]);
   });
 
   it("applies the redirect allowlist to the portal return URL", async () => {
@@ -602,60 +1449,72 @@ describe("Customer Portal", () => {
 });
 
 describe("Customer state", () => {
-  it("reads the pinned Pro subscription status and billing period", async () => {
+  it.each(["active", "past_due", "paused"] as const)(
+    "reads a nonterminal pinned Pro subscription in %s state",
+    async (status) => {
+      const { client, requests } = makeClient([
+        jsonResponse(customerResponse()),
+        jsonResponse({
+          items: [
+            {
+              id: SUBSCRIPTION_ID,
+              status,
+              product_id: PRO_PRODUCT_ID,
+              customer_id: CUSTOMER_ID,
+              current_period_start: "2026-09-01T00:00:00Z",
+              current_period_end: "2026-10-01T00:00:00Z",
+              cancel_at_period_end: false,
+            },
+          ],
+          pagination: { total_count: 1, max_page: 1 },
+        }),
+      ]);
+
+      await expect(
+        client.getCustomerState(CLERK_ORGANIZATION_ID),
+      ).resolves.toEqual({
+        customer: {
+          id: CUSTOMER_ID,
+          clerkOrganizationId: CLERK_ORGANIZATION_ID,
+          type: "team",
+        },
+        proSubscription: {
+          id: SUBSCRIPTION_ID,
+          status,
+          currentPeriodStart: new Date("2026-09-01T00:00:00Z"),
+          currentPeriodEnd: new Date("2026-10-01T00:00:00Z"),
+          cancelAtPeriodEnd: false,
+        },
+      });
+      expect(requests).toHaveLength(2);
+      const subscriptions = new URL(requests[1]?.url ?? "");
+      expect(subscriptions.pathname).toBe("/v1/subscriptions/");
+      expect(subscriptions.searchParams.get("external_customer_id")).toBe(
+        CLERK_ORGANIZATION_ID,
+      );
+      expect(subscriptions.searchParams.get("product_id")).toBe(PRO_PRODUCT_ID);
+      expect(subscriptions.searchParams.getAll("status")).toContain("past_due");
+      expect(subscriptions.searchParams.getAll("status")).not.toContain(
+        "unpaid",
+      );
+    },
+  );
+
+  it("represents no nonterminal pinned subscription as Free state", async () => {
     const { client, requests } = makeClient([
+      jsonResponse(customerResponse()),
       jsonResponse({
-        ...customerResponse(),
-        active_subscriptions: [
-          {
-            id: SUBSCRIPTION_ID,
-            status: "active",
-            product_id: PRO_PRODUCT_ID,
-            current_period_start: "2026-09-01T00:00:00Z",
-            current_period_end: "2026-10-01T00:00:00Z",
-            cancel_at_period_end: false,
-          },
-          {
-            id: "99999999-9999-4999-8999-999999999999",
-            status: "trialing",
-            product_id: OTHER_PRODUCT_ID,
-            current_period_start: "2026-09-01T00:00:00Z",
-            current_period_end: "2026-09-15T00:00:00Z",
-            cancel_at_period_end: true,
-          },
-        ],
+        items: [],
+        pagination: { total_count: 0, max_page: 0 },
       }),
     ]);
 
     await expect(
       client.getCustomerState(CLERK_ORGANIZATION_ID),
-    ).resolves.toEqual({
-      customer: {
-        id: CUSTOMER_ID,
-        clerkOrganizationId: CLERK_ORGANIZATION_ID,
-        type: "team",
-      },
-      proSubscription: {
-        id: SUBSCRIPTION_ID,
-        status: "active",
-        currentPeriodStart: new Date("2026-09-01T00:00:00Z"),
-        currentPeriodEnd: new Date("2026-10-01T00:00:00Z"),
-        cancelAtPeriodEnd: false,
-      },
-    });
-    expect(requests[0]?.url).toBe(
-      `${POLAR_PRODUCTION_BASE_URL}/customers/external/${CLERK_ORGANIZATION_ID}/state`,
-    );
-  });
-
-  it("represents no active pinned subscription as Free state", async () => {
-    const { client } = makeClient([
-      jsonResponse({ ...customerResponse(), active_subscriptions: [] }),
-    ]);
-
-    await expect(
-      client.getCustomerState(CLERK_ORGANIZATION_ID),
     ).resolves.toMatchObject({ proSubscription: null });
+    expect(
+      new URL(requests[1]?.url ?? "").searchParams.getAll("status"),
+    ).not.toContain("unpaid");
   });
 });
 

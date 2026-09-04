@@ -1,6 +1,10 @@
 import { createEnv } from "@t3-oss/env-nextjs";
 import { z } from "zod";
 
+const deployedApiHosts = {
+  preview: "humans-api-preview.hi-541.workers.dev",
+  production: "humans-api-production.hi-541.workers.dev",
+} as const;
 const releaseEnvironment =
   process.env.HUMANS_RELEASE_ENVIRONMENT ??
   (process.env.VERCEL ? undefined : "local");
@@ -14,6 +18,24 @@ const turnstileTestingKeys = new Set([
   "2x0000000000000000000000000000000AA",
   "3x0000000000000000000000000000000AA",
 ]);
+
+const apiUrl = z.url().refine((value) => {
+  if (releaseEnvironment === "local") return true;
+  const expectedHost =
+    deployedApiHosts[releaseEnvironment as keyof typeof deployedApiHosts];
+  if (!expectedHost) return false;
+  const url = new URL(value);
+  return (
+    url.protocol === "https:" &&
+    !url.username &&
+    !url.password &&
+    !url.port &&
+    url.pathname === "/" &&
+    !url.search &&
+    !url.hash &&
+    url.hostname === expectedHost
+  );
+}, "Deployed HUMANS_API_URL must be an approved HTTPS Worker origin");
 
 const turnstileKey = z
   .string()
@@ -34,7 +56,7 @@ const validatedEnv = createEnv({
     process.env.SKIP_ENV_VALIDATION === "1" && releaseEnvironment === "local",
   server: {
     CLERK_SECRET_KEY: z.string().min(1),
-    HUMANS_API_URL: z.url().default("http://localhost:8787"),
+    HUMANS_API_URL: apiUrl,
     HUMANS_PROXY_SECRET: z.string().min(16),
     HUMANS_RELEASE_ENVIRONMENT: z.enum(["local", "preview", "production"]),
     TURNSTILE_SECRET_KEY: turnstileKey,
@@ -45,7 +67,9 @@ const validatedEnv = createEnv({
   },
   runtimeEnv: {
     CLERK_SECRET_KEY: process.env.CLERK_SECRET_KEY,
-    HUMANS_API_URL: process.env.HUMANS_API_URL,
+    HUMANS_API_URL:
+      process.env.HUMANS_API_URL ??
+      (releaseEnvironment === "local" ? "http://localhost:8787" : undefined),
     HUMANS_PROXY_SECRET: process.env.HUMANS_PROXY_SECRET,
     HUMANS_RELEASE_ENVIRONMENT: releaseEnvironment,
     NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:

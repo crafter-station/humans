@@ -8,7 +8,7 @@ import {
   reconcileCreditPeriodPage,
   recoverCreditUsageLeases,
 } from "@humans/database/billing";
-import { idempotencyKeys, schedules } from "@trigger.dev/sdk";
+import { idempotencyKeys, runs, schedules } from "@trigger.dev/sdk";
 
 import { withDatabaseRuntime, withPolarBillingRuntime } from "../runtime.js";
 import { reconcileAllCreditPeriodPages } from "../billing.js";
@@ -81,7 +81,7 @@ export const billingReconciliationSchedule = schedules.task({
   run: ({ timestamp }) =>
     withPolarBillingRuntime((database, client) =>
       reconcileAllCreditPeriodPages({
-        page: (afterOrganizationId) =>
+        page: (after) =>
           reconcileCreditPeriodPage(
             database,
             ({ organizationId, startAt, endAt }) =>
@@ -93,7 +93,7 @@ export const billingReconciliationSchedule = schedules.task({
                   interval: "day",
                 })
                 .then(({ total }) => total),
-            { limit: 50, now: timestamp, afterOrganizationId },
+            { limit: 50, now: timestamp, after },
           ),
       }),
     ),
@@ -120,7 +120,14 @@ export const enrichmentDispatchRecoverySchedule = schedules.task({
   retry: { maxAttempts: 3 },
   run: async ({ timestamp }) => {
     const recovery = await withDatabaseRuntime((database) =>
-      recoverEnrichmentDispatches(database, timestamp),
+      recoverEnrichmentDispatches(database, timestamp, async (triggerRunId) => {
+        const run = await runs.retrieve(triggerRunId);
+        return {
+          status: run.status,
+          isCompleted: run.isCompleted,
+          isCancelled: run.isCancelled,
+        };
+      }),
     );
     const dispatcher = await triggerDispatcher("recovery", timestamp);
     return { ...recovery, dispatcherRunId: dispatcher.id };

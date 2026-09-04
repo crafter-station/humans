@@ -2,15 +2,13 @@ import { defineConfig, devices } from "@playwright/test";
 
 const previewURL = process.env.PLAYWRIGHT_PREVIEW_URL?.trim();
 const productionURL = process.env.PLAYWRIGHT_PRODUCTION_URL?.trim();
-const previewStorageState = "./playwright/.clerk/preview.json";
-const sensitiveImpersonationRun = Boolean(
-  process.env.E2E_PROFILE_OWNER_IMPERSONATION_URL?.trim(),
+const sensitiveAcceptanceRun = Boolean(
+  process.env.E2E_PROFILE_OWNER_IMPERSONATION_URL?.trim() ||
+    process.env.E2E_PROFILE_OWNER_CLEANUP_IMPERSONATION_URL?.trim() ||
+    process.env.E2E_OPERATOR_IMPERSONATION_URL?.trim() ||
+    process.env.E2E_PRODUCTION_MEMBER_IMPERSONATION_URL?.trim() ||
+    process.env.VERCEL_AUTOMATION_BYPASS_SECRET?.trim(),
 );
-if (!previewURL || !productionURL) {
-  throw new Error(
-    "PLAYWRIGHT_PREVIEW_URL and PLAYWRIGHT_PRODUCTION_URL are required for browser acceptance",
-  );
-}
 
 export default defineConfig({
   testDir: "./e2e",
@@ -21,7 +19,7 @@ export default defineConfig({
   workers: 1,
   timeout: 120_000,
   expect: { timeout: 20_000 },
-  reporter: sensitiveImpersonationRun
+  reporter: sensitiveAcceptanceRun
     ? [["dot"]]
     : [["line"], ["html", { open: "never" }]],
   use: {
@@ -43,15 +41,43 @@ export default defineConfig({
     {
       name: "cleanup",
       testMatch: /global\.teardown\.ts/,
+      use: {
+        screenshot: "off",
+        trace: "off",
+        video: "off",
+      },
     },
     {
       name: "preview-chromium",
       dependencies: ["setup"],
-      testMatch: /v1-preview\.spec\.ts/,
+      testMatch: /workspace-journey\.spec\.ts/,
       use: {
         ...devices["Desktop Chrome"],
         baseURL: previewURL,
-        storageState: previewStorageState,
+        screenshot: "off",
+        trace: "off",
+        video: "off",
+      },
+    },
+    {
+      name: "preview-operator",
+      dependencies: ["preview-chromium"],
+      testMatch: /operator-control\.spec\.ts/,
+      use: {
+        ...devices["Desktop Chrome"],
+        baseURL: previewURL,
+        screenshot: "off",
+        trace: "off",
+        video: "off",
+      },
+    },
+    {
+      name: "production-chromium",
+      testMatch: /workspace-journey\.spec\.ts/,
+      teardown: "production-member-cleanup",
+      use: {
+        ...devices["Desktop Chrome"],
+        baseURL: productionURL,
         screenshot: "off",
         trace: "off",
         video: "off",
@@ -59,10 +85,32 @@ export default defineConfig({
     },
     {
       name: "production-profile-control",
+      dependencies: ["production-chromium"],
       testMatch: /profile-control\.spec\.ts/,
+      teardown: "production-profile-cleanup",
       use: {
         ...devices["Desktop Chrome"],
         baseURL: productionURL,
+        screenshot: "off",
+        trace: "off",
+        video: "off",
+      },
+    },
+    {
+      name: "production-profile-cleanup",
+      testMatch: /profile-control\.teardown\.ts/,
+      use: {
+        ...devices["Desktop Chrome"],
+        baseURL: productionURL,
+        screenshot: "off",
+        trace: "off",
+        video: "off",
+      },
+    },
+    {
+      name: "production-member-cleanup",
+      testMatch: /production-member\.teardown\.ts/,
+      use: {
         screenshot: "off",
         trace: "off",
         video: "off",

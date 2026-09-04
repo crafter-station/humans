@@ -1,13 +1,15 @@
 import { test as teardown } from "@playwright/test";
 
-import { cleanupReleaseUser, removePreviewStorageState } from "./release-user";
+import {
+  cleanupReleaseUser,
+  releaseUserCredentialsFromEnvironment,
+  removeLegacyPreviewStorageState,
+} from "./release-user";
 
-teardown("delete the disposable Clerk identity", async () => {
+teardown("delete the disposable Member and Organizations", async () => {
   try {
-    const secretKey = process.env.CLERK_SECRET_KEY?.trim();
-    if (!secretKey) throw new Error("CLERK_SECRET_KEY is required for cleanup");
-    await cleanupReleaseUser(secretKey);
+    await cleanupReleaseUser(releaseUserCredentialsFromEnvironment());
   } finally {
-    await removePreviewStorageState();
+    removeLegacyPreviewStorageState();
   }
 });

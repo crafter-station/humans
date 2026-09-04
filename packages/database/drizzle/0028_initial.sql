@@ -1,0 +1,2 @@
+DROP INDEX "credit_usage_outbox_organization_occurred_idx";--> statement-breakpoint
+CREATE INDEX "credit_usage_outbox_organization_delivered_idx" ON "credit_usage_outbox" USING btree ("organization_id","delivered_at");

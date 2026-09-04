@@ -29,7 +29,12 @@ import {
   NaturalSearchError,
   NaturalSearchInterpreter,
 } from "./natural-search";
-import { type PolarBoundary, polarBoundary } from "./polar";
+import {
+  type PolarBoundary,
+  polarBoundary,
+  polarCheckoutCreationMayHaveSucceeded,
+  polarCheckoutNotFound,
+} from "./polar";
 
 export type Bindings = {
   CLERK_PUBLISHABLE_KEY: string;
@@ -46,14 +51,18 @@ export type Bindings = {
   IP_RATE_LIMITER?: RateLimitBinding;
   NATURAL_SEARCH_RATE_LIMITER?: RateLimitBinding;
   PUBLIC_PROFILE_REQUEST_RATE_LIMITER?: RateLimitBinding;
+  PUBLIC_PROFILE_VERIFICATION_RATE_LIMITER?: RateLimitBinding;
   POLAR_ACCESS_TOKEN?: string;
   POLAR_BASE_URL?: string;
   POLAR_ORGANIZATION_ID?: string;
   POLAR_PRO_PRODUCT_ID?: string;
+  POLAR_CUSTOMER_OWNER_EMAIL?: string;
   POLAR_USAGE_METER_ID?: string;
   POLAR_USAGE_EVENT_NAME?: string;
   POLAR_WEBHOOK_SECRET?: string;
   BILLING_APP_ORIGIN?: string;
+  BILLING_APP_ORIGIN_ATTESTATION?: string;
+  BILLING_APP_ORIGIN_ATTESTATION_KEY?: string;
   BILLING_REQUIRED?: "true";
   SENTRY_DSN?: string;
   SENTRY_ENVIRONMENT?: string;
@@ -79,12 +88,20 @@ type RateLimitBinding = {
 type DatabaseLayer = ReturnType<typeof makeDatabaseLayer>;
 type DatabaseLayerFactory = (bindings: Bindings) => DatabaseLayer;
 
+const isOrganizationAdminRole = (role: string) =>
+  role === "org:admin" || role === "admin";
+
 const healthResponse = z
   .object({
     checks: z.object({
       database: z.literal("ok"),
       pgvector: z.literal("ok"),
     }),
+    worker: z
+      .object({
+        versionId: z.uuid(),
+      })
+      .optional(),
     status: z.literal("ok"),
   })
   .openapi("Health");
@@ -509,6 +526,105 @@ const checkHealth = Effect.fn("checkHealth")(function* () {
   } as const;
 });
 
+const deployedEnvironments = {
+  preview: {
+    clerkMode: "test",
+    neonEndpoint: "ep-sweet-tree-aubos9m6",
+    sentryProjectId: "4512020599144448",
+  },
+  production: {
+    clerkMode: "live",
+    neonEndpoint: "ep-jolly-night-au0ic7nb",
+    sentryProjectId: "4512020552089600",
+  },
+} as const;
+
+const unspacedSecret = (value: unknown, minimumLength: number) =>
+  typeof value === "string" &&
+  value.length >= minimumLength &&
+  value.trim() === value &&
+  !/\s/.test(value);
+
+const deployedDatabaseUrl = (value: unknown, endpoint: string) => {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value);
+    return (
+      (url.protocol === "postgres:" || url.protocol === "postgresql:") &&
+      url.username !== "" &&
+      url.password !== "" &&
+      url.port === "" &&
+      url.pathname !== "/" &&
+      (url.hostname === endpoint || url.hostname.startsWith(`${endpoint}-`)) &&
+      url.hostname.endsWith(".neon.tech")
+    );
+  } catch {
+    return false;
+  }
+};
+
+const deployedSentryDsn = (value: unknown, projectId: string) => {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      url.username !== "" &&
+      url.password === "" &&
+      url.port === "" &&
+      url.pathname === `/${projectId}` &&
+      (url.hostname.endsWith(".ingest.sentry.io") ||
+        url.hostname.endsWith(".ingest.us.sentry.io"))
+    );
+  } catch {
+    return false;
+  }
+};
+
+const deployedRateLimitBindings = [
+  "API_KEY_RATE_LIMITER",
+  "IP_RATE_LIMITER",
+  "MEMBER_RATE_LIMITER",
+  "NATURAL_SEARCH_RATE_LIMITER",
+  "ORGANIZATION_RATE_LIMITER",
+  "PUBLIC_PROFILE_REQUEST_RATE_LIMITER",
+  "PUBLIC_PROFILE_VERIFICATION_RATE_LIMITER",
+] as const;
+
+const rateLimitBindingConfigured = (value: unknown) =>
+  typeof value === "object" &&
+  value !== null &&
+  "limit" in value &&
+  typeof value.limit === "function";
+
+export const deployedApiConfigurationValid = (bindings: Bindings) => {
+  const environment =
+    deployedEnvironments[
+      bindings.SENTRY_ENVIRONMENT as keyof typeof deployedEnvironments
+    ];
+  if (!environment) return false;
+  return (
+    bindings.BILLING_REQUIRED === "true" &&
+    bindings.CLERK_BOT_PROTECTION_ENABLED === "true" &&
+    new RegExp(`^pk_${environment.clerkMode}_[^\\s]{16,}$`).test(
+      bindings.CLERK_PUBLISHABLE_KEY ?? "",
+    ) &&
+    new RegExp(`^sk_${environment.clerkMode}_[^\\s]{16,}$`).test(
+      bindings.CLERK_SECRET_KEY ?? "",
+    ) &&
+    /^whsec_[^\s]{16,}$/.test(bindings.CLERK_WEBHOOK_SIGNING_SECRET ?? "") &&
+    deployedDatabaseUrl(bindings.DATABASE_URL, environment.neonEndpoint) &&
+    unspacedSecret(bindings.SEARCH_CURSOR_SECRET, 32) &&
+    deployedSentryDsn(bindings.SENTRY_DSN, environment.sentryProjectId) &&
+    unspacedSecret(bindings.WEB_PROXY_SECRET, 16) &&
+    /^[0-9a-f]{40}$/.test(bindings.SENTRY_RELEASE ?? "") &&
+    z.uuid().safeParse(bindings.CF_VERSION_METADATA?.id).success &&
+    deployedRateLimitBindings.every((name) =>
+      rateLimitBindingConfigured(bindings[name]),
+    )
+  );
+};
+
 export const createApp = (
   databaseLayer: DatabaseLayerFactory,
   identity: IdentityBoundary = clerkIdentityBoundary,
@@ -517,6 +633,14 @@ export const createApp = (
   errorReporter: ErrorReporter = () => undefined,
 ) => {
   const app = new OpenAPIHono<{ Bindings: Bindings }>();
+  app.use("*", async (context, next) => {
+    await next();
+    const release = context.env?.SENTRY_RELEASE?.trim();
+    if (release) context.header("X-Humans-Release", release);
+    const environment = context.env?.SENTRY_ENVIRONMENT;
+    if (environment === "preview" || environment === "production")
+      context.header("X-Humans-Environment", environment);
+  });
   let naturalSearch: NaturalSearchInterpreter | undefined;
   const organizationRequests = new Map<string, number[]>();
   const memberRequests = new Map<string, number[]>();
@@ -524,6 +648,7 @@ export const createApp = (
   const ipRequests = new Map<string, number[]>();
   const naturalSearchRequests = new Map<string, number[]>();
   const publicProfileRequestRequests = new Map<string, number[]>();
+  const publicProfileVerificationRequests = new Map<string, number[]>();
   let internalMcpToken: string | undefined;
   const getInternalMcpToken = () => (internalMcpToken ??= crypto.randomUUID());
   const reportUnexpected = (
@@ -565,16 +690,29 @@ export const createApp = (
 
   app.openapi(healthRoute, async (context) => {
     try {
+      const deployed =
+        context.env?.SENTRY_ENVIRONMENT === "preview" ||
+        context.env?.SENTRY_ENVIRONMENT === "production";
       if (
-        context.env?.BILLING_REQUIRED === "true" &&
-        !polar.billingConfigured(context.env)
+        (deployed || context.env?.BILLING_REQUIRED === "true") &&
+        (context.env?.BILLING_REQUIRED !== "true" ||
+          !polar.billingConfigured(context.env) ||
+          !deployedApiConfigurationValid(context.env))
       ) {
-        throw new Error("Billing configuration is required");
+        throw new Error("Deployed API configuration is required");
       }
       const health = await Effect.runPromise(
         checkHealth().pipe(Effect.provide(databaseLayer(context.env))),
       );
-      return context.json(health, 200);
+      return context.json(
+        context.env?.CF_VERSION_METADATA?.id
+          ? {
+              ...health,
+              worker: { versionId: context.env.CF_VERSION_METADATA.id },
+            }
+          : health,
+        200,
+      );
     } catch (error) {
       reportUnexpected(context, error, "health.check");
       return context.json(
@@ -642,24 +780,49 @@ export const createApp = (
     if (event === null) return context.json({ processed: false }, 200);
     try {
       const projection = await runDatabase(context, (database) =>
-        database.setPolarSubscriptionStatus({
-          organizationId: event.organizationId,
-          polarSubscriptionId: event.subscriptionId,
-          polarCustomerId: event.polarCustomerId,
-          status: event.status,
-          eventType: event.eventType,
-          eventId: event.eventId,
-          occurredAt: event.occurredAt,
-          periodStart: event.periodStart,
-          periodEnd: event.periodEnd,
-          cancelAtPeriodEnd: event.cancelAtPeriodEnd,
-        }),
+        event.eventType === "order.refunded"
+          ? database.recordPolarOrderRefund({
+              organizationId: event.organizationId,
+              polarSubscriptionId: event.subscriptionId,
+              polarCustomerId: event.polarCustomerId,
+              eventType: event.eventType,
+              eventId: event.eventId,
+              occurredAt: event.occurredAt,
+              order: event.order,
+            })
+          : database.setPolarSubscriptionStatus({
+              organizationId: event.organizationId,
+              polarSubscriptionId: event.subscriptionId,
+              polarCustomerId: event.polarCustomerId,
+              status: event.status,
+              eventType: event.eventType,
+              eventId: event.eventId,
+              occurredAt: event.occurredAt,
+              periodStart: event.periodStart,
+              periodEnd: event.periodEnd,
+              cancelAtPeriodEnd: event.cancelAtPeriodEnd,
+              ...(event.eventType === "order.paid"
+                ? { order: event.order }
+                : {}),
+            }),
       );
       return context.json(projection, 200);
     } catch (error) {
       return unavailable(context, error, "polar.webhook.apply");
     }
   });
+
+  app.post(
+    "/v1/internal/public-profile-request-verifications",
+    async (context) => {
+      privateResponse(context);
+      if (!trustedPublicProfileRequest(context, "verification")) {
+        return publicProfileRequestForbidden(context);
+      }
+      const limited = await enforcePublicProfileVerificationRateLimit(context);
+      return limited instanceof Response ? limited : context.body(null, 204);
+    },
+  );
 
   app.post("/v1/public/profile-requests", async (context) => {
     privateResponse(context);
@@ -668,9 +831,7 @@ export const createApp = (
       context.env?.SENTRY_ENVIRONMENT === "production";
     if (
       (deployed || context.env?.WEB_PROXY_SECRET !== undefined) &&
-      (context.env?.WEB_PROXY_SECRET === undefined ||
-        context.req.header("X-Humans-Web-Proxy") !==
-          context.env.WEB_PROXY_SECRET)
+      !trustedPublicProfileRequest(context, "verified")
     ) {
       return publicProfileRequestForbidden(context);
     }
@@ -1131,6 +1292,7 @@ export const createApp = (
   );
 
   app.all("/mcp", async (context) => {
+    privateResponse(context);
     const authorization = context.req.header("Authorization");
     if (authorization === undefined) return unauthorized(context);
     const actor = await identity.authenticateApiKey(
@@ -1138,6 +1300,30 @@ export const createApp = (
       context.env,
     );
     if (actor === null) return unauthorized(context);
+
+    try {
+      await runDatabase(context, (database) =>
+        database.getWorkspace(actor.memberId, actor.organizationId),
+      );
+      const limited = await enforcePrincipalRateLimits(context, {
+        memberId: actor.memberId,
+        organizationId: actor.organizationId,
+        apiKeyId: actor.keyId,
+      });
+      if (limited instanceof Response) return limited;
+      await recordActivity(
+        context,
+        actor,
+        "organization_access",
+        undefined,
+        "mcp",
+      );
+    } catch (error) {
+      return tagged(error, "WorkspaceForbidden") ||
+        tagged(error, "AbuseControlRejected")
+        ? forbidden(context)
+        : unavailable(context, error, "mcp.authorize");
+    }
 
     const origin = new URL(context.req.url).origin;
     const mcpCorrelationId = correlationId(context);
@@ -1147,15 +1333,29 @@ export const createApp = (
         headers.set("Authorization", authorization);
         headers.set("X-Humans-Internal-MCP", getInternalMcpToken());
         headers.set("X-Correlation-ID", mcpCorrelationId);
-        headers.set(
-          "X-Humans-Client-IP",
-          context.req.header("CF-Connecting-IP") ?? "unknown",
-        );
-        return await app.request(
+        headers.set("X-Humans-Client-IP", clientIp(context));
+        const response = await app.request(
           `${origin}${path}`,
           { ...init, headers },
           context.env,
         );
+        const responseHeaders = new Headers(response.headers);
+        for (const name of [
+          "RateLimit-Limit",
+          "RateLimit-Remaining",
+          "RateLimit-Reset",
+          "Retry-After",
+        ]) {
+          const value = context.res.headers.get(name);
+          if (value && !responseHeaders.has(name)) {
+            responseHeaders.set(name, value);
+          }
+        }
+        return new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: responseHeaders,
+        });
       },
       revealContact: async (input) =>
         contactRevealResponse(
@@ -1196,10 +1396,6 @@ export const createApp = (
       {
         clerkOrganizationId: organizationId,
         name: seed.name,
-        owner: {
-          externalId: memberId,
-          email: seed.email,
-        },
       },
       context.env,
     );
@@ -1250,7 +1446,10 @@ export const createApp = (
           botProtectionVerified: session.botProtectionVerified === true,
         }),
       );
-      if (polar.billingConfigured(context.env))
+      if (
+        polar.billingConfigured(context.env) &&
+        isOrganizationAdminRole(workspace.role)
+      )
         await ensureOrganizationPolarCustomer(
           context,
           session.memberId,
@@ -1346,9 +1545,7 @@ export const createApp = (
     const workspace = await runDatabase(context, (database) =>
       database.getWorkspace(admin.memberId, admin.organizationId),
     );
-    return workspace.role === "org:admin" || workspace.role === "admin"
-      ? admin
-      : false;
+    return isOrganizationAdminRole(workspace.role) ? admin : false;
   };
 
   app.get("/v1/billing", async (context) => {
@@ -1367,8 +1564,7 @@ export const createApp = (
       return context.json(
         {
           ...billing,
-          canManageBilling:
-            workspace.role === "org:admin" || workspace.role === "admin",
+          canManageBilling: isOrganizationAdminRole(workspace.role),
         },
         200,
       );
@@ -1391,11 +1587,45 @@ export const createApp = (
         admin.memberId,
         admin.organizationId,
       );
-      const state = await polar.getCustomerState(
-        admin.organizationId,
-        context.env,
+      let checkoutClaim = await runDatabase(context, (database) =>
+        database.claimPolarCheckout({ organizationId: admin.organizationId }),
       );
+      if (checkoutClaim.state === "pending") {
+        privateResponse(context);
+        return context.json(
+          {
+            error: {
+              code: "checkout_in_progress",
+              message: "Checkout creation is already in progress",
+            },
+          },
+          409,
+        );
+      }
+      const initialClaimId = checkoutClaim.claimId;
+      if (!initialClaimId)
+        throw new Error("Polar checkout claim identity is unavailable");
+      let state: Awaited<ReturnType<PolarBoundary["getCustomerState"]>>;
+      try {
+        state = await polar.getCustomerState(admin.organizationId, context.env);
+      } catch (error) {
+        if (checkoutClaim.state === "claimed") {
+          await runDatabase(context, (database) =>
+            database.releasePolarCheckoutLease({
+              organizationId: admin.organizationId,
+              claimId: initialClaimId,
+            }),
+          );
+        }
+        throw error;
+      }
       if (state.proSubscription !== null) {
+        await runDatabase(context, (database) =>
+          database.clearPolarCheckoutClaim({
+            organizationId: admin.organizationId,
+            claimId: initialClaimId,
+          }),
+        );
         privateResponse(context);
         return context.json(
           {
@@ -1407,14 +1637,169 @@ export const createApp = (
           409,
         );
       }
-      const checkout = await polar.createProCheckout(
-        admin.organizationId,
-        context.env,
+      let checkout = null;
+      if (
+        checkoutClaim.state === "open" ||
+        checkoutClaim.state === "reconcile"
+      ) {
+        const { claimId } = checkoutClaim;
+        const checkoutId =
+          checkoutClaim.state === "open"
+            ? checkoutClaim.checkout.id
+            : checkoutClaim.checkoutId;
+        let cleared = false;
+        if (checkoutId) {
+          try {
+            const knownCheckout = await polar.getProCheckout(
+              checkoutId,
+              admin.organizationId,
+              context.env,
+            );
+            if (knownCheckout.status === "open") {
+              checkout = knownCheckout;
+            } else if (
+              knownCheckout.status === "expired" ||
+              knownCheckout.status === "failed" ||
+              (knownCheckout.status === "succeeded" &&
+                checkoutClaim.state === "reconcile")
+            ) {
+              cleared = await runDatabase(context, (database) =>
+                database.clearPolarCheckoutClaim({
+                  organizationId: admin.organizationId,
+                  claimId,
+                  checkoutId,
+                }),
+              );
+            }
+          } catch (error) {
+            if (
+              checkoutClaim.state !== "reconcile" ||
+              !polarCheckoutNotFound(error)
+            )
+              throw error;
+            cleared = await runDatabase(context, (database) =>
+              database.clearPolarCheckoutClaim({
+                organizationId: admin.organizationId,
+                claimId,
+                checkoutId,
+              }),
+            );
+          }
+        } else {
+          const knownCheckout = await polar.findProCheckoutByClaim(
+            claimId,
+            admin.organizationId,
+            context.env,
+          );
+          if (knownCheckout?.status === "open") {
+            checkout = knownCheckout;
+          } else if (
+            knownCheckout !== null &&
+            (knownCheckout.status === "expired" ||
+              knownCheckout.status === "failed" ||
+              (knownCheckout.status === "succeeded" &&
+                knownCheckout.expiresAt.getTime() <= Date.now()))
+          ) {
+            cleared = await runDatabase(context, (database) =>
+              database.clearPolarCheckoutClaim({
+                organizationId: admin.organizationId,
+                claimId,
+                checkoutId: null,
+              }),
+            );
+          } else if (knownCheckout === null) {
+            cleared = await runDatabase(context, (database) =>
+              database.releaseExpiredPolarCheckoutReconciliation({
+                organizationId: admin.organizationId,
+                claimId,
+              }),
+            );
+          }
+        }
+        if (cleared) {
+          checkoutClaim = await runDatabase(context, (database) =>
+            database.claimPolarCheckout({
+              organizationId: admin.organizationId,
+            }),
+          );
+        }
+      }
+      let responseStatus: 200 | 201 = 200;
+      if (checkoutClaim.state === "claimed") {
+        const { claimId } = checkoutClaim;
+        try {
+          checkout = await polar.findOpenProCheckout(
+            admin.organizationId,
+            context.env,
+          );
+        } catch (error) {
+          await runDatabase(context, (database) =>
+            database.releasePolarCheckoutLease({
+              organizationId: admin.organizationId,
+              claimId,
+            }),
+          );
+          throw error;
+        }
+        if (checkout === null) {
+          const started = await runDatabase(context, (database) =>
+            database.beginPolarCheckoutCreation({
+              organizationId: admin.organizationId,
+              claimId,
+            }),
+          );
+          if (started) {
+            try {
+              checkout = await polar.createProCheckout(
+                admin.organizationId,
+                claimId,
+                context.env,
+              );
+              responseStatus = 201;
+            } catch (error) {
+              if (!polarCheckoutCreationMayHaveSucceeded(error)) {
+                await runDatabase(context, (database) =>
+                  database.clearPolarCheckoutClaim({
+                    organizationId: admin.organizationId,
+                    claimId,
+                    checkoutId: null,
+                  }),
+                );
+              }
+              throw error;
+            }
+          }
+        }
+      }
+      const completionClaimId =
+        checkoutClaim.state === "claimed" ||
+        checkoutClaim.state === "reconcile" ||
+        checkoutClaim.state === "open"
+          ? checkoutClaim.claimId
+          : null;
+      if (checkout === null || completionClaimId === null) {
+        privateResponse(context);
+        return context.json(
+          {
+            error: {
+              code: "checkout_in_progress",
+              message: "Checkout creation requires reconciliation",
+            },
+          },
+          409,
+        );
+      }
+      await runDatabase(context, (database) =>
+        database.completePolarCheckout({
+          organizationId: admin.organizationId,
+          claimId: completionClaimId,
+          checkout,
+        }),
       );
       privateResponse(context);
       return context.json(
         { url: checkout.url, expiresAt: checkout.expiresAt },
-        201,
+        responseStatus,
       );
     } catch (error) {
       return tagged(error, "WorkspaceForbidden")
@@ -2082,7 +2467,24 @@ export const createApp = (
   };
   const suppliedCorrelationId = (context: AppContext) => {
     const value = context.req.header("X-Correlation-ID")?.trim();
-    return value && /^[A-Za-z0-9_-]{1,100}$/.test(value) ? value : undefined;
+    if (!value) return undefined;
+    const deployed =
+      context.env?.SENTRY_ENVIRONMENT === "preview" ||
+      context.env?.SENTRY_ENVIRONMENT === "production" ||
+      context.env?.WEB_PROXY_SECRET !== undefined;
+    if (!deployed) {
+      return /^[A-Za-z0-9_-]{1,100}$/.test(value) ? value : undefined;
+    }
+    const trustedProxy =
+      context.env?.WEB_PROXY_SECRET !== undefined &&
+      context.req.header("X-Humans-Web-Proxy") === context.env.WEB_PROXY_SECRET;
+    const suppliedInternalMcp = context.req.header("X-Humans-Internal-MCP");
+    const internalMcp =
+      suppliedInternalMcp !== undefined &&
+      suppliedInternalMcp === getInternalMcpToken();
+    return (trustedProxy || internalMcp) && z.uuid().safeParse(value).success
+      ? value
+      : undefined;
   };
   const hashIp = async (value: string) => {
     const digest = await crypto.subtle.digest(
@@ -2171,6 +2573,19 @@ export const createApp = (
     return limit.allowed ? null : publicRateLimited(context, limit);
   };
 
+  const enforcePublicProfileVerificationRateLimit = async (
+    context: AppContext,
+  ) => {
+    const ip = clientIp(context);
+    const limit = await enforceRateLimit(
+      context.env?.PUBLIC_PROFILE_VERIFICATION_RATE_LIMITER,
+      takeRateLimit(publicProfileVerificationRequests, ip, 20),
+      `public-profile-verification:${ip}`,
+    );
+    setRateLimitHeaders(context, limit);
+    return limit.allowed ? null : publicRateLimited(context, limit);
+  };
+
   const authorizeApiKey = async (
     context: AppContext,
     requiredScopes: ApiScope[],
@@ -2193,17 +2608,19 @@ export const createApp = (
       throw error;
     }
 
-    const generalLimit = await enforcePrincipalRateLimits(context, {
-      memberId: actor.memberId,
-      organizationId: actor.organizationId,
-      apiKeyId: actor.keyId,
-    });
-    if (generalLimit instanceof Response) return generalLimit;
-    try {
-      await recordActivity(context, actor, "organization_access");
-    } catch (error) {
-      if (tagged(error, "AbuseControlRejected")) return forbidden(context);
-      throw error;
+    if (requestSource(context, true) !== "mcp") {
+      const generalLimit = await enforcePrincipalRateLimits(context, {
+        memberId: actor.memberId,
+        organizationId: actor.organizationId,
+        apiKeyId: actor.keyId,
+      });
+      if (generalLimit instanceof Response) return generalLimit;
+      try {
+        await recordActivity(context, actor, "organization_access");
+      } catch (error) {
+        if (tagged(error, "AbuseControlRejected")) return forbidden(context);
+        throw error;
+      }
     }
     if (naturalLanguage) {
       const naturalLimit = await enforceRateLimit(
@@ -2228,6 +2645,7 @@ export const createApp = (
           database.getWorkspace(actor.memberId, actor.organizationId),
         ).then(() => undefined),
       enforcePrincipalRateLimits: async (actor) => {
+        if (requestSource(context, true) === "mcp") return null;
         const response = await enforcePrincipalRateLimits(context, {
           ...actor,
           apiKeyId: actor.keyId,
@@ -2244,7 +2662,9 @@ export const createApp = (
           : null;
       },
       recordActivity: (actor, kind, source, details) =>
-        recordActivity(context, actor, kind, details, source),
+        source === "mcp" && kind === "organization_access"
+          ? Promise.resolve()
+          : recordActivity(context, actor, kind, details, source),
       purchase: (input) =>
         runDatabase(context, (database) =>
           database.purchaseContactReveal(input),
@@ -2802,6 +3222,14 @@ const publicProfileRequestForbidden = (context: Context) =>
     },
     403,
   );
+
+const trustedPublicProfileRequest = (
+  context: Context<{ Bindings: Bindings }>,
+  stage: "verification" | "verified",
+) =>
+  context.env?.WEB_PROXY_SECRET !== undefined &&
+  context.req.header("X-Humans-Web-Proxy") === context.env.WEB_PROXY_SECRET &&
+  context.req.header("X-Humans-Public-Profile-Request") === stage;
 
 const requestTooLarge = (context: Context) =>
   context.json(

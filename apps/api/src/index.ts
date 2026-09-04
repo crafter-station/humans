@@ -4,11 +4,15 @@ import * as Sentry from "@sentry/cloudflare";
 import { type Bindings, createApp } from "./app";
 
 const app = createApp(
-  (bindings) =>
-    makeNeonDatabaseLayer(
+  (bindings) => {
+    if (!bindings.SEARCH_CURSOR_SECRET?.trim()) {
+      throw new Error("SEARCH_CURSOR_SECRET is required");
+    }
+    return makeNeonDatabaseLayer(
       bindings.DATABASE_URL,
-      bindings.SEARCH_CURSOR_SECRET ?? bindings.CLERK_SECRET_KEY,
-    ),
+      bindings.SEARCH_CURSOR_SECRET,
+    );
+  },
   undefined,
   undefined,
   undefined,

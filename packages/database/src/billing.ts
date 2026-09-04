@@ -8,9 +8,11 @@ import {
   gte,
   inArray,
   isNotNull,
+  isNull,
   lt,
   lte,
   ne,
+  or,
   sql,
 } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/neon-serverless";
@@ -47,6 +49,20 @@ export type PolarSubscriptionStatus =
   | "unpaid"
   | "paused";
 
+export type PolarOrderProjection = {
+  orderId: string;
+  status: "paid" | "partially_refunded" | "refunded";
+  billingReason:
+    | "subscription_create"
+    | "subscription_cycle"
+    | "subscription_update"
+    | "subscription_meter_cycle";
+  currency: string;
+  totalAmount: number;
+  refundedAmount: number;
+  refundedTaxAmount: number;
+};
+
 export type PolarSubscriptionProjection = {
   eventId: string;
   eventType: string;
@@ -58,6 +74,18 @@ export type PolarSubscriptionProjection = {
   periodStart: Date;
   periodEnd: Date;
   cancelAtPeriodEnd: boolean;
+  order?: PolarOrderProjection;
+  now?: Date;
+};
+
+export type PolarOrderRefundProjection = {
+  eventId: string;
+  eventType: "order.refunded";
+  occurredAt: Date;
+  organizationId: string;
+  polarCustomerId: string;
+  polarSubscriptionId: string;
+  order: PolarOrderProjection;
   now?: Date;
 };
 
@@ -82,9 +110,11 @@ export type CreditMeterReader = (
 export class BillingStoreError extends Error {
   constructor(
     readonly code:
+      | "billing_checkout_claim_lost"
       | "billing_customer_conflict"
       | "billing_event_conflict"
       | "billing_identity_unavailable"
+      | "billing_order_conflict"
       | "billing_period_unavailable"
       | "billing_subscription_conflict"
       | "invalid_billing_input"
@@ -98,6 +128,30 @@ export class BillingStoreError extends Error {
 type QueryableDatabase = DrizzleDatabase | Transaction;
 
 const validDate = (value: Date) => !Number.isNaN(value.getTime());
+
+const validatePolarOrder = (order: PolarOrderProjection) => {
+  if (
+    !order.orderId.trim() ||
+    !/^[a-z]{3}$/.test(order.currency) ||
+    !Number.isSafeInteger(order.totalAmount) ||
+    order.totalAmount < 0 ||
+    !Number.isSafeInteger(order.refundedAmount) ||
+    order.refundedAmount < 0 ||
+    !Number.isSafeInteger(order.refundedTaxAmount) ||
+    order.refundedTaxAmount < 0
+  )
+    throw new BillingStoreError("invalid_billing_input");
+};
+
+const polarOrderValues = (order: PolarOrderProjection) => ({
+  orderId: order.orderId,
+  orderStatus: order.status,
+  orderBillingReason: order.billingReason,
+  orderCurrency: order.currency,
+  orderTotalAmount: order.totalAmount,
+  orderRefundedAmount: order.refundedAmount,
+  orderRefundedTaxAmount: order.refundedTaxAmount,
+});
 
 const validatePeriod = (startAt: Date, endAt: Date) => {
   if (
@@ -160,7 +214,7 @@ export const getBillingCustomerSeed = async (
   input: { memberId: string; organizationId: string },
 ) => {
   const [identity] = await database
-    .select({ email: members.email, name: organizations.name })
+    .select({ name: organizations.name })
     .from(organizationMemberships)
     .innerJoin(members, eq(members.clerkId, organizationMemberships.memberId))
     .innerJoin(
@@ -172,14 +226,256 @@ export const getBillingCustomerSeed = async (
         eq(organizationMemberships.memberId, input.memberId),
         eq(organizationMemberships.organizationId, input.organizationId),
         eq(organizationMemberships.active, true),
+        inArray(organizationMemberships.role, ["admin", "org:admin"]),
         eq(members.active, true),
         eq(organizations.active, true),
       ),
     )
     .limit(1);
-  if (!identity?.email?.trim() || !identity.name.trim())
+  if (!identity?.name.trim())
     throw new BillingStoreError("billing_identity_unavailable");
-  return { email: identity.email, name: identity.name };
+  return identity;
+};
+
+const checkoutClaimLeaseMilliseconds = 5 * 60_000;
+const checkoutReconciliationQuarantineMilliseconds =
+  checkoutClaimLeaseMilliseconds;
+
+export const claimPolarCheckout = (
+  database: DrizzleDatabase,
+  input: { organizationId: string; now?: Date },
+) =>
+  database.transaction(async (tx) => {
+    const now = input.now ?? new Date();
+    if (!input.organizationId.trim() || !validDate(now))
+      throw new BillingStoreError("invalid_billing_input");
+    await lockBillingMappings(tx, [`organization:${input.organizationId}`]);
+    const [customer] = await tx
+      .select()
+      .from(polarCustomers)
+      .where(eq(polarCustomers.organizationId, input.organizationId))
+      .limit(1)
+      .for("update");
+    if (!customer) throw new BillingStoreError("billing_identity_unavailable");
+
+    if (
+      customer.checkoutClaimId &&
+      customer.checkoutId &&
+      customer.checkoutUrl &&
+      customer.checkoutExpiresAt &&
+      customer.checkoutExpiresAt.getTime() > now.getTime()
+    ) {
+      return {
+        state: "open" as const,
+        claimId: customer.checkoutClaimId,
+        checkout: {
+          id: customer.checkoutId,
+          url: customer.checkoutUrl,
+          expiresAt: customer.checkoutExpiresAt,
+        },
+      };
+    }
+    if (customer.checkoutClaimId && customer.checkoutClaimExpiresAt === null)
+      return {
+        state: "reconcile" as const,
+        claimId: customer.checkoutClaimId,
+        checkoutId: customer.checkoutId,
+      };
+    if (
+      customer.checkoutClaimId &&
+      customer.checkoutClaimExpiresAt &&
+      customer.checkoutClaimExpiresAt.getTime() > now.getTime()
+    )
+      return { state: "pending" as const };
+
+    const claimId = crypto.randomUUID();
+    await tx
+      .update(polarCustomers)
+      .set({
+        checkoutClaimId: claimId,
+        checkoutClaimExpiresAt: new Date(
+          now.getTime() + checkoutClaimLeaseMilliseconds,
+        ),
+        checkoutId: null,
+        checkoutUrl: null,
+        checkoutExpiresAt: null,
+        updatedAt: now,
+      })
+      .where(eq(polarCustomers.organizationId, input.organizationId));
+    return { state: "claimed" as const, claimId };
+  });
+
+export const beginPolarCheckoutCreation = async (
+  database: DrizzleDatabase,
+  input: { organizationId: string; claimId: string; now?: Date },
+) => {
+  const now = input.now ?? new Date();
+  if (!input.organizationId.trim() || !input.claimId.trim() || !validDate(now))
+    throw new BillingStoreError("invalid_billing_input");
+  const [started] = await database
+    .update(polarCustomers)
+    .set({
+      // Null makes a started claim sticky because Polar may have received the POST.
+      checkoutClaimExpiresAt: null,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(polarCustomers.organizationId, input.organizationId),
+        eq(polarCustomers.checkoutClaimId, input.claimId),
+        gt(polarCustomers.checkoutClaimExpiresAt, now),
+      ),
+    )
+    .returning({ organizationId: polarCustomers.organizationId });
+  return started !== undefined;
+};
+
+export const completePolarCheckout = (
+  database: DrizzleDatabase,
+  input: {
+    organizationId: string;
+    claimId: string;
+    checkout: { id: string; url: string; expiresAt: Date };
+    now?: Date;
+  },
+) =>
+  database.transaction(async (tx) => {
+    const now = input.now ?? new Date();
+    if (
+      !input.organizationId.trim() ||
+      !input.claimId.trim() ||
+      !input.checkout.id.trim() ||
+      !input.checkout.url.trim() ||
+      !validDate(input.checkout.expiresAt) ||
+      !validDate(now)
+    )
+      throw new BillingStoreError("invalid_billing_input");
+    await lockBillingMappings(tx, [`organization:${input.organizationId}`]);
+    const [completed] = await tx
+      .update(polarCustomers)
+      .set({
+        checkoutClaimId: input.claimId,
+        checkoutClaimExpiresAt: null,
+        checkoutId: input.checkout.id,
+        checkoutUrl: input.checkout.url,
+        checkoutExpiresAt: input.checkout.expiresAt,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(polarCustomers.organizationId, input.organizationId),
+          eq(polarCustomers.checkoutClaimId, input.claimId),
+        ),
+      )
+      .returning({ organizationId: polarCustomers.organizationId });
+    if (!completed) throw new BillingStoreError("billing_checkout_claim_lost");
+    return input.checkout;
+  });
+
+export const clearPolarCheckoutClaim = async (
+  database: DrizzleDatabase,
+  input: {
+    organizationId: string;
+    claimId: string;
+    checkoutId?: string | null;
+    now?: Date;
+  },
+) => {
+  const now = input.now ?? new Date();
+  if (
+    !input.organizationId.trim() ||
+    !input.claimId.trim() ||
+    (input.checkoutId !== undefined &&
+      input.checkoutId !== null &&
+      !input.checkoutId.trim()) ||
+    !validDate(now)
+  )
+    throw new BillingStoreError("invalid_billing_input");
+  const [cleared] = await database
+    .update(polarCustomers)
+    .set({
+      checkoutClaimId: null,
+      checkoutClaimExpiresAt: null,
+      checkoutId: null,
+      checkoutUrl: null,
+      checkoutExpiresAt: null,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(polarCustomers.organizationId, input.organizationId),
+        eq(polarCustomers.checkoutClaimId, input.claimId),
+        ...(input.checkoutId === undefined
+          ? []
+          : [
+              input.checkoutId === null
+                ? isNull(polarCustomers.checkoutId)
+                : eq(polarCustomers.checkoutId, input.checkoutId),
+            ]),
+      ),
+    )
+    .returning({ organizationId: polarCustomers.organizationId });
+  return cleared !== undefined;
+};
+
+export const releaseExpiredPolarCheckoutReconciliation = async (
+  database: DrizzleDatabase,
+  input: { organizationId: string; claimId: string; now?: Date },
+) => {
+  const now = input.now ?? new Date();
+  if (!input.organizationId.trim() || !input.claimId.trim() || !validDate(now))
+    throw new BillingStoreError("invalid_billing_input");
+  const [released] = await database
+    .update(polarCustomers)
+    .set({
+      checkoutClaimId: null,
+      checkoutClaimExpiresAt: null,
+      checkoutId: null,
+      checkoutUrl: null,
+      checkoutExpiresAt: null,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(polarCustomers.organizationId, input.organizationId),
+        eq(polarCustomers.checkoutClaimId, input.claimId),
+        isNull(polarCustomers.checkoutClaimExpiresAt),
+        isNull(polarCustomers.checkoutId),
+        lte(
+          polarCustomers.updatedAt,
+          new Date(
+            now.getTime() - checkoutReconciliationQuarantineMilliseconds,
+          ),
+        ),
+      ),
+    )
+    .returning({ organizationId: polarCustomers.organizationId });
+  return released !== undefined;
+};
+
+export const releasePolarCheckoutLease = async (
+  database: DrizzleDatabase,
+  input: { organizationId: string; claimId: string; now?: Date },
+) => {
+  const now = input.now ?? new Date();
+  if (!input.organizationId.trim() || !input.claimId.trim() || !validDate(now))
+    throw new BillingStoreError("invalid_billing_input");
+  const [released] = await database
+    .update(polarCustomers)
+    .set({
+      checkoutClaimId: null,
+      checkoutClaimExpiresAt: null,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(polarCustomers.organizationId, input.organizationId),
+        eq(polarCustomers.checkoutClaimId, input.claimId),
+        isNotNull(polarCustomers.checkoutClaimExpiresAt),
+      ),
+    )
+    .returning({ organizationId: polarCustomers.organizationId });
+  return released !== undefined;
 };
 
 export const getOrganizationBillingOverview = (
@@ -225,6 +521,12 @@ const polarStatusPriority: Record<PolarSubscriptionStatus, number> = {
   paused: 4,
 };
 
+const terminalPolarStatus = (status: PolarSubscriptionStatus | null) =>
+  status === "incomplete_expired" ||
+  status === "canceled" ||
+  status === "unpaid" ||
+  status === "paused";
+
 const schedulesFreeDowngrade = (
   status: PolarSubscriptionStatus,
   cancelAtPeriodEnd: boolean,
@@ -240,13 +542,29 @@ const schedulesFreeDowngrade = (
 
 const shouldProjectPolarState = (
   current: typeof organizationEntitlements.$inferSelect | undefined,
+  currentEventType: string | null,
   input: PolarSubscriptionProjection,
 ) => {
+  if (
+    current?.tier === "free" &&
+    current.status === "active" &&
+    current.periodStart !== null &&
+    current.periodStart.getTime() >= input.periodEnd.getTime()
+  )
+    return false;
   if (!current?.polarEventAt) return true;
   const ordering = input.occurredAt.getTime() - current.polarEventAt.getTime();
   if (ordering !== 0) return ordering > 0;
   if (input.eventType === "subscription.revoked") return true;
+  if (currentEventType === "subscription.revoked") return false;
   const currentStatus = current.polarStatus as PolarSubscriptionStatus | null;
+  const incomingTerminal = terminalPolarStatus(input.status);
+  const currentTerminal = terminalPolarStatus(currentStatus);
+  if (incomingTerminal !== currentTerminal) return incomingTerminal;
+  if (input.cancelAtPeriodEnd !== current.cancelAtPeriodEnd)
+    return input.cancelAtPeriodEnd;
+  if (input.eventType === "order.paid") return true;
+  if (currentEventType === "order.paid") return false;
   return (
     currentStatus === null ||
     polarStatusPriority[input.status] >
@@ -293,6 +611,105 @@ const assertPolarSubscriptionMapping = async (
     throw new BillingStoreError("billing_subscription_conflict");
 };
 
+const assertPolarOrderMapping = async (
+  tx: Transaction,
+  input: Pick<
+    PolarOrderRefundProjection,
+    "organizationId" | "polarSubscriptionId" | "order"
+  >,
+) => {
+  const [mapping] = await tx
+    .select({
+      organizationId: polarWebhookEvents.organizationId,
+      subscriptionId: polarWebhookEvents.subscriptionId,
+    })
+    .from(polarWebhookEvents)
+    .where(eq(polarWebhookEvents.orderId, input.order.orderId))
+    .limit(1);
+  if (
+    mapping &&
+    (mapping.organizationId !== input.organizationId ||
+      mapping.subscriptionId !== input.polarSubscriptionId)
+  )
+    throw new BillingStoreError("billing_order_conflict");
+};
+
+const assertOrderReplay = (
+  event: typeof polarWebhookEvents.$inferSelect,
+  order: PolarOrderProjection,
+) => {
+  if (
+    event.orderId !== order.orderId ||
+    event.orderStatus !== order.status ||
+    event.orderBillingReason !== order.billingReason ||
+    event.orderCurrency !== order.currency ||
+    event.orderTotalAmount !== order.totalAmount ||
+    event.orderRefundedAmount !== order.refundedAmount ||
+    event.orderRefundedTaxAmount !== order.refundedTaxAmount
+  )
+    throw new BillingStoreError("billing_event_conflict");
+};
+
+const hasEmptyOrderAudit = (event: typeof polarWebhookEvents.$inferSelect) =>
+  event.orderId === null &&
+  event.orderStatus === null &&
+  event.orderBillingReason === null &&
+  event.orderCurrency === null &&
+  event.orderTotalAmount === null &&
+  event.orderRefundedAmount === null &&
+  event.orderRefundedTaxAmount === null;
+
+const assertExactWebhookIdentityReplay = (
+  event: typeof polarWebhookEvents.$inferSelect,
+  input: PolarSubscriptionProjection,
+) => {
+  if (
+    event.organizationId !== input.organizationId ||
+    event.subscriptionId !== input.polarSubscriptionId ||
+    event.eventType !== input.eventType ||
+    event.status !== input.status ||
+    event.occurredAt?.getTime() !== input.occurredAt.getTime()
+  )
+    throw new BillingStoreError("billing_event_conflict");
+};
+
+const hydrateLegacyOrderAudit = async (
+  tx: Transaction,
+  event: typeof polarWebhookEvents.$inferSelect,
+  input: PolarSubscriptionProjection & { order: PolarOrderProjection },
+) => {
+  assertExactWebhookIdentityReplay(event, input);
+  const [hydrated] = await tx
+    .update(polarWebhookEvents)
+    .set(polarOrderValues(input.order))
+    .where(
+      and(
+        eq(polarWebhookEvents.id, input.eventId),
+        eq(polarWebhookEvents.organizationId, input.organizationId),
+        eq(polarWebhookEvents.subscriptionId, input.polarSubscriptionId),
+        eq(polarWebhookEvents.eventType, input.eventType),
+        eq(polarWebhookEvents.status, input.status),
+        eq(polarWebhookEvents.occurredAt, input.occurredAt),
+        isNull(polarWebhookEvents.orderId),
+        isNull(polarWebhookEvents.orderStatus),
+        isNull(polarWebhookEvents.orderBillingReason),
+        isNull(polarWebhookEvents.orderCurrency),
+        isNull(polarWebhookEvents.orderTotalAmount),
+        isNull(polarWebhookEvents.orderRefundedAmount),
+        isNull(polarWebhookEvents.orderRefundedTaxAmount),
+      ),
+    )
+    .returning();
+  if (hydrated) return hydrated;
+  const [concurrentReplay] = await tx
+    .select()
+    .from(polarWebhookEvents)
+    .where(eq(polarWebhookEvents.id, input.eventId))
+    .limit(1);
+  if (!concurrentReplay) throw new Error("polar_webhook_event_not_found");
+  return concurrentReplay;
+};
+
 const assertWebhookReplay = (
   event: typeof polarWebhookEvents.$inferSelect,
   input: PolarSubscriptionProjection,
@@ -308,6 +725,8 @@ const assertWebhookReplay = (
       event.occurredAt.getTime() !== input.occurredAt.getTime())
   )
     throw new BillingStoreError("billing_event_conflict");
+  if (input.eventType === "order.paid" && input.order)
+    assertOrderReplay(event, input.order);
 };
 
 export const projectPolarSubscriptionEvent = (
@@ -325,18 +744,32 @@ export const projectPolarSubscriptionEvent = (
       !input.polarSubscriptionId.trim()
     )
       throw new BillingStoreError("invalid_billing_input");
+    if (input.eventType === "order.paid") {
+      if (input.order?.status !== "paid")
+        throw new BillingStoreError("invalid_billing_input");
+      validatePolarOrder(input.order);
+    } else if (input.order !== undefined) {
+      throw new BillingStoreError("invalid_billing_input");
+    }
     const now = input.now ?? new Date();
     if (!validDate(now)) throw new BillingStoreError("invalid_billing_input");
     await lockBillingMappings(tx, [
       `customer:${input.polarCustomerId}`,
       `organization:${input.organizationId}`,
       `subscription:${input.polarSubscriptionId}`,
+      ...(input.order ? [`order:${input.order.orderId}`] : []),
     ]);
     await recordPolarCustomerInTransaction(tx, {
       organizationId: input.organizationId,
       polarCustomerId: input.polarCustomerId,
     });
     await assertPolarSubscriptionMapping(tx, input);
+    if (input.order)
+      await assertPolarOrderMapping(tx, {
+        organizationId: input.organizationId,
+        polarSubscriptionId: input.polarSubscriptionId,
+        order: input.order,
+      });
     const [event] = await tx
       .insert(polarWebhookEvents)
       .values({
@@ -345,6 +778,7 @@ export const projectPolarSubscriptionEvent = (
         subscriptionId: input.polarSubscriptionId,
         eventType: input.eventType,
         status: input.status,
+        ...(input.order ? polarOrderValues(input.order) : {}),
         occurredAt: input.occurredAt,
       })
       .onConflictDoNothing()
@@ -356,8 +790,17 @@ export const projectPolarSubscriptionEvent = (
         .where(eq(polarWebhookEvents.id, input.eventId))
         .limit(1);
       if (!existing) throw new Error("polar_webhook_event_not_found");
-      assertWebhookReplay(existing, input);
-      return { processed: false, applied: existing.applied };
+      const replay =
+        input.eventType === "order.paid" &&
+        input.order !== undefined &&
+        hasEmptyOrderAudit(existing)
+          ? await hydrateLegacyOrderAudit(tx, existing, {
+              ...input,
+              order: input.order,
+            })
+          : existing;
+      assertWebhookReplay(replay, input);
+      return { processed: false, applied: replay.applied };
     }
 
     const [current] = await tx
@@ -365,7 +808,18 @@ export const projectPolarSubscriptionEvent = (
       .from(organizationEntitlements)
       .where(eq(organizationEntitlements.organizationId, input.organizationId))
       .limit(1);
-    const projectsState = shouldProjectPolarState(current, input);
+    const [currentEvent] = current?.polarEventId
+      ? await tx
+          .select({ eventType: polarWebhookEvents.eventType })
+          .from(polarWebhookEvents)
+          .where(eq(polarWebhookEvents.id, current.polarEventId))
+          .limit(1)
+      : [];
+    const projectsState = shouldProjectPolarState(
+      current,
+      currentEvent?.eventType ?? null,
+      input,
+    );
     if (projectsState) {
       const [freeClaim] = await tx
         .select({ memberId: memberFreeCreditClaims.memberId })
@@ -459,6 +913,70 @@ export const projectPolarSubscriptionEvent = (
         .set({ applied: true })
         .where(eq(polarWebhookEvents.id, input.eventId));
     return { processed: true, applied };
+  });
+
+/** Records refunds for audit without changing Credits or subscription access. */
+export const recordPolarOrderRefund = (
+  database: DrizzleDatabase,
+  input: PolarOrderRefundProjection,
+) =>
+  database.transaction(async (tx) => {
+    const now = input.now ?? new Date();
+    if (
+      !input.eventId.trim() ||
+      !validDate(input.occurredAt) ||
+      !validDate(now) ||
+      !input.organizationId.trim() ||
+      !input.polarCustomerId.trim() ||
+      !input.polarSubscriptionId.trim() ||
+      input.order.status === "paid" ||
+      input.order.refundedAmount < 1
+    )
+      throw new BillingStoreError("invalid_billing_input");
+    validatePolarOrder(input.order);
+    await lockBillingMappings(tx, [
+      `customer:${input.polarCustomerId}`,
+      `order:${input.order.orderId}`,
+      `organization:${input.organizationId}`,
+      `subscription:${input.polarSubscriptionId}`,
+    ]);
+    await recordPolarCustomerInTransaction(tx, {
+      organizationId: input.organizationId,
+      polarCustomerId: input.polarCustomerId,
+    });
+    await assertPolarSubscriptionMapping(tx, input);
+    await assertPolarOrderMapping(tx, input);
+
+    const [event] = await tx
+      .insert(polarWebhookEvents)
+      .values({
+        id: input.eventId,
+        organizationId: input.organizationId,
+        subscriptionId: input.polarSubscriptionId,
+        eventType: input.eventType,
+        occurredAt: input.occurredAt,
+        processedAt: now,
+        ...polarOrderValues(input.order),
+      })
+      .onConflictDoNothing()
+      .returning();
+    if (event) return { processed: true, applied: false };
+
+    const [existing] = await tx
+      .select()
+      .from(polarWebhookEvents)
+      .where(eq(polarWebhookEvents.id, input.eventId))
+      .limit(1);
+    if (!existing) throw new Error("polar_webhook_event_not_found");
+    if (
+      existing.organizationId !== input.organizationId ||
+      existing.subscriptionId !== input.polarSubscriptionId ||
+      existing.eventType !== input.eventType ||
+      existing.occurredAt?.getTime() !== input.occurredAt.getTime()
+    )
+      throw new BillingStoreError("billing_event_conflict");
+    assertOrderReplay(existing, input.order);
+    return { processed: false, applied: false };
   });
 
 /** Materializes usage missing from the pre-release consumption ledger. */
@@ -656,9 +1174,72 @@ export const markCreditUsageDelivered = async (
           eq(creditUsageOutbox.leaseOwner, input.leaseOwner),
         ),
       )
-      .returning({ id: creditUsageOutbox.id });
+      .returning({
+        id: creditUsageOutbox.id,
+        organizationId: creditUsageOutbox.organizationId,
+        occurredAt: creditUsageOutbox.occurredAt,
+      });
     if (delivered.length !== input.ids.length)
       throw new BillingStoreError("usage_lease_lost");
+    for (const item of delivered) {
+      let periods = await tx
+        .select()
+        .from(creditReconciliations)
+        .where(
+          and(
+            eq(creditReconciliations.organizationId, item.organizationId),
+            lte(creditReconciliations.periodStart, item.occurredAt),
+            gt(creditReconciliations.periodEnd, item.occurredAt),
+          ),
+        );
+      if (periods.length === 0) {
+        const [entitlement] = await tx
+          .select({
+            periodStart: organizationEntitlements.periodStart,
+            periodEnd: organizationEntitlements.periodEnd,
+          })
+          .from(organizationEntitlements)
+          .where(
+            eq(organizationEntitlements.organizationId, item.organizationId),
+          )
+          .limit(1);
+        if (
+          entitlement?.periodStart &&
+          entitlement.periodEnd &&
+          entitlement.periodStart.getTime() <= item.occurredAt.getTime() &&
+          item.occurredAt.getTime() < entitlement.periodEnd.getTime()
+        ) {
+          await tx
+            .insert(creditReconciliations)
+            .values({
+              organizationId: item.organizationId,
+              localCredits: 0,
+              polarCredits: 0,
+              status: "pending",
+              periodStart: entitlement.periodStart,
+              periodEnd: entitlement.periodEnd,
+            })
+            .onConflictDoNothing();
+          periods = await tx
+            .select()
+            .from(creditReconciliations)
+            .where(
+              and(
+                eq(creditReconciliations.organizationId, item.organizationId),
+                lte(creditReconciliations.periodStart, item.occurredAt),
+                gt(creditReconciliations.periodEnd, item.occurredAt),
+              ),
+            );
+        }
+      }
+      const [period] = periods;
+      if (periods.length !== 1 || !period)
+        throw new BillingStoreError("billing_period_unavailable");
+      await tx
+        .update(creditReconciliations)
+        .set({ status: "pending", resolvedAt: null })
+        .where(eq(creditReconciliations.id, period.id));
+    }
   });
 };
 
@@ -845,30 +1426,7 @@ const reconciliationPeriod = async (
   if (!reconciliation) return null;
   if (reconciliation.periodStart && reconciliation.periodEnd)
     return reconciliation;
-  const [entitlement] = await database
-    .select({
-      periodStart: organizationEntitlements.periodStart,
-      periodEnd: organizationEntitlements.periodEnd,
-    })
-    .from(organizationEntitlements)
-    .where(
-      eq(
-        organizationEntitlements.organizationId,
-        reconciliation.organizationId,
-      ),
-    )
-    .limit(1);
-  if (!entitlement?.periodStart || !entitlement.periodEnd)
-    throw new BillingStoreError("billing_period_unavailable");
-  const [upgraded] = await database
-    .update(creditReconciliations)
-    .set({
-      periodStart: entitlement.periodStart,
-      periodEnd: entitlement.periodEnd,
-    })
-    .where(eq(creditReconciliations.id, reconciliationId))
-    .returning();
-  return upgraded ?? reconciliation;
+  throw new BillingStoreError("billing_period_unavailable");
 };
 
 const getOrCreateReconciliation = async (
@@ -877,8 +1435,13 @@ const getOrCreateReconciliation = async (
     | { reconciliationId: string }
     | { organizationId: string; startAt: Date; endAt: Date },
 ) => {
-  if ("reconciliationId" in input)
+  if ("reconciliationId" in input) {
+    if (!input.reconciliationId.trim())
+      throw new BillingStoreError("invalid_billing_input");
     return reconciliationPeriod(database, input.reconciliationId);
+  }
+  if (!input.organizationId.trim())
+    throw new BillingStoreError("invalid_billing_input");
   validatePeriod(input.startAt, input.endAt);
   await database
     .insert(creditReconciliations)
@@ -935,8 +1498,8 @@ export const reconcileCreditUsage = async (
       and(
         eq(creditUsageOutbox.organizationId, target.organizationId),
         eq(creditUsageOutbox.state, "delivered"),
-        gte(creditUsageOutbox.deliveredAt, target.startAt),
-        lt(creditUsageOutbox.deliveredAt, target.endAt),
+        gte(creditUsageOutbox.occurredAt, target.startAt),
+        lt(creditUsageOutbox.occurredAt, target.endAt),
       ),
     );
   const localCredits = Number(usage?.total ?? 0);
@@ -982,13 +1545,84 @@ export const reconcileCreditUsage = async (
   return completed ?? null;
 };
 
+type CreditReconciliationCursor = {
+  organizationId: string;
+  startAt: Date;
+  endAt: Date;
+};
+
+const decodeCreditReconciliationCursor = (
+  value: string | undefined,
+): CreditReconciliationCursor | null => {
+  if (value === undefined) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (
+      !Array.isArray(parsed) ||
+      parsed.length !== 3 ||
+      typeof parsed[0] !== "string" ||
+      !parsed[0].trim() ||
+      typeof parsed[1] !== "string" ||
+      typeof parsed[2] !== "string"
+    )
+      throw new Error("invalid_cursor");
+    const startAt = new Date(parsed[1]);
+    const endAt = new Date(parsed[2]);
+    validatePeriod(startAt, endAt);
+    return { organizationId: parsed[0], startAt, endAt };
+  } catch {
+    throw new BillingStoreError("invalid_billing_input");
+  }
+};
+
+const encodeCreditReconciliationCursor = (target: CreditReconciliationTarget) =>
+  JSON.stringify([
+    target.organizationId,
+    target.startAt.toISOString(),
+    target.endAt.toISOString(),
+  ]);
+
+const afterCreditReconciliationCursor = (
+  cursor: CreditReconciliationCursor | null,
+) =>
+  cursor === null
+    ? undefined
+    : or(
+        gt(creditReconciliations.organizationId, cursor.organizationId),
+        and(
+          eq(creditReconciliations.organizationId, cursor.organizationId),
+          gt(creditReconciliations.periodStart, cursor.startAt),
+        ),
+        and(
+          eq(creditReconciliations.organizationId, cursor.organizationId),
+          eq(creditReconciliations.periodStart, cursor.startAt),
+          gt(creditReconciliations.periodEnd, cursor.endAt),
+        ),
+      );
+
+const afterEntitlementCursor = (cursor: CreditReconciliationCursor | null) =>
+  cursor === null
+    ? undefined
+    : or(
+        gt(organizationEntitlements.organizationId, cursor.organizationId),
+        and(
+          eq(organizationEntitlements.organizationId, cursor.organizationId),
+          gt(organizationEntitlements.periodStart, cursor.startAt),
+        ),
+        and(
+          eq(organizationEntitlements.organizationId, cursor.organizationId),
+          eq(organizationEntitlements.periodStart, cursor.startAt),
+          gt(organizationEntitlements.periodEnd, cursor.endAt),
+        ),
+      );
+
 export const reconcileCreditPeriodPage = async (
   database: DrizzleDatabase,
   readMeter: CreditMeterReader,
   options: {
     limit?: number;
     now?: Date;
-    afterOrganizationId?: string;
+    after?: string;
   } = {},
 ) => {
   const limit = options.limit ?? 50;
@@ -997,12 +1631,11 @@ export const reconcileCreditPeriodPage = async (
     !Number.isSafeInteger(limit) ||
     limit < 1 ||
     limit > 100 ||
-    !validDate(now) ||
-    (options.afterOrganizationId !== undefined &&
-      !options.afterOrganizationId.trim())
+    !validDate(now)
   )
     throw new BillingStoreError("invalid_billing_input");
-  const candidates = await database
+  const cursor = decodeCreditReconciliationCursor(options.after);
+  const currentPeriods = await database
     .select({
       organizationId: organizationEntitlements.organizationId,
       startAt: organizationEntitlements.periodStart,
@@ -1020,15 +1653,80 @@ export const reconcileCreditPeriodPage = async (
       and(
         isNotNull(organizationEntitlements.periodStart),
         isNotNull(organizationEntitlements.periodEnd),
-        options.afterOrganizationId === undefined
-          ? undefined
-          : gt(
-              organizationEntitlements.organizationId,
-              options.afterOrganizationId,
-            ),
+        afterEntitlementCursor(cursor),
       ),
     )
-    .orderBy(organizationEntitlements.organizationId)
+    .orderBy(
+      organizationEntitlements.organizationId,
+      organizationEntitlements.periodStart,
+      organizationEntitlements.periodEnd,
+    )
+    .limit(limit + 1);
+  const exactCurrentPeriods = currentPeriods.filter(
+    (
+      period,
+    ): period is {
+      organizationId: string;
+      startAt: Date;
+      endAt: Date;
+    } => period.startAt !== null && period.endAt !== null,
+  );
+  if (exactCurrentPeriods.length > 0)
+    await database
+      .insert(creditReconciliations)
+      .values(
+        exactCurrentPeriods.map((period) => ({
+          organizationId: period.organizationId,
+          localCredits: 0,
+          polarCredits: 0,
+          periodStart: period.startAt,
+          periodEnd: period.endAt,
+          status: "pending",
+        })),
+      )
+      .onConflictDoNothing();
+  const candidates = await database
+    .select({
+      id: creditReconciliations.id,
+      organizationId: creditReconciliations.organizationId,
+      startAt: creditReconciliations.periodStart,
+      endAt: creditReconciliations.periodEnd,
+    })
+    .from(creditReconciliations)
+    .innerJoin(
+      polarCustomers,
+      eq(polarCustomers.organizationId, creditReconciliations.organizationId),
+    )
+    .leftJoin(
+      organizationEntitlements,
+      and(
+        eq(
+          organizationEntitlements.organizationId,
+          creditReconciliations.organizationId,
+        ),
+        eq(
+          organizationEntitlements.periodStart,
+          creditReconciliations.periodStart,
+        ),
+        eq(organizationEntitlements.periodEnd, creditReconciliations.periodEnd),
+      ),
+    )
+    .where(
+      and(
+        isNotNull(creditReconciliations.periodStart),
+        isNotNull(creditReconciliations.periodEnd),
+        or(
+          ne(creditReconciliations.status, "matched"),
+          isNotNull(organizationEntitlements.organizationId),
+        ),
+        afterCreditReconciliationCursor(cursor),
+      ),
+    )
+    .orderBy(
+      creditReconciliations.organizationId,
+      creditReconciliations.periodStart,
+      creditReconciliations.periodEnd,
+    )
     .limit(limit + 1);
   const page = candidates.slice(0, limit);
   const results = [];
@@ -1038,19 +1736,24 @@ export const reconcileCreditPeriodPage = async (
       await reconcileCreditUsage(
         database,
         {
-          organizationId: candidate.organizationId,
-          startAt: candidate.startAt,
-          endAt: candidate.endAt,
+          reconciliationId: candidate.id,
           now,
         },
         readMeter,
       ),
     );
   }
+  const lastCandidate = page.at(-1);
   return {
     reconciliations: results,
     nextCursor:
-      candidates.length > limit ? (page.at(-1)?.organizationId ?? null) : null,
+      candidates.length > limit && lastCandidate?.startAt && lastCandidate.endAt
+        ? encodeCreditReconciliationCursor({
+            organizationId: lastCandidate.organizationId,
+            startAt: lastCandidate.startAt,
+            endAt: lastCandidate.endAt,
+          })
+        : null,
   };
 };
 
@@ -1060,7 +1763,7 @@ export const reconcileCurrentCreditPeriods = async (
   options: {
     limit?: number;
     now?: Date;
-    afterOrganizationId?: string;
+    after?: string;
   } = {},
 ) =>
   (await reconcileCreditPeriodPage(database, readMeter, options))

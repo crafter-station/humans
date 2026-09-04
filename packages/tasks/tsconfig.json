@@ -9,7 +9,6 @@
   },
   "include": [
     "trigger.config.ts",
-    "trigger.tikhub.config.ts",
     "scripts/**/*.ts",
     "src/**/*.ts",
     "test/**/*.ts"

@@ -22,6 +22,7 @@ export async function POST(request: Request) {
   const response = await fetch(`${env.HUMANS_API_URL}/v1/workspace`, {
     method: "POST",
     headers: protectedProxyHeaders(request, token),
+    redirect: "error",
   });
   return new Response(response.body, {
     status: response.status,

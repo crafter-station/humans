@@ -13,9 +13,16 @@ import {
 } from "../abuse-controls";
 import { runChargedProfileSearch } from "../charged-search";
 import {
+  beginPolarCheckoutCreation,
+  claimPolarCheckout,
+  clearPolarCheckoutClaim,
+  completePolarCheckout,
   getBillingCustomerSeed,
   getOrganizationBillingOverview,
+  recordPolarOrderRefund,
   recordPolarCustomer,
+  releaseExpiredPolarCheckoutReconciliation,
+  releasePolarCheckoutLease,
 } from "../billing";
 import {
   ContactRevealError,
@@ -217,9 +224,37 @@ export const makeDatabaseService = (
       saved("Database.getOrganizationBillingOverview", () =>
         getOrganizationBillingOverview(database, organizationId),
       ),
+    claimPolarCheckout: (input) =>
+      saved("Database.claimPolarCheckout", () =>
+        claimPolarCheckout(database, input),
+      ),
+    beginPolarCheckoutCreation: (input) =>
+      saved("Database.beginPolarCheckoutCreation", () =>
+        beginPolarCheckoutCreation(database, input),
+      ),
+    completePolarCheckout: (input) =>
+      saved("Database.completePolarCheckout", () =>
+        completePolarCheckout(database, input),
+      ),
+    clearPolarCheckoutClaim: (input) =>
+      saved("Database.clearPolarCheckoutClaim", () =>
+        clearPolarCheckoutClaim(database, input),
+      ),
+    releaseExpiredPolarCheckoutReconciliation: (input) =>
+      saved("Database.releaseExpiredPolarCheckoutReconciliation", () =>
+        releaseExpiredPolarCheckoutReconciliation(database, input),
+      ),
+    releasePolarCheckoutLease: (input) =>
+      saved("Database.releasePolarCheckoutLease", () =>
+        releasePolarCheckoutLease(database, input),
+      ),
     recordPolarCustomer: (input) =>
       saved("Database.recordPolarCustomer", () =>
         recordPolarCustomer(database, input),
+      ),
+    recordPolarOrderRefund: (input) =>
+      saved("Database.recordPolarOrderRefund", () =>
+        recordPolarOrderRefund(database, input),
       ),
     ...makeClerkService(database),
     ...makeProfileService(database),

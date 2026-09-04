@@ -9,6 +9,7 @@ import { applyCreditEntry, getCreditBalance } from "@humans/database/credits";
 import { importProfiles } from "@humans/database/import-profiles";
 import * as schema from "@humans/database/schema";
 import { searchProfiles } from "@humans/database/search-profiles";
+import { PolarBillingError } from "@humans/polar-billing";
 import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
@@ -61,13 +62,51 @@ describe("Humans API", () => {
   });
 
   it("serves health and public API documentation from an initialized database", async () => {
-    const healthResponse = await app.request("/health");
+    const release = "a".repeat(40);
+    const workerVersionId = "11111111-1111-4111-8111-111111111111";
+    const rateLimitBinding = { limit: async () => ({ success: true }) };
+    const healthResponse = await app.request("/health", {}, {
+      API_KEY_RATE_LIMITER: rateLimitBinding,
+      BILLING_APP_ORIGIN: "https://humans.crafter.run",
+      BILLING_REQUIRED: "true",
+      CLERK_BOT_PROTECTION_ENABLED: "true",
+      CLERK_PUBLISHABLE_KEY: `pk_live_${"a".repeat(24)}`,
+      CLERK_SECRET_KEY: `sk_live_${"b".repeat(24)}`,
+      CLERK_WEBHOOK_SIGNING_SECRET: `whsec_${"c".repeat(24)}`,
+      CF_VERSION_METADATA: { id: workerVersionId },
+      DATABASE_URL:
+        "postgresql://humans:password@ep-jolly-night-au0ic7nb-pooler.c-10.us-east-1.aws.neon.tech/humans?sslmode=require",
+      IP_RATE_LIMITER: rateLimitBinding,
+      MEMBER_RATE_LIMITER: rateLimitBinding,
+      NATURAL_SEARCH_RATE_LIMITER: rateLimitBinding,
+      ORGANIZATION_RATE_LIMITER: rateLimitBinding,
+      POLAR_ACCESS_TOKEN: "polar_oat_test_only",
+      POLAR_BASE_URL: "https://api.polar.sh/v1",
+      POLAR_CUSTOMER_OWNER_EMAIL: "billing@humans.example",
+      POLAR_ORGANIZATION_ID: "22222222-2222-4222-8222-222222222222",
+      POLAR_PRO_PRODUCT_ID: "33333333-3333-4333-8333-333333333333",
+      POLAR_USAGE_EVENT_NAME: "humans_credit_usage",
+      POLAR_USAGE_METER_ID: "44444444-4444-4444-8444-444444444444",
+      POLAR_WEBHOOK_SECRET: "polar_webhook_secret",
+      PUBLIC_PROFILE_REQUEST_RATE_LIMITER: rateLimitBinding,
+      PUBLIC_PROFILE_VERIFICATION_RATE_LIMITER: rateLimitBinding,
+      SEARCH_CURSOR_SECRET: "d".repeat(32),
+      SENTRY_DSN: "https://public@o1.ingest.us.sentry.io/4512020552089600",
+      SENTRY_ENVIRONMENT: "production",
+      SENTRY_RELEASE: release,
+      WEB_PROXY_SECRET: "e".repeat(32),
+    } as Bindings);
     expect(healthResponse.status).toBe(200);
+    expect(healthResponse.headers.get("x-humans-release")).toBe(release);
+    expect(healthResponse.headers.get("x-humans-environment")).toBe(
+      "production",
+    );
     await expect(healthResponse.json()).resolves.toEqual({
       checks: {
         database: "ok",
         pgvector: "ok",
       },
+      worker: { versionId: workerVersionId },
       status: "ok",
     });
 
@@ -321,25 +360,42 @@ describe("Humans API", () => {
     expect(identity.personalOrganizationsCreated).toBe(1);
   });
 
-  it("refuses a second Pro checkout for an active Polar subscription", async () => {
+  it("routes a past-due Pro subscription to recovery instead of another checkout", async () => {
     const billingIdentity = new FakeIdentity();
     billingIdentity.sessions.set("billing_session", {
       memberId: "billing_member",
       organizationId: null,
     });
-    let active = true;
-    const createProCheckout = vi.fn(async () => ({
+    let subscriptionStatus: "active" | "past_due" | null = "past_due";
+    const ensureCustomer = vi.fn(async (input) => ({
+      id: "22222222-2222-4222-8222-222222222222",
+      clerkOrganizationId: input.clerkOrganizationId,
+      type: "team" as const,
+    }));
+    const checkoutSession = {
       id: "11111111-1111-4111-8111-111111111111",
       url: "https://polar.sh/checkout/test",
-      expiresAt: new Date("2026-09-04T00:00:00Z"),
+      expiresAt: new Date(Date.now() + 60_000),
+    };
+    let recoverableCheckout: typeof checkoutSession | null = null;
+    const findOpenProCheckout = vi.fn(async () => recoverableCheckout);
+    const findProCheckoutByClaim = vi.fn(async () =>
+      recoverableCheckout
+        ? { ...recoverableCheckout, status: "open" as const }
+        : null,
+    );
+    let knownCheckoutStatus: "open" | "expired" | "succeeded" = "open";
+    const getProCheckout = vi.fn(async () => ({
+      ...checkoutSession,
+      status: knownCheckoutStatus,
     }));
+    const createProCheckout = vi.fn(async () => checkoutSession);
     const polar = {
       billingConfigured: () => true,
-      ensureCustomer: async (input) => ({
-        id: "22222222-2222-4222-8222-222222222222",
-        clerkOrganizationId: input.clerkOrganizationId,
-        type: "team" as const,
-      }),
+      ensureCustomer,
+      findOpenProCheckout,
+      findProCheckoutByClaim,
+      getProCheckout,
       createProCheckout,
       createCustomerPortalSession: async () => ({
         id: "33333333-3333-4333-8333-333333333333",
@@ -352,10 +408,10 @@ describe("Humans API", () => {
           clerkOrganizationId,
           type: "team" as const,
         },
-        proSubscription: active
+        proSubscription: subscriptionStatus
           ? {
               id: "44444444-4444-4444-8444-444444444444",
-              status: "active" as const,
+              status: subscriptionStatus,
               currentPeriodStart: new Date("2026-09-01T00:00:00Z"),
               currentPeriodEnd: new Date("2026-10-01T00:00:00Z"),
               cancelAtPeriodEnd: false,
@@ -377,6 +433,14 @@ describe("Humans API", () => {
       headers: { authorization: "Bearer billing_session" },
     });
     expect(provisioned.status).toBe(200);
+    expect(ensureCustomer).toHaveBeenCalledOnce();
+    expect(ensureCustomer).toHaveBeenCalledWith(
+      {
+        clerkOrganizationId: "personal_billing_member",
+        name: "Personal Organization",
+      },
+      undefined,
+    );
     billingIdentity.sessions.set("billing_session", {
       memberId: "billing_member",
       organizationId: "personal_billing_member",
@@ -392,13 +456,501 @@ describe("Humans API", () => {
     });
     expect(createProCheckout).not.toHaveBeenCalled();
 
-    active = false;
+    subscriptionStatus = null;
     const checkout = await billingApp.request("/v1/billing/checkout", {
       method: "POST",
       headers: { authorization: "Bearer billing_session" },
     });
     expect(checkout.status).toBe(201);
     expect(createProCheckout).toHaveBeenCalledOnce();
+
+    const replay = await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_session" },
+    });
+    expect(replay.status).toBe(200);
+    expect(createProCheckout).toHaveBeenCalledOnce();
+
+    await database
+      .update(schema.polarCustomers)
+      .set({ checkoutExpiresAt: new Date(0) })
+      .where(
+        eq(schema.polarCustomers.organizationId, "personal_billing_member"),
+      );
+    const providerOpen = await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_session" },
+    });
+    expect(providerOpen.status).toBe(200);
+    expect(createProCheckout).toHaveBeenCalledOnce();
+
+    knownCheckoutStatus = "expired";
+    await database
+      .update(schema.polarCustomers)
+      .set({ checkoutExpiresAt: new Date(0) })
+      .where(
+        eq(schema.polarCustomers.organizationId, "personal_billing_member"),
+      );
+    const replacement = await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_session" },
+    });
+    expect(replacement.status).toBe(201);
+    expect(createProCheckout).toHaveBeenCalledTimes(2);
+    expect(getProCheckout).toHaveBeenCalledTimes(3);
+
+    await database
+      .update(schema.polarCustomers)
+      .set({
+        checkoutClaimId: null,
+        checkoutClaimExpiresAt: null,
+        checkoutId: null,
+        checkoutUrl: null,
+        checkoutExpiresAt: null,
+      })
+      .where(
+        eq(schema.polarCustomers.organizationId, "personal_billing_member"),
+      );
+    createProCheckout.mockRejectedValueOnce(new Error("response lost"));
+    const failedCheckout = await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_session" },
+    });
+    expect(failedCheckout.status).toBe(503);
+    const blockedRetry = await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_session" },
+    });
+    expect(blockedRetry.status).toBe(409);
+    await expect(blockedRetry.json()).resolves.toMatchObject({
+      error: { code: "checkout_in_progress" },
+    });
+    expect(createProCheckout).toHaveBeenCalledTimes(3);
+
+    await database
+      .update(schema.polarCustomers)
+      .set({ updatedAt: new Date(Date.now() - 6 * 60_000) })
+      .where(
+        eq(schema.polarCustomers.organizationId, "personal_billing_member"),
+      );
+    const boundedRetry = await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_session" },
+    });
+    expect(boundedRetry.status).toBe(201);
+    expect(createProCheckout).toHaveBeenCalledTimes(4);
+
+    await database
+      .update(schema.polarCustomers)
+      .set({
+        checkoutClaimId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        checkoutClaimExpiresAt: null,
+        checkoutId: null,
+        checkoutUrl: null,
+        checkoutExpiresAt: null,
+      })
+      .where(
+        eq(schema.polarCustomers.organizationId, "personal_billing_member"),
+      );
+    recoverableCheckout = checkoutSession;
+    const recovered = await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_session" },
+    });
+    expect(recovered.status).toBe(200);
+    await expect(recovered.json()).resolves.toMatchObject({
+      url: checkoutSession.url,
+    });
+    expect(createProCheckout).toHaveBeenCalledTimes(4);
+    expect(findOpenProCheckout).toHaveBeenCalledTimes(4);
+    expect(findProCheckoutByClaim).toHaveBeenCalledTimes(3);
+
+    knownCheckoutStatus = "succeeded";
+    recoverableCheckout = null;
+    await database
+      .update(schema.polarCustomers)
+      .set({ checkoutExpiresAt: new Date(0) })
+      .where(
+        eq(schema.polarCustomers.organizationId, "personal_billing_member"),
+      );
+    const afterSucceeded = await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_session" },
+    });
+    expect(afterSucceeded.status).toBe(201);
+    expect(createProCheckout).toHaveBeenCalledTimes(5);
+
+    subscriptionStatus = "active";
+    const activeSubscription = await billingApp.request(
+      "/v1/billing/checkout",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer billing_session" },
+      },
+    );
+    expect(activeSubscription.status).toBe(409);
+    subscriptionStatus = null;
+
+    findOpenProCheckout.mockRejectedValueOnce(new Error("preflight failed"));
+    const failedPreflight = await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_session" },
+    });
+    expect(failedPreflight.status).toBe(503);
+    const afterPreflightFailure = await billingApp.request(
+      "/v1/billing/checkout",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer billing_session" },
+      },
+    );
+    expect(afterPreflightFailure.status).toBe(201);
+    expect(createProCheckout).toHaveBeenCalledTimes(6);
+
+    subscriptionStatus = "active";
+    await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_session" },
+    });
+    subscriptionStatus = null;
+    createProCheckout.mockRejectedValueOnce(
+      new PolarBillingError("forbidden", { operation: "create_checkout" }),
+    );
+    const rejectedCreation = await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_session" },
+    });
+    expect(rejectedCreation.status).toBe(503);
+    const afterRejectedCreation = await billingApp.request(
+      "/v1/billing/checkout",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer billing_session" },
+      },
+    );
+    expect(afterRejectedCreation.status).toBe(201);
+    expect(createProCheckout).toHaveBeenCalledTimes(8);
+
+    billingIdentity.sessions.set("billing_invited_session", {
+      memberId: "billing_invited_member",
+      organizationId: "billing_inviting_organization",
+    });
+    billingIdentity.organizations.set("billing_invited_member", {
+      member: {
+        clerkId: "billing_invited_member",
+        email: "billing-invited@example.com",
+        imageUrl: null,
+        name: "Billing Invited Member",
+      },
+      membership: {
+        clerkId: "billing_invited_membership",
+        memberId: "billing_invited_member",
+        organizationId: "billing_inviting_organization",
+        role: "org:member",
+      },
+      organization: {
+        clerkId: "billing_inviting_organization",
+        name: "Billing Inviting Organization",
+        slug: "billing-inviting-organization",
+      },
+    });
+    const customerCallsBeforeInvited = ensureCustomer.mock.calls.length;
+    const invited = await billingApp.request("/v1/workspace", {
+      method: "POST",
+      headers: { authorization: "Bearer billing_invited_session" },
+    });
+    expect(invited.status).toBe(200);
+    expect(ensureCustomer).toHaveBeenCalledTimes(customerCallsBeforeInvited);
+  });
+
+  it("serializes concurrent Pro checkout requests", async () => {
+    const billingIdentity = new FakeIdentity();
+    billingIdentity.sessions.set("concurrent_billing_session", {
+      memberId: "concurrent_billing_member",
+      organizationId: null,
+    });
+    let checkoutStarted: (() => void) | undefined;
+    let finishCheckout: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      checkoutStarted = resolve;
+    });
+    const finish = new Promise<void>((resolve) => {
+      finishCheckout = resolve;
+    });
+    const createProCheckout = vi.fn(async () => {
+      checkoutStarted?.();
+      await finish;
+      return {
+        id: "55555555-5555-4555-8555-555555555555",
+        url: "https://polar.sh/checkout/concurrent",
+        expiresAt: new Date(Date.now() + 60_000),
+      };
+    });
+    const polar = {
+      billingConfigured: () => true,
+      ensureCustomer: async (input) => ({
+        id: "66666666-6666-4666-8666-666666666666",
+        clerkOrganizationId: input.clerkOrganizationId,
+        type: "team" as const,
+      }),
+      findOpenProCheckout: async () => null,
+      findProCheckoutByClaim: async () => null,
+      getProCheckout: async () => ({
+        id: "55555555-5555-4555-8555-555555555555",
+        status: "open" as const,
+        url: "https://polar.sh/checkout/concurrent",
+        expiresAt: new Date(Date.now() + 60_000),
+      }),
+      createProCheckout,
+      createCustomerPortalSession: async () => ({
+        id: "77777777-7777-4777-8777-777777777777",
+        url: "https://polar.sh/portal/concurrent",
+        expiresAt: new Date(Date.now() + 60_000),
+      }),
+      getCustomerState: async (clerkOrganizationId: string) => ({
+        customer: {
+          id: "66666666-6666-4666-8666-666666666666",
+          clerkOrganizationId,
+          type: "team" as const,
+        },
+        proSubscription: null,
+      }),
+      getMeterQuantities: async () => ({ quantities: [], total: 0 }),
+      verifySubscriptionWebhook: async () => null,
+      verifyBillingWebhook: async () => null,
+    } satisfies PolarBoundary;
+    const billingApp = createApp(
+      () => makeDatabaseLayer(database),
+      billingIdentity,
+      undefined,
+      polar,
+    );
+    const provisioned = await billingApp.request("/v1/workspace", {
+      method: "POST",
+      headers: { authorization: "Bearer concurrent_billing_session" },
+    });
+    expect(provisioned.status).toBe(200);
+    billingIdentity.sessions.set("concurrent_billing_session", {
+      memberId: "concurrent_billing_member",
+      organizationId: "personal_concurrent_billing_member",
+    });
+
+    const first = billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer concurrent_billing_session" },
+    });
+    await started;
+    const concurrent = await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer concurrent_billing_session" },
+    });
+    expect(concurrent.status).toBe(409);
+    await expect(concurrent.json()).resolves.toMatchObject({
+      error: { code: "checkout_in_progress" },
+    });
+    finishCheckout?.();
+    expect((await first).status).toBe(201);
+    expect(createProCheckout).toHaveBeenCalledOnce();
+  });
+
+  it("isolates billing reads and management by Organization role", async () => {
+    const billingIdentity = new FakeIdentity();
+    billingIdentity.sessions.set("role_admin_session", {
+      memberId: "role_admin",
+      organizationId: null,
+    });
+    const customerIds = new Map([
+      ["personal_role_admin", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"],
+      ["role_secondary", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
+    ]);
+    const ensureCustomer = vi.fn(async (input) => ({
+      id: customerIds.get(input.clerkOrganizationId) ?? "customer_unexpected",
+      clerkOrganizationId: input.clerkOrganizationId,
+      type: "team" as const,
+    }));
+    const createProCheckout = vi.fn(async (organizationId: string) => ({
+      id: "33333333-3333-4333-8333-333333333333",
+      url: `https://polar.sh/checkout/${organizationId}`,
+      expiresAt: new Date(Date.now() + 60_000),
+    }));
+    const createCustomerPortalSession = vi.fn(
+      async (organizationId: string) => ({
+        id: "44444444-4444-4444-8444-444444444444",
+        url: `https://polar.sh/portal/${organizationId}`,
+        expiresAt: new Date(Date.now() + 60_000),
+      }),
+    );
+    const polar = {
+      billingConfigured: () => true,
+      ensureCustomer,
+      findOpenProCheckout: async () => null,
+      findProCheckoutByClaim: async () => null,
+      getProCheckout: async () => ({
+        id: "88888888-8888-4888-8888-888888888888",
+        status: "open" as const,
+        url: "https://polar.sh/checkout/member",
+        expiresAt: new Date(Date.now() + 60_000),
+      }),
+      createProCheckout,
+      createCustomerPortalSession,
+      getCustomerState: async (clerkOrganizationId: string) => ({
+        customer: {
+          id: customerIds.get(clerkOrganizationId) ?? "customer_unexpected",
+          clerkOrganizationId,
+          type: "team" as const,
+        },
+        proSubscription: null,
+      }),
+      getMeterQuantities: async () => ({ quantities: [], total: 0 }),
+      verifySubscriptionWebhook: async () => null,
+      verifyBillingWebhook: async () => null,
+    } satisfies PolarBoundary;
+    const billingApp = createApp(
+      () => makeDatabaseLayer(database),
+      billingIdentity,
+      undefined,
+      polar,
+    );
+
+    expect(
+      (
+        await billingApp.request("/v1/workspace", {
+          method: "POST",
+          headers: { authorization: "Bearer role_admin_session" },
+        })
+      ).status,
+    ).toBe(200);
+    billingIdentity.sessions.set("role_admin_session", {
+      memberId: "role_admin",
+      organizationId: "personal_role_admin",
+    });
+    billingIdentity.sessions.set("role_member_session", {
+      memberId: "role_member",
+      organizationId: "personal_role_admin",
+    });
+    billingIdentity.organizations.set("role_member", {
+      member: {
+        clerkId: "role_member",
+        email: "role-member@example.com",
+        imageUrl: null,
+        name: "Role Member",
+      },
+      membership: {
+        clerkId: "role_member_membership",
+        memberId: "role_member",
+        organizationId: "personal_role_admin",
+        role: "org:member",
+      },
+      organization: {
+        clerkId: "personal_role_admin",
+        name: "Personal Organization",
+        slug: "personal-role-admin",
+      },
+    });
+    expect(
+      (
+        await billingApp.request("/v1/workspace", {
+          method: "POST",
+          headers: { authorization: "Bearer role_member_session" },
+        })
+      ).status,
+    ).toBe(200);
+
+    const [adminOverview, memberOverview] = await Promise.all([
+      billingApp.request("/v1/billing", {
+        headers: { authorization: "Bearer role_admin_session" },
+      }),
+      billingApp.request("/v1/billing", {
+        headers: { authorization: "Bearer role_member_session" },
+      }),
+    ]);
+    expect(adminOverview.status).toBe(200);
+    expect(memberOverview.status).toBe(200);
+    await expect(adminOverview.json()).resolves.toMatchObject({
+      plan: "free",
+      availableCredits: 100,
+      canManageBilling: true,
+    });
+    await expect(memberOverview.json()).resolves.toMatchObject({
+      plan: "free",
+      availableCredits: 100,
+      canManageBilling: false,
+    });
+    for (const path of ["checkout", "portal"]) {
+      const blocked = await billingApp.request(`/v1/billing/${path}`, {
+        method: "POST",
+        headers: { authorization: "Bearer role_member_session" },
+      });
+      expect(blocked.status).toBe(403);
+    }
+    expect(createProCheckout).not.toHaveBeenCalled();
+    expect(createCustomerPortalSession).not.toHaveBeenCalled();
+
+    const portal = await billingApp.request("/v1/billing/portal", {
+      method: "POST",
+      headers: { authorization: "Bearer role_admin_session" },
+    });
+    expect(portal.status).toBe(201);
+    expect(createCustomerPortalSession).toHaveBeenCalledWith(
+      "personal_role_admin",
+      undefined,
+    );
+
+    billingIdentity.sessions.set("role_admin_session", {
+      memberId: "role_admin",
+      organizationId: "role_secondary",
+    });
+    billingIdentity.organizations.set("role_admin", {
+      member: {
+        clerkId: "role_admin",
+        email: "role-admin@example.com",
+        imageUrl: null,
+        name: "Role Admin",
+      },
+      membership: {
+        clerkId: "role_secondary_membership",
+        memberId: "role_admin",
+        organizationId: "role_secondary",
+        role: "org:admin",
+      },
+      organization: {
+        clerkId: "role_secondary",
+        name: "Role Secondary",
+        slug: "role-secondary",
+      },
+    });
+    expect(
+      (
+        await billingApp.request("/v1/workspace", {
+          method: "POST",
+          headers: { authorization: "Bearer role_admin_session" },
+        })
+      ).status,
+    ).toBe(200);
+    const secondaryOverview = await billingApp.request("/v1/billing", {
+      headers: { authorization: "Bearer role_admin_session" },
+    });
+    await expect(secondaryOverview.json()).resolves.toMatchObject({
+      plan: "free",
+      availableCredits: 0,
+      status: "inactive",
+      canManageBilling: true,
+    });
+    const secondaryCheckout = await billingApp.request("/v1/billing/checkout", {
+      method: "POST",
+      headers: { authorization: "Bearer role_admin_session" },
+    });
+    expect(secondaryCheckout.status).toBe(201);
+    expect(createProCheckout).toHaveBeenCalledWith(
+      "role_secondary",
+      expect.stringMatching(/^[0-9a-f-]{36}$/),
+      undefined,
+    );
+    expect(
+      ensureCustomer.mock.calls.map(([input]) => input.clerkOrganizationId),
+    ).toEqual(
+      expect.arrayContaining(["personal_role_admin", "role_secondary"]),
+    );
   });
 
   it("returns a structured unauthorized response", async () => {
@@ -1285,11 +1837,13 @@ describe("Humans API", () => {
       WEB_PROXY_SECRET: "server-owned-proxy-secret",
     } as Bindings;
 
-    for (const suppliedSecret of [
-      undefined,
-      "forged-secret",
-      "SERVER-OWNED-PROXY-SECRET",
-    ]) {
+    for (const [suppliedSecret, stage] of [
+      [undefined, undefined],
+      ["forged-secret", "verified"],
+      ["SERVER-OWNED-PROXY-SECRET", "verified"],
+      [bindings.WEB_PROXY_SECRET, undefined],
+      [bindings.WEB_PROXY_SECRET, "verification"],
+    ] as const) {
       const response = await postPublicProfileRequest(
         app,
         crypto.randomUUID(),
@@ -1297,6 +1851,7 @@ describe("Humans API", () => {
         "198.51.100.101",
         bindings,
         suppliedSecret,
+        stage,
       );
       expect(response.status).toBe(403);
     }
@@ -1317,8 +1872,57 @@ describe("Humans API", () => {
       "198.51.100.101",
       bindings,
       bindings.WEB_PROXY_SECRET,
+      "verified",
     );
     expect(proxied.status).toBe(202);
+  });
+
+  it("limits Turnstile verification attempts before provider work", async () => {
+    const keys: string[] = [];
+    const proxySecret = "server-owned-proxy-secret";
+    const bindings = {
+      WEB_PROXY_SECRET: proxySecret,
+      PUBLIC_PROFILE_VERIFICATION_RATE_LIMITER: {
+        limit: async ({ key }) => {
+          keys.push(key);
+          return { success: false };
+        },
+      },
+    } as Bindings;
+
+    for (const stage of [undefined, "verified", "VERIFICATION"]) {
+      const response = await app.request(
+        "/v1/internal/public-profile-request-verifications",
+        {
+          method: "POST",
+          headers: {
+            "X-Humans-Client-IP": "203.0.113.25",
+            "X-Humans-Web-Proxy": proxySecret,
+            ...(stage === undefined
+              ? {}
+              : { "X-Humans-Public-Profile-Request": stage }),
+          },
+        },
+        bindings,
+      );
+      expect(response.status).toBe(403);
+    }
+
+    const limited = await app.request(
+      "/v1/internal/public-profile-request-verifications",
+      {
+        method: "POST",
+        headers: {
+          "X-Humans-Client-IP": "203.0.113.25",
+          "X-Humans-Public-Profile-Request": "verification",
+          "X-Humans-Web-Proxy": proxySecret,
+        },
+      },
+      bindings,
+    );
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("ratelimit-limit")).toBe("20");
+    expect(keys).toEqual(["public-profile-verification:203.0.113.25"]);
   });
 
   it("verifies and translates signed Clerk webhooks", async () => {
@@ -2019,6 +2623,40 @@ describe("Humans API", () => {
         "ip:203.0.113.10",
       ]),
     );
+    dimensionKeys.length = 0;
+    const mcpDimensionResponse = await dimensionApp.request(
+      "/mcp",
+      {
+        method: "POST",
+        headers: {
+          accept: "application/json, text/event-stream",
+          authorization: "Bearer read_key",
+          "content-type": "application/json",
+          "mcp-protocol-version": "2025-06-18",
+          "X-Humans-Client-IP": "198.51.100.28",
+          "X-Humans-Web-Proxy": "server-owned-proxy-secret",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "list_search_facets", arguments: {} },
+        }),
+      },
+      {
+        ...rateBindings,
+        WEB_PROXY_SECRET: "server-owned-proxy-secret",
+      },
+    );
+    expect(mcpDimensionResponse.status).toBe(200);
+    expect([...dimensionKeys].sort()).toEqual(
+      [
+        "api-key:read_key_id",
+        "ip:198.51.100.28",
+        "member:external_member",
+        "organization:external_organization",
+      ].sort(),
+    );
     const rateLimitApp = createApp(() => makeDatabaseLayer(database), identity);
     for (let request = 0; request < 60; request += 1) {
       const response = await rateLimitApp.request("/v1/search/facets", {
@@ -2178,10 +2816,12 @@ describe("Humans API", () => {
   });
 
   it("denies suspended Operators while active Operators retain access", async () => {
-    await database.insert(schema.members).values([
-      { clerkId: "active_system_operator" },
-      { clerkId: "suspended_system_operator" },
-    ]);
+    await database
+      .insert(schema.members)
+      .values([
+        { clerkId: "active_system_operator" },
+        { clerkId: "suspended_system_operator" },
+      ]);
     await database.insert(schema.principalSuspensions).values({
       principalType: "member",
       principalId: "suspended_system_operator",
@@ -2472,6 +3112,7 @@ const postPublicProfileRequest = (
   ip: string,
   bindings?: Bindings,
   proxySecret?: string,
+  stage?: string,
 ) =>
   app.request(
     "/v1/public/profile-requests",
@@ -2483,6 +3124,9 @@ const postPublicProfileRequest = (
         ...(proxySecret === undefined
           ? {}
           : { "X-Humans-Web-Proxy": proxySecret }),
+        ...(stage === undefined
+          ? {}
+          : { "X-Humans-Public-Profile-Request": stage }),
       },
       body: JSON.stringify({
         profileReference,

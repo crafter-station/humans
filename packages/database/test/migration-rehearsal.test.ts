@@ -8,6 +8,7 @@ import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { projectPolarSubscriptionEvent } from "../src/billing";
 import { backfillCurrentCompanyEmployments } from "../src/companies";
 import * as schema from "../src/schema";
 
@@ -71,6 +72,13 @@ describe("migration rehearsal", () => {
     await migrate(upgradeDatabase, { migrationsFolder: previousMigrations });
     await upgradePool.query(`
       INSERT INTO organizations (clerk_id, name) VALUES ('org_release', 'Release Organization');
+      INSERT INTO polar_webhook_events (
+        id, organization_id, subscription_id, event_type, status, occurred_at,
+        applied
+      ) VALUES (
+        'event_release_paid', 'org_release', 'subscription_release',
+        'order.paid', 'active', '2026-09-02T00:00:00Z', true
+      );
       INSERT INTO profiles (
         profile_id, name, github_account_id, github_login, eligibility_basis,
         adult_attested, searchable, searchability_reason
@@ -149,6 +157,30 @@ describe("migration rehearsal", () => {
     await expect(
       backfillCurrentCompanyEmployments(structuredUpgradeDatabase),
     ).resolves.toBe(0);
+    await expect(
+      projectPolarSubscriptionEvent(structuredUpgradeDatabase, {
+        eventId: "event_release_paid",
+        eventType: "order.paid",
+        occurredAt: new Date("2026-09-02T00:00:00Z"),
+        organizationId: "org_release",
+        polarCustomerId: "customer_release",
+        polarSubscriptionId: "subscription_release",
+        status: "active",
+        periodStart: new Date("2026-09-01T00:00:00Z"),
+        periodEnd: new Date("2026-10-01T00:00:00Z"),
+        cancelAtPeriodEnd: false,
+        order: {
+          orderId: "order_release",
+          status: "paid",
+          billingReason: "subscription_cycle",
+          currency: "usd",
+          totalAmount: 2_000,
+          refundedAmount: 0,
+          refundedTaxAmount: 0,
+        },
+        now: new Date("2026-09-03T00:00:00Z"),
+      }),
+    ).resolves.toEqual({ processed: false, applied: true });
 
     const employment = await upgradePool.query<{
       name: string;
@@ -359,6 +391,42 @@ describe("migration rehearsal", () => {
         "SELECT to_regclass('public.enrichment_checkpoints'), to_regclass('public.enrichment_dispatches'), github_inaccessible_since FROM profiles LIMIT 0",
       ),
     ).resolves.toBeDefined();
+    await expect(
+      upgradePool.query(
+        "SELECT checkout_claim_id, checkout_id, checkout_expires_at FROM polar_customers LIMIT 0",
+      ),
+    ).resolves.toBeDefined();
+    await expect(
+      upgradePool.query(
+        "SELECT order_id, order_status, order_refunded_amount FROM polar_webhook_events LIMIT 0",
+      ),
+    ).resolves.toBeDefined();
+    await expect(
+      upgradePool.query(`
+        SELECT
+          order_id,
+          order_status,
+          order_billing_reason,
+          order_currency,
+          order_total_amount,
+          order_refunded_amount,
+          order_refunded_tax_amount
+        FROM polar_webhook_events
+        WHERE id = 'event_release_paid'
+      `),
+    ).resolves.toMatchObject({
+      rows: [
+        {
+          order_id: "order_release",
+          order_status: "paid",
+          order_billing_reason: "subscription_cycle",
+          order_currency: "usd",
+          order_total_amount: 2_000,
+          order_refunded_amount: 0,
+          order_refunded_tax_amount: 0,
+        },
+      ],
+    });
     await upgradePool.end();
   }, 300_000);
 });

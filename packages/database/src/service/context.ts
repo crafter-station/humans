@@ -10,9 +10,16 @@ import type {
   suspendPrincipal,
 } from "../abuse-controls";
 import type {
+  beginPolarCheckoutCreation,
+  claimPolarCheckout,
+  clearPolarCheckoutClaim,
+  completePolarCheckout,
   getBillingCustomerSeed,
   getOrganizationBillingOverview,
+  recordPolarOrderRefund,
   recordPolarCustomer,
+  releaseExpiredPolarCheckoutReconciliation,
+  releasePolarCheckoutLease,
 } from "../billing";
 import type { runChargedProfileSearch } from "../charged-search";
 import type {
@@ -113,10 +120,52 @@ export class Database extends Context.Service<
       Awaited<ReturnType<typeof getOrganizationBillingOverview>>,
       DatabaseUnavailable
     >;
+    readonly claimPolarCheckout: (
+      input: Parameters<typeof claimPolarCheckout>[1],
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof claimPolarCheckout>>,
+      DatabaseUnavailable
+    >;
+    readonly beginPolarCheckoutCreation: (
+      input: Parameters<typeof beginPolarCheckoutCreation>[1],
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof beginPolarCheckoutCreation>>,
+      DatabaseUnavailable
+    >;
+    readonly completePolarCheckout: (
+      input: Parameters<typeof completePolarCheckout>[1],
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof completePolarCheckout>>,
+      DatabaseUnavailable
+    >;
+    readonly clearPolarCheckoutClaim: (
+      input: Parameters<typeof clearPolarCheckoutClaim>[1],
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof clearPolarCheckoutClaim>>,
+      DatabaseUnavailable
+    >;
+    readonly releaseExpiredPolarCheckoutReconciliation: (
+      input: Parameters<typeof releaseExpiredPolarCheckoutReconciliation>[1],
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof releaseExpiredPolarCheckoutReconciliation>>,
+      DatabaseUnavailable
+    >;
+    readonly releasePolarCheckoutLease: (
+      input: Parameters<typeof releasePolarCheckoutLease>[1],
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof releasePolarCheckoutLease>>,
+      DatabaseUnavailable
+    >;
     readonly recordPolarCustomer: (
       input: Parameters<typeof recordPolarCustomer>[1],
     ) => Effect.Effect<
       Awaited<ReturnType<typeof recordPolarCustomer>>,
+      DatabaseUnavailable
+    >;
+    readonly recordPolarOrderRefund: (
+      input: Parameters<typeof recordPolarOrderRefund>[1],
+    ) => Effect.Effect<
+      Awaited<ReturnType<typeof recordPolarOrderRefund>>,
       DatabaseUnavailable
     >;
     readonly getOperatorOverview: () => Effect.Effect<

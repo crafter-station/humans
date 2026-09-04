@@ -1,5 +1,6 @@
 {
   "$schema": "../../node_modules/wrangler/config-schema.json",
+  "account_id": "541e1e926ecd3c40c0b204180978349f",
   "name": "humans-api-local",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-31",
@@ -37,6 +38,11 @@
       "name": "PUBLIC_PROFILE_REQUEST_RATE_LIMITER",
       "namespace_id": "1006",
       "simple": { "limit": 5, "period": 60 }
+    },
+    {
+      "name": "PUBLIC_PROFILE_VERIFICATION_RATE_LIMITER",
+      "namespace_id": "1007",
+      "simple": { "limit": 20, "period": 60 }
     }
   ],
   "env": {
@@ -77,6 +83,11 @@
           "name": "PUBLIC_PROFILE_REQUEST_RATE_LIMITER",
           "namespace_id": "1106",
           "simple": { "limit": 5, "period": 60 }
+        },
+        {
+          "name": "PUBLIC_PROFILE_VERIFICATION_RATE_LIMITER",
+          "namespace_id": "1107",
+          "simple": { "limit": 20, "period": 60 }
         }
       ]
     },
@@ -117,6 +128,11 @@
           "name": "PUBLIC_PROFILE_REQUEST_RATE_LIMITER",
           "namespace_id": "1206",
           "simple": { "limit": 5, "period": 60 }
+        },
+        {
+          "name": "PUBLIC_PROFILE_VERIFICATION_RATE_LIMITER",
+          "namespace_id": "1207",
+          "simple": { "limit": 20, "period": 60 }
         }
       ]
     }

@@ -28,9 +28,15 @@ export type PolarBillingErrorCode =
 export type PolarBillingOperation =
   | "get_customer"
   | "create_customer"
+  | "get_customer_member"
+  | "create_customer_member"
+  | "update_customer_member"
+  | "list_customer_members"
+  | "get_checkout"
   | "create_checkout"
+  | "list_checkouts"
   | "create_customer_session"
-  | "get_customer_state"
+  | "list_subscriptions"
   | "ingest_usage"
   | "get_meter_quantities";
 
@@ -75,26 +81,36 @@ export type PolarCustomer = {
   type: "team";
 };
 
-export type PolarCustomerOwner = {
-  externalId: string;
-  email: string;
-};
-
 export type EnsurePolarCustomerInput = {
   clerkOrganizationId: string;
   name: string;
-  owner: PolarCustomerOwner;
 };
 
-export type CreateProCheckoutInput = {
+export type FindOpenProCheckoutInput = {
   clerkOrganizationId: string;
   successUrl: string;
+};
+
+export type CreateProCheckoutInput = FindOpenProCheckoutInput & {
+  checkoutClaimId: string;
+};
+
+export type GetProCheckoutInput = FindOpenProCheckoutInput & {
+  checkoutId: string;
+};
+
+export type FindProCheckoutByClaimInput = FindOpenProCheckoutInput & {
+  checkoutClaimId: string;
 };
 
 export type PolarCheckoutSession = {
   id: string;
   url: string;
   expiresAt: Date;
+};
+
+export type PolarCheckout = PolarCheckoutSession & {
+  status: "open" | "expired" | "confirmed" | "succeeded" | "failed";
 };
 
 export type CreateCustomerPortalSessionInput = {
@@ -110,7 +126,7 @@ export type PolarCustomerPortalSession = {
 
 export type PolarSubscription = {
   id: string;
-  status: "active" | "trialing";
+  status: "incomplete" | "trialing" | "active" | "past_due" | "paused";
   currentPeriodStart: Date;
   currentPeriodEnd: Date;
   cancelAtPeriodEnd: boolean;
@@ -154,6 +170,13 @@ export type PolarMeterQuantities = {
 export type PolarBillingClient = {
   getCustomer(clerkOrganizationId: string): Promise<PolarCustomer>;
   ensureCustomer(input: EnsurePolarCustomerInput): Promise<PolarCustomer>;
+  findOpenProCheckout(
+    input: FindOpenProCheckoutInput,
+  ): Promise<PolarCheckoutSession | null>;
+  findProCheckoutByClaim(
+    input: FindProCheckoutByClaimInput,
+  ): Promise<PolarCheckout | null>;
+  getProCheckout(input: GetProCheckoutInput): Promise<PolarCheckout>;
   createProCheckout(
     input: CreateProCheckoutInput,
   ): Promise<PolarCheckoutSession>;
@@ -176,6 +199,7 @@ export type CreatePolarBillingClientOptions = {
   proProductId: string;
   usageMeterId: string;
   usageEventName: string;
+  customerOwnerEmail?: string;
   successUrlAllowlist: readonly string[];
   fetch?: typeof globalThis.fetch;
   clock?: PolarBillingClock;
@@ -197,6 +221,11 @@ const METER_INTERVALS = new Set<PolarMeterInterval>([
   "hour",
 ]);
 const MAX_ATTEMPTS = 3;
+const CUSTOMER_MEMBER_PAGE_LIMIT = 100;
+const MAX_CUSTOMER_MEMBER_LIST_PAGES = 10;
+const CHECKOUT_PAGE_LIMIT = 100;
+const MAX_CHECKOUT_LIST_PAGES = 10;
+const CUSTOMER_OWNER_EXTERNAL_ID = "humans-billing-owner";
 
 const systemClock: PolarBillingClock = {
   now: () => new Date(),
@@ -257,6 +286,12 @@ const requireUuidConfiguration = (value: unknown, field: string): string => {
   return id;
 };
 
+const requireUuidInput = (value: unknown, field: string): string => {
+  const id = requireInputString(value, field);
+  if (!UUID_V4.test(id)) inputError(field);
+  return id;
+};
+
 const requireUuidResponse = (
   value: unknown,
   operation: PolarBillingOperation,
@@ -307,6 +342,39 @@ const requireResponseInteger = (
   return number;
 };
 
+const requireSubscriptionStatus = (
+  value: unknown,
+  operation: PolarBillingOperation,
+): PolarSubscription["status"] | "unpaid" => {
+  switch (value) {
+    case "incomplete":
+    case "trialing":
+    case "active":
+    case "past_due":
+    case "unpaid":
+    case "paused":
+      return value;
+    default:
+      return malformedResponse(operation);
+  }
+};
+
+const requireCheckoutStatus = (
+  value: unknown,
+  operation: PolarBillingOperation,
+): PolarCheckout["status"] => {
+  switch (value) {
+    case "open":
+    case "expired":
+    case "confirmed":
+    case "succeeded":
+    case "failed":
+      return value;
+    default:
+      return malformedResponse(operation);
+  }
+};
+
 const requireResponseObject = (
   value: unknown,
   operation: PolarBillingOperation,
@@ -352,6 +420,11 @@ const requireWebUrl = (
     return onError();
   return { value, url };
 };
+
+const isLoopbackHostname = (hostname: string): boolean =>
+  hostname === "localhost" ||
+  hostname === "[::1]" ||
+  /^127(?:\.\d{1,3}){3}$/.test(hostname);
 
 const parseCustomer = (
   value: unknown,
@@ -458,6 +531,18 @@ export const createPolarBillingClient = (
     "usageEventName",
   );
   if (usageEventName.length > 128) configurationError("usageEventName");
+  const customerOwnerEmail =
+    options.customerOwnerEmail === undefined
+      ? undefined
+      : requireConfigurationString(
+          options.customerOwnerEmail,
+          "customerOwnerEmail",
+        );
+  if (
+    customerOwnerEmail !== undefined &&
+    (customerOwnerEmail.length > 254 || !EMAIL.test(customerOwnerEmail))
+  )
+    configurationError("customerOwnerEmail");
   if (
     !Array.isArray(options.successUrlAllowlist) ||
     options.successUrlAllowlist.length === 0
@@ -472,7 +557,9 @@ export const createPolarBillingClient = (
     if (
       allowed.url.pathname !== "/" ||
       allowed.url.search !== "" ||
-      allowed.url.hash !== ""
+      allowed.url.hash !== "" ||
+      (allowed.url.protocol === "http:" &&
+        !isLoopbackHostname(allowed.url.hostname))
     )
       configurationError("successUrlAllowlist");
     allowedOrigins.add(allowed.url.origin);
@@ -513,7 +600,7 @@ export const createPolarBillingClient = (
   const request = async (
     operation: PolarBillingOperation,
     path: string,
-    method: "GET" | "POST",
+    method: "GET" | "POST" | "PATCH",
     expectedStatus: number,
     body?: JsonObject,
   ): Promise<unknown> => {
@@ -526,7 +613,11 @@ export const createPolarBillingClient = (
     const serializedBody =
       body === undefined ? undefined : JSON.stringify(body);
 
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    const maxAttempts =
+      operation === "create_checkout" || operation === "create_customer_member"
+        ? 1
+        : MAX_ATTEMPTS;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       let response: Response;
       try {
         response = await fetchImplementation(`${baseUrl}${path}`, {
@@ -534,6 +625,7 @@ export const createPolarBillingClient = (
           headers,
           body: serializedBody,
           redirect: "manual",
+          signal: AbortSignal.timeout(20_000),
         });
       } catch {
         throw new PolarBillingError("network_error", { operation });
@@ -546,7 +638,7 @@ export const createPolarBillingClient = (
       const retryAfterMs = retryableStatus
         ? parseRetryAfter(response.headers.get("Retry-After"), clock)
         : undefined;
-      if (retryableStatus && attempt < MAX_ATTEMPTS) {
+      if (retryableStatus && attempt < maxAttempts) {
         await cancelResponse(response);
         const delay = retryAfterMs ?? 250 * 2 ** (attempt - 1);
         try {
@@ -586,13 +678,631 @@ export const createPolarBillingClient = (
     );
   };
 
+  type CustomerMemberOperation =
+    | "get_customer_member"
+    | "create_customer_member"
+    | "update_customer_member"
+    | "list_customer_members";
+  type ParsedCustomerMember = {
+    id: string;
+    email: string;
+    externalId: string | null;
+    role: "owner" | "billing_manager" | "member";
+  };
+
+  const parseCustomerMember = (
+    value: unknown,
+    operation: CustomerMemberOperation,
+    customerId: string,
+  ): ParsedCustomerMember => {
+    const member = requireResponseObject(value, operation);
+    const id = requireUuidResponse(member.id, operation);
+    const responseCustomerId = requireUuidResponse(
+      member.customer_id,
+      operation,
+    );
+    const email = requireResponseString(member.email, operation);
+    const externalId =
+      member.external_id === null
+        ? null
+        : requireResponseString(member.external_id, operation);
+    requireResponseDate(member.created_at, operation);
+    if (member.modified_at !== null)
+      requireResponseDate(member.modified_at, operation);
+    if (
+      member.name !== null &&
+      (typeof member.name !== "string" || member.name.length > 256)
+    )
+      malformedResponse(operation);
+    if (
+      responseCustomerId !== customerId ||
+      email.length > 254 ||
+      email !== email.trim() ||
+      !EMAIL.test(email) ||
+      (externalId !== null && externalId !== externalId.trim())
+    )
+      malformedResponse(operation);
+    const role = member.role;
+    if (role !== "owner" && role !== "billing_manager" && role !== "member")
+      return malformedResponse(operation);
+    return { id, email, externalId, role };
+  };
+
+  const requireServiceCustomerMember = (
+    member: ParsedCustomerMember,
+    operation: CustomerMemberOperation,
+  ): ParsedCustomerMember => {
+    if (member.externalId !== CUSTOMER_OWNER_EXTERNAL_ID)
+      malformedResponse(operation);
+    return member;
+  };
+
+  const getServiceCustomerMember = async (
+    clerkOrganizationId: string,
+    customerId: string,
+  ): Promise<ParsedCustomerMember> =>
+    requireServiceCustomerMember(
+      parseCustomerMember(
+        await request(
+          "get_customer_member",
+          `/customers/external/${encodeURIComponent(clerkOrganizationId)}/members/${encodeURIComponent(CUSTOMER_OWNER_EXTERNAL_ID)}`,
+          "GET",
+          200,
+        ),
+        "get_customer_member",
+        customerId,
+      ),
+      "get_customer_member",
+    );
+
+  const getCustomerMember = async (
+    customerId: string,
+    memberId: string,
+  ): Promise<ParsedCustomerMember> => {
+    const member = parseCustomerMember(
+      await request(
+        "get_customer_member",
+        `/customers/${encodeURIComponent(customerId)}/members/${encodeURIComponent(memberId)}`,
+        "GET",
+        200,
+      ),
+      "get_customer_member",
+      customerId,
+    );
+    if (member.id !== memberId) malformedResponse("get_customer_member");
+    return member;
+  };
+
+  const memberMutationMayHaveSucceeded = (error: unknown): boolean =>
+    error instanceof PolarBillingError &&
+    (error.code === "conflict" ||
+      error.code === "invalid_request" ||
+      error.code === "network_error" ||
+      error.code === "server_error" ||
+      error.code === "malformed_response");
+
+  const recoverCustomerMemberMutation = async (
+    error: unknown,
+    readMember: () => Promise<ParsedCustomerMember>,
+  ): Promise<ParsedCustomerMember> => {
+    if (!memberMutationMayHaveSucceeded(error)) throw error;
+    try {
+      return await readMember();
+    } catch (lookupError) {
+      if (
+        lookupError instanceof PolarBillingError &&
+        lookupError.code === "not_found"
+      )
+        throw error;
+      throw lookupError;
+    }
+  };
+
+  type CustomerMemberPagination = {
+    totalCount: number;
+    maxPage: number;
+  };
+
+  const listCustomerMembers = async (
+    clerkOrganizationId: string,
+    customerId: string,
+  ): Promise<ParsedCustomerMember[]> => {
+    const memberIds = new Set<string>();
+    const externalIds = new Set<string>();
+    const members: ParsedCustomerMember[] = [];
+    let expectedPagination: CustomerMemberPagination | undefined;
+    for (let page = 1; page <= MAX_CUSTOMER_MEMBER_LIST_PAGES; page += 1) {
+      const parameters = new URLSearchParams({
+        page: String(page),
+        limit: String(CUSTOMER_MEMBER_PAGE_LIMIT),
+      });
+      const response = requireResponseObject(
+        await request(
+          "list_customer_members",
+          `/customers/external/${encodeURIComponent(clerkOrganizationId)}/members?${parameters.toString()}`,
+          "GET",
+          200,
+        ),
+        "list_customer_members",
+      );
+      const items = response.items;
+      const pagination = requireResponseObject(
+        response.pagination,
+        "list_customer_members",
+      );
+      if (!Array.isArray(items))
+        return malformedResponse("list_customer_members");
+      const totalCount = requireResponseInteger(
+        pagination.total_count,
+        "list_customer_members",
+      );
+      const maxPage = requireResponseInteger(
+        pagination.max_page,
+        "list_customer_members",
+      );
+      const expectedMaxPage = Math.ceil(
+        totalCount / CUSTOMER_MEMBER_PAGE_LIMIT,
+      );
+      if (
+        maxPage !== expectedMaxPage ||
+        maxPage > MAX_CUSTOMER_MEMBER_LIST_PAGES ||
+        (expectedPagination !== undefined &&
+          (totalCount !== expectedPagination.totalCount ||
+            maxPage !== expectedPagination.maxPage))
+      )
+        malformedResponse("list_customer_members");
+      expectedPagination ??= { totalCount, maxPage };
+      const expectedItemCount =
+        maxPage === 0
+          ? 0
+          : page < maxPage
+            ? CUSTOMER_MEMBER_PAGE_LIMIT
+            : totalCount - (page - 1) * CUSTOMER_MEMBER_PAGE_LIMIT;
+      if (page > Math.max(1, maxPage) || items.length !== expectedItemCount)
+        malformedResponse("list_customer_members");
+
+      for (const item of items) {
+        const member = parseCustomerMember(
+          item,
+          "list_customer_members",
+          customerId,
+        );
+        if (memberIds.has(member.id))
+          malformedResponse("list_customer_members");
+        memberIds.add(member.id);
+        if (member.externalId !== null) {
+          if (externalIds.has(member.externalId))
+            malformedResponse("list_customer_members");
+          externalIds.add(member.externalId);
+        }
+        members.push(member);
+      }
+
+      if (page >= maxPage) {
+        if (members.length !== totalCount)
+          malformedResponse("list_customer_members");
+        return members;
+      }
+    }
+    return malformedResponse("list_customer_members");
+  };
+
+  const demoteCustomerMember = async (
+    customerId: string,
+    expected: ParsedCustomerMember,
+  ): Promise<void> => {
+    const requireDemotedMember = (member: ParsedCustomerMember) => {
+      if (
+        member.id !== expected.id ||
+        member.externalId !== expected.externalId ||
+        member.role !== "member"
+      )
+        malformedResponse("update_customer_member");
+      return member;
+    };
+
+    try {
+      requireDemotedMember(
+        parseCustomerMember(
+          await request(
+            "update_customer_member",
+            `/customers/${encodeURIComponent(customerId)}/members/${encodeURIComponent(expected.id)}`,
+            "PATCH",
+            200,
+            { role: "member" },
+          ),
+          "update_customer_member",
+          customerId,
+        ),
+      );
+    } catch (updateError) {
+      requireDemotedMember(
+        await recoverCustomerMemberMutation(updateError, () =>
+          getCustomerMember(customerId, expected.id),
+        ),
+      );
+    }
+  };
+
+  const requireListedServiceOwner = (
+    members: readonly ParsedCustomerMember[],
+    serviceMember: ParsedCustomerMember,
+  ) => {
+    const listedServiceMembers = members.filter(
+      (member) => member.externalId === CUSTOMER_OWNER_EXTERNAL_ID,
+    );
+    if (
+      listedServiceMembers.length !== 1 ||
+      listedServiceMembers[0]?.id !== serviceMember.id ||
+      listedServiceMembers[0].email !== customerOwnerEmail ||
+      listedServiceMembers[0].role !== "owner"
+    )
+      malformedResponse("list_customer_members");
+  };
+
+  const requireStableCustomerMembers = (
+    before: readonly ParsedCustomerMember[],
+    after: readonly ParsedCustomerMember[],
+  ) => {
+    if (before.length !== after.length)
+      malformedResponse("list_customer_members");
+    const afterById = new Map(after.map((member) => [member.id, member]));
+    for (const member of before) {
+      if (afterById.get(member.id)?.externalId !== member.externalId)
+        malformedResponse("list_customer_members");
+    }
+  };
+
+  const ensureServiceCustomerOwner = async (
+    clerkOrganizationId: string,
+    customerId: string,
+  ): Promise<void> => {
+    if (customerOwnerEmail === undefined)
+      configurationError("customerOwnerEmail");
+    let member: ParsedCustomerMember;
+    try {
+      member = await getServiceCustomerMember(clerkOrganizationId, customerId);
+    } catch (error) {
+      if (!(error instanceof PolarBillingError) || error.code !== "not_found")
+        throw error;
+      try {
+        member = requireServiceCustomerMember(
+          parseCustomerMember(
+            await request(
+              "create_customer_member",
+              `/customers/external/${encodeURIComponent(clerkOrganizationId)}/members`,
+              "POST",
+              201,
+              {
+                email: customerOwnerEmail,
+                external_id: CUSTOMER_OWNER_EXTERNAL_ID,
+                role: "billing_manager",
+              },
+            ),
+            "create_customer_member",
+            customerId,
+          ),
+          "create_customer_member",
+        );
+      } catch (createError) {
+        member = await recoverCustomerMemberMutation(createError, () =>
+          getServiceCustomerMember(clerkOrganizationId, customerId),
+        );
+      }
+    }
+
+    if (member.role !== "owner" || member.email !== customerOwnerEmail) {
+      const update: JsonObject = { role: "owner" };
+      if (member.email !== customerOwnerEmail)
+        update.email = customerOwnerEmail;
+      try {
+        member = requireServiceCustomerMember(
+          parseCustomerMember(
+            await request(
+              "update_customer_member",
+              `/customers/external/${encodeURIComponent(clerkOrganizationId)}/members/${encodeURIComponent(CUSTOMER_OWNER_EXTERNAL_ID)}`,
+              "PATCH",
+              200,
+              update,
+            ),
+            "update_customer_member",
+            customerId,
+          ),
+          "update_customer_member",
+        );
+      } catch (updateError) {
+        member = await recoverCustomerMemberMutation(updateError, () =>
+          getServiceCustomerMember(clerkOrganizationId, customerId),
+        );
+      }
+      if (member.role !== "owner" || member.email !== customerOwnerEmail)
+        malformedResponse("update_customer_member");
+    }
+
+    const before = await listCustomerMembers(clerkOrganizationId, customerId);
+    requireListedServiceOwner(before, member);
+    for (const customerMember of before) {
+      if (
+        customerMember.id !== member.id &&
+        (customerMember.role === "owner" ||
+          customerMember.role === "billing_manager")
+      )
+        await demoteCustomerMember(customerId, customerMember);
+    }
+
+    const after = await listCustomerMembers(clerkOrganizationId, customerId);
+    requireStableCustomerMembers(before, after);
+    requireListedServiceOwner(after, member);
+    if (
+      after.filter((customerMember) => customerMember.role === "owner")
+        .length !== 1 ||
+      after.some(
+        (customerMember) =>
+          customerMember.id !== member.id &&
+          (customerMember.role === "owner" ||
+            customerMember.role === "billing_manager"),
+      )
+    )
+      malformedResponse("list_customer_members");
+  };
+
+  type ParsedProCheckout = PolarCheckout & {
+    checkoutClaimId: string | null;
+    successUrl: string;
+  };
+
+  const parseProCheckout = (
+    value: unknown,
+    operation: "create_checkout" | "get_checkout" | "list_checkouts",
+    clerkOrganizationId: string,
+    expected: { checkoutClaimId?: string; successUrl?: string },
+  ): ParsedProCheckout => {
+    const response = requireResponseObject(value, operation);
+    const id = requireUuidResponse(response.id, operation);
+    const responseProductId = requireUuidResponse(
+      response.product_id,
+      operation,
+    );
+    const responseOrganizationId = requireUuidResponse(
+      response.organization_id,
+      operation,
+    );
+    const responseExternalId = requireResponseString(
+      response.external_customer_id,
+      operation,
+    );
+    const responseMetadata = requireResponseObject(
+      response.metadata,
+      operation,
+    );
+    requireUuidResponse(response.customer_id, operation);
+    const checkoutClaimId =
+      responseMetadata.humansCheckoutClaimId === undefined
+        ? null
+        : requireUuidResponse(
+            responseMetadata.humansCheckoutClaimId,
+            operation,
+          );
+    const responseSuccessUrl = requireWebUrl(response.success_url, () =>
+      malformedResponse(operation),
+    );
+    if (
+      responseProductId !== proProductId ||
+      responseOrganizationId !== organizationId ||
+      responseExternalId !== clerkOrganizationId ||
+      responseMetadata.humansOrganizationId !== clerkOrganizationId ||
+      (expected.successUrl !== undefined &&
+        responseSuccessUrl.value !== expected.successUrl) ||
+      (expected.checkoutClaimId !== undefined &&
+        checkoutClaimId !== expected.checkoutClaimId)
+    )
+      malformedResponse(operation);
+    const checkout = requireWebUrl(response.url, () =>
+      malformedResponse(operation),
+    );
+    if (checkout.url.protocol !== "https:") malformedResponse(operation);
+    return {
+      id,
+      checkoutClaimId,
+      successUrl: responseSuccessUrl.value,
+      status: requireCheckoutStatus(response.status, operation),
+      url: checkout.value,
+      expiresAt: requireResponseDate(response.expires_at, operation),
+    };
+  };
+
+  const parseOpenProCheckout = (
+    value: unknown,
+    operation: "create_checkout" | "list_checkouts",
+    clerkOrganizationId: string,
+    expected: { checkoutClaimId?: string; successUrl: string },
+  ): PolarCheckoutSession => {
+    const {
+      checkoutClaimId: _,
+      successUrl: __,
+      status,
+      ...checkout
+    } = parseProCheckout(value, operation, clerkOrganizationId, expected);
+    if (status !== "open") malformedResponse(operation);
+    return checkout;
+  };
+
+  type CheckoutPagination = {
+    totalCount: number;
+    maxPage: number;
+  };
+
+  const listProCheckoutPage = async (
+    clerkOrganizationId: string,
+    parameters: URLSearchParams,
+    page: number,
+    expectedPagination: CheckoutPagination | undefined,
+    checkoutIds: Set<string>,
+    checkoutClaimIds: Set<string>,
+  ) => {
+    const pageParameters = new URLSearchParams(parameters);
+    pageParameters.set("page", String(page));
+    const response = requireResponseObject(
+      await request(
+        "list_checkouts",
+        `/checkouts/?${pageParameters.toString()}`,
+        "GET",
+        200,
+      ),
+      "list_checkouts",
+    );
+    const items = response.items;
+    const pagination = requireResponseObject(
+      response.pagination,
+      "list_checkouts",
+    );
+    if (!Array.isArray(items)) return malformedResponse("list_checkouts");
+    const totalCount = requireResponseInteger(
+      pagination.total_count,
+      "list_checkouts",
+    );
+    const maxPage = requireResponseInteger(
+      pagination.max_page,
+      "list_checkouts",
+    );
+    const expectedMaxPage = Math.ceil(totalCount / CHECKOUT_PAGE_LIMIT);
+    if (
+      maxPage !== expectedMaxPage ||
+      maxPage > MAX_CHECKOUT_LIST_PAGES ||
+      (expectedPagination !== undefined &&
+        (totalCount !== expectedPagination.totalCount ||
+          maxPage !== expectedPagination.maxPage))
+    )
+      malformedResponse("list_checkouts");
+    const expectedItemCount =
+      maxPage === 0
+        ? 0
+        : page < maxPage
+          ? CHECKOUT_PAGE_LIMIT
+          : totalCount - (page - 1) * CHECKOUT_PAGE_LIMIT;
+    if (page > Math.max(1, maxPage) || items.length !== expectedItemCount)
+      malformedResponse("list_checkouts");
+
+    const checkouts: ParsedProCheckout[] = [];
+    for (const item of items) {
+      const checkout = parseProCheckout(
+        item,
+        "list_checkouts",
+        clerkOrganizationId,
+        {},
+      );
+      if (checkoutIds.has(checkout.id)) malformedResponse("list_checkouts");
+      checkoutIds.add(checkout.id);
+      if (checkout.checkoutClaimId !== null) {
+        if (checkoutClaimIds.has(checkout.checkoutClaimId))
+          malformedResponse("list_checkouts");
+        checkoutClaimIds.add(checkout.checkoutClaimId);
+      }
+      checkouts.push(checkout);
+    }
+    return { checkouts, pagination: { totalCount, maxPage } };
+  };
+
+  const findOpenProCheckout = async (
+    clerkOrganizationId: string,
+    successUrl: string,
+  ) => {
+    const parameters = new URLSearchParams({
+      organization_id: organizationId,
+      product_id: proProductId,
+      external_customer_id: clerkOrganizationId,
+      status: "open",
+      sorting: "-created_at",
+      limit: String(CHECKOUT_PAGE_LIMIT),
+    });
+    const checkoutIds = new Set<string>();
+    const checkoutClaimIds = new Set<string>();
+    let expectedPagination: CheckoutPagination | undefined;
+    let match: ParsedProCheckout | undefined;
+    for (let page = 1; page <= MAX_CHECKOUT_LIST_PAGES; page += 1) {
+      const result = await listProCheckoutPage(
+        clerkOrganizationId,
+        parameters,
+        page,
+        expectedPagination,
+        checkoutIds,
+        checkoutClaimIds,
+      );
+      expectedPagination ??= result.pagination;
+      for (const checkout of result.checkouts) {
+        if (checkout.status !== "open") malformedResponse("list_checkouts");
+        if (checkout.successUrl !== successUrl) continue;
+        if (match !== undefined) malformedResponse("list_checkouts");
+        match = checkout;
+      }
+      if (page >= result.pagination.maxPage) {
+        if (match === undefined) return null;
+        const {
+          checkoutClaimId: _,
+          successUrl: __,
+          status: ___,
+          ...session
+        } = match;
+        return session;
+      }
+    }
+    return malformedResponse("list_checkouts");
+  };
+
+  const findProCheckoutByClaim = async (
+    clerkOrganizationId: string,
+    checkoutClaimId: string,
+    successUrl: string,
+  ) => {
+    const parameters = new URLSearchParams({
+      organization_id: organizationId,
+      product_id: proProductId,
+      external_customer_id: clerkOrganizationId,
+      sorting: "-created_at",
+      limit: String(CHECKOUT_PAGE_LIMIT),
+    });
+    const checkoutIds = new Set<string>();
+    const checkoutClaimIds = new Set<string>();
+    let expectedPagination: CheckoutPagination | undefined;
+    let match: ParsedProCheckout | undefined;
+    for (let page = 1; page <= MAX_CHECKOUT_LIST_PAGES; page += 1) {
+      const result = await listProCheckoutPage(
+        clerkOrganizationId,
+        parameters,
+        page,
+        expectedPagination,
+        checkoutIds,
+        checkoutClaimIds,
+      );
+      expectedPagination ??= result.pagination;
+      const checkout = result.checkouts.find(
+        (candidate) => candidate.checkoutClaimId === checkoutClaimId,
+      );
+      if (checkout !== undefined) {
+        if (checkout.successUrl !== successUrl)
+          malformedResponse("list_checkouts");
+        match = checkout;
+      }
+      if (page >= result.pagination.maxPage) {
+        if (match === undefined) return null;
+        const {
+          checkoutClaimId: _,
+          successUrl: __,
+          ...claimedCheckout
+        } = match;
+        return claimedCheckout;
+      }
+    }
+    return malformedResponse("list_checkouts");
+  };
+
   return {
     getCustomer,
 
     async ensureCustomer(input) {
       const value = assertExactInputKeys(
         input,
-        ["clerkOrganizationId", "name", "owner"],
+        ["clerkOrganizationId", "name"],
         "input",
       );
       const clerkOrganizationId = requireClerkOrganizationId(
@@ -600,19 +1310,8 @@ export const createPolarBillingClient = (
       );
       const name = requireInputString(value.name, "name");
       if (name.length > 256) inputError("name");
-      const owner = assertExactInputKeys(
-        value.owner,
-        ["externalId", "email"],
-        "owner",
-      );
-      const ownerExternalId = requireInputString(
-        owner.externalId,
-        "owner.externalId",
-      );
-      const ownerEmail = requireInputString(owner.email, "owner.email");
-      if (ownerEmail.length > 254 || !EMAIL.test(ownerEmail))
-        inputError("owner.email");
-
+      if (customerOwnerEmail === undefined)
+        configurationError("customerOwnerEmail");
       try {
         return await getCustomer(clerkOrganizationId);
       } catch (error) {
@@ -632,8 +1331,8 @@ export const createPolarBillingClient = (
             name,
             organization_id: organizationId,
             owner: {
-              external_id: ownerExternalId,
-              email: ownerEmail,
+              external_id: CUSTOMER_OWNER_EXTERNAL_ID,
+              email: customerOwnerEmail,
             },
           },
         );
@@ -664,7 +1363,7 @@ export const createPolarBillingClient = (
       }
     },
 
-    async createProCheckout(input) {
+    async findOpenProCheckout(input) {
       const value = assertExactInputKeys(
         input,
         ["clerkOrganizationId", "successUrl"],
@@ -674,53 +1373,121 @@ export const createPolarBillingClient = (
         value.clerkOrganizationId,
       );
       const successUrl = validateRedirectUrl(value.successUrl, "successUrl");
-      const response = requireResponseObject(
-        await request("create_checkout", "/checkouts/", "POST", 201, {
-          products: [proProductId],
-          external_customer_id: clerkOrganizationId,
-          success_url: successUrl,
-          allow_discount_codes: false,
-          allow_trial: false,
-          metadata: { humansOrganizationId: clerkOrganizationId },
-        }),
-        "create_checkout",
+      return findOpenProCheckout(clerkOrganizationId, successUrl);
+    },
+
+    async findProCheckoutByClaim(input) {
+      const value = assertExactInputKeys(
+        input,
+        ["checkoutClaimId", "clerkOrganizationId", "successUrl"],
+        "input",
       );
-      const id = requireUuidResponse(response.id, "create_checkout");
-      const responseProductId = requireUuidResponse(
-        response.product_id,
-        "create_checkout",
+      const checkoutClaimId = requireUuidInput(
+        value.checkoutClaimId,
+        "checkoutClaimId",
       );
-      const responseOrganizationId = requireUuidResponse(
-        response.organization_id,
-        "create_checkout",
+      const clerkOrganizationId = requireClerkOrganizationId(
+        value.clerkOrganizationId,
       );
-      const responseExternalId = requireResponseString(
-        response.external_customer_id,
-        "create_checkout",
+      const successUrl = validateRedirectUrl(value.successUrl, "successUrl");
+      return findProCheckoutByClaim(
+        clerkOrganizationId,
+        checkoutClaimId,
+        successUrl,
       );
-      const responseMetadata = requireResponseObject(
-        response.metadata,
-        "create_checkout",
+    },
+
+    async getProCheckout(input) {
+      const value = assertExactInputKeys(
+        input,
+        ["checkoutId", "clerkOrganizationId", "successUrl"],
+        "input",
       );
-      requireUuidResponse(response.customer_id, "create_checkout");
-      if (
-        response.status !== "open" ||
-        responseProductId !== proProductId ||
-        responseOrganizationId !== organizationId ||
-        responseExternalId !== clerkOrganizationId ||
-        responseMetadata.humansOrganizationId !== clerkOrganizationId
-      )
-        malformedResponse("create_checkout");
-      const checkout = requireWebUrl(response.url, () =>
-        malformedResponse("create_checkout"),
+      const checkoutId = requireUuidInput(value.checkoutId, "checkoutId");
+      const clerkOrganizationId = requireClerkOrganizationId(
+        value.clerkOrganizationId,
       );
-      if (checkout.url.protocol !== "https:")
-        malformedResponse("create_checkout");
-      return {
-        id,
-        url: checkout.value,
-        expiresAt: requireResponseDate(response.expires_at, "create_checkout"),
-      };
+      const successUrl = validateRedirectUrl(value.successUrl, "successUrl");
+      const {
+        checkoutClaimId: _,
+        successUrl: __,
+        ...checkout
+      } = parseProCheckout(
+        await request(
+          "get_checkout",
+          `/checkouts/${encodeURIComponent(checkoutId)}`,
+          "GET",
+          200,
+        ),
+        "get_checkout",
+        clerkOrganizationId,
+        { successUrl },
+      );
+      if (checkout.id !== checkoutId) malformedResponse("get_checkout");
+      return checkout;
+    },
+
+    async createProCheckout(input) {
+      const value = assertExactInputKeys(
+        input,
+        ["checkoutClaimId", "clerkOrganizationId", "successUrl"],
+        "input",
+      );
+      const checkoutClaimId = requireUuidInput(
+        value.checkoutClaimId,
+        "checkoutClaimId",
+      );
+      const clerkOrganizationId = requireClerkOrganizationId(
+        value.clerkOrganizationId,
+      );
+      const successUrl = validateRedirectUrl(value.successUrl, "successUrl");
+      try {
+        const response = await request(
+          "create_checkout",
+          "/checkouts/",
+          "POST",
+          201,
+          {
+            products: [proProductId],
+            external_customer_id: clerkOrganizationId,
+            success_url: successUrl,
+            allow_discount_codes: false,
+            allow_trial: false,
+            metadata: {
+              humansCheckoutClaimId: checkoutClaimId,
+              humansOrganizationId: clerkOrganizationId,
+            },
+          },
+        );
+        return parseOpenProCheckout(
+          response,
+          "create_checkout",
+          clerkOrganizationId,
+          { checkoutClaimId, successUrl },
+        );
+      } catch (error) {
+        if (
+          error instanceof PolarBillingError &&
+          (error.code === "network_error" ||
+            error.code === "server_error" ||
+            error.code === "malformed_response")
+        ) {
+          try {
+            const recovered = await findProCheckoutByClaim(
+              clerkOrganizationId,
+              checkoutClaimId,
+              successUrl,
+            );
+            if (recovered?.status === "open") {
+              const { status: _, ...checkout } = recovered;
+              return checkout;
+            }
+          } catch {
+            // Preserve the original sanitized failure while the caller's lease expires.
+          }
+        }
+        throw error;
+      }
     },
 
     async createCustomerPortalSession(input) {
@@ -732,11 +1499,17 @@ export const createPolarBillingClient = (
       const clerkOrganizationId = requireClerkOrganizationId(
         value.clerkOrganizationId,
       );
+      const returnUrl =
+        value.returnUrl === undefined
+          ? undefined
+          : validateRedirectUrl(value.returnUrl, "returnUrl");
+      const customer = await getCustomer(clerkOrganizationId);
+      await ensureServiceCustomerOwner(clerkOrganizationId, customer.id);
       const body: JsonObject = {
         external_customer_id: clerkOrganizationId,
+        external_member_id: CUSTOMER_OWNER_EXTERNAL_ID,
       };
-      if (value.returnUrl !== undefined)
-        body.return_url = validateRedirectUrl(value.returnUrl, "returnUrl");
+      if (returnUrl !== undefined) body.return_url = returnUrl;
       const response = requireResponseObject(
         await request(
           "create_customer_session",
@@ -753,13 +1526,13 @@ export const createPolarBillingClient = (
         "create_customer_session",
       );
       requireResponseString(response.token, "create_customer_session");
-      const customer = parseCustomer(
+      const responseCustomer = parseCustomer(
         response.customer,
         "create_customer_session",
         clerkOrganizationId,
         organizationId,
       );
-      if (customer.id !== customerId)
+      if (responseCustomer.id !== customerId || customer.id !== customerId)
         malformedResponse("create_customer_session");
       const portal = requireWebUrl(response.customer_portal_url, () =>
         malformedResponse("create_customer_session"),
@@ -780,62 +1553,91 @@ export const createPolarBillingClient = (
       const clerkOrganizationId = requireClerkOrganizationId(
         clerkOrganizationIdValue,
       );
+      const customer = await getCustomer(clerkOrganizationId);
+      const parameters = new URLSearchParams({
+        organization_id: organizationId,
+        external_customer_id: clerkOrganizationId,
+        product_id: proProductId,
+        limit: "100",
+      });
+      const statuses = [
+        "incomplete",
+        "trialing",
+        "active",
+        "past_due",
+        "paused",
+      ] as const;
+      for (const status of statuses) parameters.append("status", status);
       const response = requireResponseObject(
         await request(
-          "get_customer_state",
-          `/customers/external/${encodeURIComponent(clerkOrganizationId)}/state`,
+          "list_subscriptions",
+          `/subscriptions/?${parameters.toString()}`,
           "GET",
           200,
         ),
-        "get_customer_state",
+        "list_subscriptions",
       );
-      const customer = parseCustomer(
-        response,
-        "get_customer_state",
-        clerkOrganizationId,
-        organizationId,
+      const items = response.items;
+      const pagination = requireResponseObject(
+        response.pagination,
+        "list_subscriptions",
       );
-      const activeSubscriptions = response.active_subscriptions;
-      if (!Array.isArray(activeSubscriptions))
-        return malformedResponse("get_customer_state");
+      if (!Array.isArray(items)) return malformedResponse("list_subscriptions");
+      const totalCount = requireResponseInteger(
+        pagination.total_count,
+        "list_subscriptions",
+      );
+      const maxPage = requireResponseInteger(
+        pagination.max_page,
+        "list_subscriptions",
+      );
+      if (totalCount !== items.length || totalCount > 100 || maxPage > 1)
+        malformedResponse("list_subscriptions");
 
       const ids = new Set<string>();
       const proSubscriptions: PolarSubscription[] = [];
-      for (const item of activeSubscriptions) {
-        const subscription = requireResponseObject(item, "get_customer_state");
-        const id = requireUuidResponse(subscription.id, "get_customer_state");
-        if (ids.has(id)) malformedResponse("get_customer_state");
+      for (const item of items) {
+        const subscription = requireResponseObject(item, "list_subscriptions");
+        const id = requireUuidResponse(subscription.id, "list_subscriptions");
+        if (ids.has(id)) malformedResponse("list_subscriptions");
         ids.add(id);
-        const status = subscription.status;
-        if (status !== "active" && status !== "trialing")
-          return malformedResponse("get_customer_state");
+        const status = requireSubscriptionStatus(
+          subscription.status,
+          "list_subscriptions",
+        );
+        if (status === "unpaid") return malformedResponse("list_subscriptions");
         const productId = requireUuidResponse(
           subscription.product_id,
-          "get_customer_state",
+          "list_subscriptions",
+        );
+        const customerId = requireUuidResponse(
+          subscription.customer_id,
+          "list_subscriptions",
         );
         const currentPeriodStart = requireResponseDate(
           subscription.current_period_start,
-          "get_customer_state",
+          "list_subscriptions",
         );
         const currentPeriodEnd = requireResponseDate(
           subscription.current_period_end,
-          "get_customer_state",
+          "list_subscriptions",
         );
         const cancelAtPeriodEnd = subscription.cancel_at_period_end;
         if (currentPeriodStart.getTime() >= currentPeriodEnd.getTime())
-          return malformedResponse("get_customer_state");
+          return malformedResponse("list_subscriptions");
         if (typeof cancelAtPeriodEnd !== "boolean")
-          return malformedResponse("get_customer_state");
-        if (productId === proProductId)
-          proSubscriptions.push({
-            id,
-            status,
-            currentPeriodStart,
-            currentPeriodEnd,
-            cancelAtPeriodEnd,
-          });
+          return malformedResponse("list_subscriptions");
+        if (productId !== proProductId || customerId !== customer.id)
+          return malformedResponse("list_subscriptions");
+        proSubscriptions.push({
+          id,
+          status,
+          currentPeriodStart,
+          currentPeriodEnd,
+          cancelAtPeriodEnd,
+        });
       }
-      if (proSubscriptions.length > 1) malformedResponse("get_customer_state");
+      if (proSubscriptions.length > 1) malformedResponse("list_subscriptions");
       return {
         customer,
         proSubscription: proSubscriptions[0] ?? null,

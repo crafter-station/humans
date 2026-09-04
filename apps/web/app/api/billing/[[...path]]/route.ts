@@ -25,6 +25,7 @@ const proxy = async (request: Request, path: string) => {
     method: request.method,
     headers: protectedProxyHeaders(request, token),
     cache: "no-store",
+    redirect: "error",
   });
   return new Response(response.body, {
     status: response.status,

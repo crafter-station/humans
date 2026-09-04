@@ -8,7 +8,12 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { activateOrganizationEntitlement } from "../src/abuse-controls";
 import {
+  beginPolarCheckoutCreation,
   claimCreditUsage,
+  claimPolarCheckout,
+  clearPolarCheckoutClaim,
+  completePolarCheckout,
+  getBillingCustomerSeed,
   listCreditUsageDeadLetters,
   markCreditUsageDelivered,
   type PolarSubscriptionProjection,
@@ -16,8 +21,11 @@ import {
   reconcileCreditPeriodPage,
   reconcileCreditUsage,
   recordPolarCustomer,
+  recordPolarOrderRefund,
   redriveCreditUsage,
   releaseCreditUsage,
+  releaseExpiredPolarCheckoutReconciliation,
+  releasePolarCheckoutLease,
 } from "../src/billing";
 import {
   applyCreditEntry,
@@ -36,20 +44,36 @@ const NOW = new Date("2026-09-03T00:00:00Z");
 
 const billingEvent = (
   overrides: Partial<PolarSubscriptionProjection> = {},
-): PolarSubscriptionProjection => ({
-  eventId: "event_active",
-  eventType: "subscription.active",
-  occurredAt: new Date("2026-09-02T00:00:00Z"),
-  organizationId: "organization_one",
-  polarCustomerId: "customer_one",
-  polarSubscriptionId: "subscription_one",
-  status: "active",
-  periodStart: PERIOD_START,
-  periodEnd: PERIOD_END,
-  cancelAtPeriodEnd: false,
-  now: NOW,
-  ...overrides,
-});
+): PolarSubscriptionProjection => {
+  const event: PolarSubscriptionProjection = {
+    eventId: "event_active",
+    eventType: "subscription.active",
+    occurredAt: new Date("2026-09-02T00:00:00Z"),
+    organizationId: "organization_one",
+    polarCustomerId: "customer_one",
+    polarSubscriptionId: "subscription_one",
+    status: "active",
+    periodStart: PERIOD_START,
+    periodEnd: PERIOD_END,
+    cancelAtPeriodEnd: false,
+    now: NOW,
+    ...overrides,
+  };
+  return event.eventType === "order.paid" && event.order === undefined
+    ? {
+        ...event,
+        order: {
+          orderId: `order_${event.eventId}`,
+          status: "paid",
+          billingReason: "subscription_cycle",
+          currency: "usd",
+          totalAmount: 2_000,
+          refundedAmount: 0,
+          refundedTaxAmount: 0,
+        },
+      }
+    : event;
+};
 
 describe("Polar billing and Credit periods", () => {
   const resources: {
@@ -210,6 +234,331 @@ describe("Polar billing and Credit periods", () => {
       status: "blocked",
       polarEventId: "event_revoked",
     });
+  });
+
+  it.each(["failure-first", "payment-first"] as const)(
+    "uses payment recovery for equal-timestamp webhooks arriving %s",
+    async (arrivalOrder) => {
+      await seedOrganizations("organization_one");
+      const occurredAt = new Date("2026-09-03T12:00:00.123Z");
+      const payment = billingEvent({
+        eventId: `payment_${arrivalOrder}`,
+        eventType: "order.paid",
+        occurredAt,
+      });
+      const failure = billingEvent({
+        eventId: `failure_${arrivalOrder}`,
+        eventType: "subscription.past_due",
+        status: "past_due",
+        occurredAt,
+      });
+
+      for (const event of arrivalOrder === "failure-first"
+        ? [failure, payment]
+        : [payment, failure]) {
+        await projectPolarSubscriptionEvent(database, event);
+      }
+
+      const [entitlement] = await database
+        .select()
+        .from(schema.organizationEntitlements);
+      expect(entitlement).toMatchObject({
+        status: "active",
+        polarStatus: "active",
+        polarEventId: `payment_${arrivalOrder}`,
+        pendingFreeAtPeriodEnd: false,
+      });
+      expect(await getCreditBalance(database, "organization_one")).toBe(1_000);
+    },
+  );
+
+  it.each(
+    (["incomplete_expired", "canceled", "unpaid", "paused"] as const).flatMap(
+      (status) =>
+        (["blocking-first", "payment-first"] as const).map(
+          (arrivalOrder) => [status, arrivalOrder] as const,
+        ),
+    ),
+  )(
+    "keeps equal-timestamp %s state authoritative when arriving %s",
+    async (status, arrivalOrder) => {
+      await seedOrganizations("organization_one");
+      const occurredAt = new Date("2026-09-03T12:00:00.123Z");
+      const payment = billingEvent({
+        eventId: `payment_${status}_${arrivalOrder}`,
+        eventType: "order.paid",
+        occurredAt,
+      });
+      const blocking = billingEvent({
+        eventId: `blocking_${status}_${arrivalOrder}`,
+        eventType: `subscription.${status}`,
+        status,
+        occurredAt,
+      });
+
+      for (const event of arrivalOrder === "blocking-first"
+        ? [blocking, payment]
+        : [payment, blocking]) {
+        await projectPolarSubscriptionEvent(database, event);
+      }
+
+      const [entitlement] = await database
+        .select()
+        .from(schema.organizationEntitlements);
+      expect(entitlement).toMatchObject({
+        status: "blocked",
+        polarStatus: status,
+        polarEventId: `blocking_${status}_${arrivalOrder}`,
+      });
+      expect(await getCreditBalance(database, "organization_one")).toBe(1_000);
+      await expect(
+        database.transaction((tx) =>
+          reserveCredit(tx, {
+            organizationId: "organization_one",
+            amount: 1,
+            referenceId: `search:${status}:${arrivalOrder}`,
+            idempotencyKey: `search:${status}:${arrivalOrder}`,
+            reservationKey: "idempotency-key",
+            now: NOW,
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "credits_unavailable" });
+    },
+  );
+
+  it.each(["terminal-first", "rollover-first"] as const)(
+    "records an ended Pro terminal event without replacing Free access when arriving %s",
+    async (arrivalOrder) => {
+      await database.insert(schema.members).values({ clerkId: "member_one" });
+      await seedOrganizations("organization_one");
+      await database.insert(schema.organizationMemberships).values({
+        clerkId: "membership_one",
+        memberId: "member_one",
+        organizationId: "organization_one",
+        role: "org:admin",
+      });
+      await activateOrganizationEntitlement(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+        emailVerified: true,
+        botProtectionVerified: true,
+        now: new Date("2026-08-01T00:00:00Z"),
+      });
+      await projectPolarSubscriptionEvent(
+        database,
+        billingEvent({
+          eventId: `rollover_paid_${arrivalOrder}`,
+          eventType: "order.paid",
+          cancelAtPeriodEnd: true,
+        }),
+      );
+
+      const terminal = billingEvent({
+        eventId: `rollover_terminal_${arrivalOrder}`,
+        eventType: "subscription.revoked",
+        status: "canceled",
+        occurredAt: new Date("2026-09-30T23:59:00Z"),
+        cancelAtPeriodEnd: true,
+        now:
+          arrivalOrder === "terminal-first"
+            ? new Date("2026-09-30T23:59:00Z")
+            : new Date("2026-10-01T00:01:00Z"),
+      });
+      let terminalResult: Awaited<
+        ReturnType<typeof projectPolarSubscriptionEvent>
+      >;
+      if (arrivalOrder === "terminal-first") {
+        terminalResult = await projectPolarSubscriptionEvent(
+          database,
+          terminal,
+        );
+        await database.transaction((tx) =>
+          rolloverCreditPeriodInTransaction(tx, "organization_one", PERIOD_END),
+        );
+      } else {
+        await database.transaction((tx) =>
+          rolloverCreditPeriodInTransaction(tx, "organization_one", PERIOD_END),
+        );
+        terminalResult = await projectPolarSubscriptionEvent(
+          database,
+          terminal,
+        );
+      }
+
+      expect(terminalResult).toEqual({
+        processed: true,
+        applied: arrivalOrder === "terminal-first",
+      });
+      const [entitlement] = await database
+        .select()
+        .from(schema.organizationEntitlements);
+      expect(entitlement).toMatchObject({
+        tier: "free",
+        status: "active",
+        periodStart: PERIOD_END,
+        periodEnd: new Date("2026-11-01T00:00:00Z"),
+      });
+      expect(await getCreditBalance(database, "organization_one")).toBe(100);
+      await expect(
+        database
+          .select()
+          .from(schema.polarWebhookEvents)
+          .where(eq(schema.polarWebhookEvents.id, terminal.eventId)),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          id: terminal.eventId,
+          eventType: "subscription.revoked",
+          status: "canceled",
+        }),
+      ]);
+    },
+  );
+
+  it("hydrates a fully-null legacy Order audit on an exact paid replay", async () => {
+    await seedOrganizations("organization_one");
+    const paid = billingEvent({
+      eventId: "legacy_paid_audit",
+      eventType: "order.paid",
+    });
+    await database.insert(schema.polarWebhookEvents).values({
+      id: paid.eventId,
+      organizationId: paid.organizationId,
+      subscriptionId: paid.polarSubscriptionId,
+      eventType: paid.eventType,
+      status: paid.status,
+      occurredAt: paid.occurredAt,
+      applied: true,
+    });
+
+    await expect(
+      projectPolarSubscriptionEvent(database, paid),
+    ).resolves.toEqual({ processed: false, applied: true });
+    const [hydrated] = await database
+      .select()
+      .from(schema.polarWebhookEvents)
+      .where(eq(schema.polarWebhookEvents.id, paid.eventId));
+    expect(hydrated).toMatchObject({
+      orderId: paid.order?.orderId,
+      orderStatus: paid.order?.status,
+      orderBillingReason: paid.order?.billingReason,
+      orderCurrency: paid.order?.currency,
+      orderTotalAmount: paid.order?.totalAmount,
+      orderRefundedAmount: paid.order?.refundedAmount,
+      orderRefundedTaxAmount: paid.order?.refundedTaxAmount,
+    });
+    expect(await getCreditBalance(database, "organization_one")).toBe(0);
+  });
+
+  it.each(["partial-order", "mismatched-order", "mismatched-event"] as const)(
+    "rejects %s audit data instead of hydrating a paid replay",
+    async (conflict) => {
+      await seedOrganizations("organization_one");
+      const paid = billingEvent({
+        eventId: `legacy_paid_${conflict}`,
+        eventType: "order.paid",
+      });
+      await database.insert(schema.polarWebhookEvents).values({
+        id: paid.eventId,
+        organizationId: paid.organizationId,
+        subscriptionId: paid.polarSubscriptionId,
+        eventType: paid.eventType,
+        status: conflict === "mismatched-event" ? "paused" : paid.status,
+        occurredAt: paid.occurredAt,
+        ...(conflict === "partial-order"
+          ? { orderId: paid.order?.orderId }
+          : conflict === "mismatched-order"
+            ? {
+                orderId: paid.order?.orderId,
+                orderStatus: paid.order?.status,
+                orderBillingReason: paid.order?.billingReason,
+                orderCurrency: paid.order?.currency,
+                orderTotalAmount: (paid.order?.totalAmount ?? 0) + 1,
+                orderRefundedAmount: paid.order?.refundedAmount,
+                orderRefundedTaxAmount: paid.order?.refundedTaxAmount,
+              }
+            : {}),
+      });
+
+      await expect(
+        projectPolarSubscriptionEvent(database, paid),
+      ).rejects.toMatchObject({ code: "billing_event_conflict" });
+    },
+  );
+
+  it("audits subscription Order refunds without clawing back Credits", async () => {
+    await seedOrganizations("organization_one", "organization_two");
+    const paid = billingEvent({
+      eventId: "refund_policy_paid",
+      eventType: "order.paid",
+      order: {
+        orderId: "order_refund_policy",
+        status: "paid",
+        billingReason: "subscription_cycle",
+        currency: "usd",
+        totalAmount: 2_000,
+        refundedAmount: 0,
+        refundedTaxAmount: 0,
+      },
+    });
+    await projectPolarSubscriptionEvent(database, paid);
+    const partialRefund = {
+      eventId: "refund_policy_partial",
+      eventType: "order.refunded" as const,
+      occurredAt: new Date("2026-09-03T13:00:00Z"),
+      organizationId: "organization_one",
+      polarCustomerId: "customer_one",
+      polarSubscriptionId: "subscription_one",
+      order: {
+        orderId: "order_refund_policy",
+        status: "partially_refunded" as const,
+        billingReason: "subscription_cycle" as const,
+        currency: "usd",
+        totalAmount: 2_000,
+        refundedAmount: 1_000,
+        refundedTaxAmount: 60,
+      },
+      now: new Date("2026-09-03T13:00:01Z"),
+    };
+
+    await expect(
+      recordPolarOrderRefund(database, partialRefund),
+    ).resolves.toEqual({ processed: true, applied: false });
+    await expect(
+      recordPolarOrderRefund(database, partialRefund),
+    ).resolves.toEqual({ processed: false, applied: false });
+    await expect(
+      recordPolarOrderRefund(database, {
+        ...partialRefund,
+        eventId: "refund_policy_conflict",
+        organizationId: "organization_two",
+        polarCustomerId: "customer_two",
+        polarSubscriptionId: "subscription_two",
+      }),
+    ).rejects.toMatchObject({ code: "billing_order_conflict" });
+
+    expect(await getCreditBalance(database, "organization_one")).toBe(1_000);
+    const [entitlement] = await database
+      .select()
+      .from(schema.organizationEntitlements);
+    expect(entitlement).toMatchObject({ tier: "pro", status: "active" });
+    const orderEvents = await database
+      .select()
+      .from(schema.polarWebhookEvents)
+      .where(eq(schema.polarWebhookEvents.orderId, "order_refund_policy"));
+    expect(orderEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "order.paid",
+          orderStatus: "paid",
+          orderRefundedAmount: 0,
+        }),
+        expect.objectContaining({
+          eventType: "order.refunded",
+          orderStatus: "partially_refunded",
+          orderRefundedAmount: 1_000,
+        }),
+      ]),
+    );
   });
 
   it("serializes one free grant when a Member activates two Organizations", async () => {
@@ -521,6 +870,318 @@ describe("Polar billing and Credit periods", () => {
     expect(await getCreditBalance(database, "organization_one")).toBe(1_000);
   });
 
+  it("requires an active Organization admin to seed a Polar Customer", async () => {
+    await database.insert(schema.members).values({
+      clerkId: "member_one",
+      email: "member@example.com",
+    });
+    await seedOrganizations("organization_one");
+    await database.insert(schema.organizationMemberships).values({
+      clerkId: "membership_one",
+      memberId: "member_one",
+      organizationId: "organization_one",
+      role: "org:member",
+    });
+
+    await expect(
+      getBillingCustomerSeed(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+      }),
+    ).rejects.toMatchObject({ code: "billing_identity_unavailable" });
+
+    await database
+      .update(schema.organizationMemberships)
+      .set({ role: "org:admin" })
+      .where(eq(schema.organizationMemberships.clerkId, "membership_one"));
+    await expect(
+      getBillingCustomerSeed(database, {
+        memberId: "member_one",
+        organizationId: "organization_one",
+      }),
+    ).resolves.toEqual({ name: "organization_one" });
+  });
+
+  it("serializes and reuses one open Polar checkout per Organization", async () => {
+    await seedOrganizations("organization_one");
+    await recordPolarCustomer(database, {
+      organizationId: "organization_one",
+      polarCustomerId: "customer_one",
+    });
+    const now = new Date("2026-09-03T12:00:00Z");
+    const claims = await Promise.all([
+      claimPolarCheckout(database, { organizationId: "organization_one", now }),
+      claimPolarCheckout(database, { organizationId: "organization_one", now }),
+    ]);
+    expect(claims.map(({ state }) => state).sort()).toEqual([
+      "claimed",
+      "pending",
+    ]);
+    const claimed = claims.find(
+      (
+        claim,
+      ): claim is Extract<(typeof claims)[number], { state: "claimed" }> =>
+        claim.state === "claimed",
+    );
+    if (!claimed) throw new Error("Expected one checkout claim");
+    const checkout = {
+      id: "checkout_one",
+      url: "https://polar.sh/checkout/checkout_one",
+      expiresAt: new Date("2026-09-03T13:00:00Z"),
+    };
+    await expect(
+      completePolarCheckout(database, {
+        organizationId: "organization_one",
+        claimId: claimed.claimId,
+        checkout,
+        now,
+      }),
+    ).resolves.toEqual(checkout);
+    await expect(
+      claimPolarCheckout(database, { organizationId: "organization_one", now }),
+    ).resolves.toEqual({ state: "open", claimId: claimed.claimId, checkout });
+
+    await expect(
+      claimPolarCheckout(database, {
+        organizationId: "organization_one",
+        now: new Date("2026-09-03T14:00:00Z"),
+      }),
+    ).resolves.toEqual({
+      state: "reconcile",
+      claimId: claimed.claimId,
+      checkoutId: checkout.id,
+    });
+    await expect(
+      clearPolarCheckoutClaim(database, {
+        organizationId: "organization_one",
+        claimId: "another_claim",
+        checkoutId: checkout.id,
+        now: new Date("2026-09-03T14:00:00Z"),
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      clearPolarCheckoutClaim(database, {
+        organizationId: "organization_one",
+        claimId: claimed.claimId,
+        checkoutId: checkout.id,
+        now: new Date("2026-09-03T14:00:00Z"),
+      }),
+    ).resolves.toBe(true);
+    const replacement = await claimPolarCheckout(database, {
+      organizationId: "organization_one",
+      now: new Date("2026-09-03T14:00:00Z"),
+    });
+    expect(replacement.state).toBe("claimed");
+    if (replacement.state !== "claimed")
+      throw new Error("Expected an expired checkout to be replaced");
+    await expect(
+      beginPolarCheckoutCreation(database, {
+        organizationId: "organization_one",
+        claimId: replacement.claimId,
+        now: new Date("2026-09-03T14:00:01Z"),
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      claimPolarCheckout(database, {
+        organizationId: "organization_one",
+        now: new Date("2026-09-04T14:00:00Z"),
+      }),
+    ).resolves.toEqual({
+      state: "reconcile",
+      claimId: replacement.claimId,
+      checkoutId: null,
+    });
+    await expect(
+      beginPolarCheckoutCreation(database, {
+        organizationId: "organization_one",
+        claimId: claimed.claimId,
+        now: new Date("2026-09-03T14:00:01Z"),
+      }),
+    ).resolves.toBe(false);
+  });
+
+  it("fences an expired checkout lease before any Polar creation", async () => {
+    await seedOrganizations("organization_one");
+    await recordPolarCustomer(database, {
+      organizationId: "organization_one",
+      polarCustomerId: "customer_one",
+    });
+    const first = await claimPolarCheckout(database, {
+      organizationId: "organization_one",
+      now: new Date("2026-09-03T12:00:00Z"),
+    });
+    expect(first.state).toBe("claimed");
+    if (first.state !== "claimed") throw new Error("Expected first lease");
+    const replacement = await claimPolarCheckout(database, {
+      organizationId: "organization_one",
+      now: new Date("2026-09-03T12:06:00Z"),
+    });
+    expect(replacement.state).toBe("claimed");
+    if (replacement.state !== "claimed")
+      throw new Error("Expected replacement lease");
+
+    await expect(
+      beginPolarCheckoutCreation(database, {
+        organizationId: "organization_one",
+        claimId: first.claimId,
+        now: new Date("2026-09-03T12:06:01Z"),
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      releasePolarCheckoutLease(database, {
+        organizationId: "organization_one",
+        claimId: first.claimId,
+        now: new Date("2026-09-03T12:06:01Z"),
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      beginPolarCheckoutCreation(database, {
+        organizationId: "organization_one",
+        claimId: replacement.claimId,
+        now: new Date("2026-09-03T12:06:01Z"),
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      claimPolarCheckout(database, {
+        organizationId: "organization_one",
+        now: new Date("2026-09-10T12:00:00Z"),
+      }),
+    ).resolves.toEqual({
+      state: "reconcile",
+      claimId: replacement.claimId,
+      checkoutId: null,
+    });
+    await expect(
+      releaseExpiredPolarCheckoutReconciliation(database, {
+        organizationId: "organization_one",
+        claimId: replacement.claimId,
+        now: new Date("2026-09-03T12:11:00Z"),
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      releaseExpiredPolarCheckoutReconciliation(database, {
+        organizationId: "organization_one",
+        claimId: replacement.claimId,
+        now: new Date("2026-09-03T12:11:01Z"),
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      claimPolarCheckout(database, {
+        organizationId: "organization_one",
+        now: new Date("2026-09-03T12:11:01Z"),
+      }),
+    ).resolves.toMatchObject({ state: "claimed" });
+  });
+
+  it("releases only the caller's unstarted checkout lease", async () => {
+    await seedOrganizations("organization_one");
+    await recordPolarCustomer(database, {
+      organizationId: "organization_one",
+      polarCustomerId: "customer_one",
+    });
+    const first = await claimPolarCheckout(database, {
+      organizationId: "organization_one",
+      now: new Date("2026-09-03T12:00:00Z"),
+    });
+    expect(first.state).toBe("claimed");
+    if (first.state !== "claimed") throw new Error("Expected first lease");
+    await expect(
+      releasePolarCheckoutLease(database, {
+        organizationId: "organization_one",
+        claimId: "another_claim",
+        now: new Date("2026-09-03T12:00:01Z"),
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      releasePolarCheckoutLease(database, {
+        organizationId: "organization_one",
+        claimId: first.claimId,
+        now: new Date("2026-09-03T12:00:01Z"),
+      }),
+    ).resolves.toBe(true);
+
+    const started = await claimPolarCheckout(database, {
+      organizationId: "organization_one",
+      now: new Date("2026-09-03T12:00:02Z"),
+    });
+    expect(started.state).toBe("claimed");
+    if (started.state !== "claimed") throw new Error("Expected second lease");
+    await expect(
+      beginPolarCheckoutCreation(database, {
+        organizationId: "organization_one",
+        claimId: started.claimId,
+        now: new Date("2026-09-03T12:00:03Z"),
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      releasePolarCheckoutLease(database, {
+        organizationId: "organization_one",
+        claimId: started.claimId,
+        now: new Date("2026-09-03T12:00:04Z"),
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      claimPolarCheckout(database, {
+        organizationId: "organization_one",
+        now: new Date("2026-09-10T12:00:00Z"),
+      }),
+    ).resolves.toEqual({
+      state: "reconcile",
+      claimId: started.claimId,
+      checkoutId: null,
+    });
+  });
+
+  it("serializes lease replacement behind an in-flight creation fence", async () => {
+    await seedOrganizations("organization_one");
+    await recordPolarCustomer(database, {
+      organizationId: "organization_one",
+      polarCustomerId: "customer_one",
+    });
+    const first = await claimPolarCheckout(database, {
+      organizationId: "organization_one",
+      now: new Date("2026-09-03T12:00:00Z"),
+    });
+    expect(first.state).toBe("claimed");
+    if (first.state !== "claimed") throw new Error("Expected first lease");
+
+    const pool = resources.pool;
+    if (!pool) throw new Error("Database pool is unavailable");
+    const lockClient = await pool.connect();
+    let creation: Promise<boolean> | undefined;
+    let replacement: ReturnType<typeof claimPolarCheckout> | undefined;
+    try {
+      await lockClient.query("BEGIN");
+      await lockClient.query(
+        "SELECT organization_id FROM polar_customers " +
+          "WHERE organization_id = 'organization_one' FOR UPDATE",
+      );
+      creation = beginPolarCheckoutCreation(database, {
+        organizationId: "organization_one",
+        claimId: first.claimId,
+        now: new Date("2026-09-03T12:04:59Z"),
+      });
+      await waitForBlockedPolarCustomerQueries(pool, 1);
+      replacement = claimPolarCheckout(database, {
+        organizationId: "organization_one",
+        now: new Date("2026-09-03T12:05:01Z"),
+      });
+      await waitForBlockedPolarCustomerQueries(pool, 2);
+      await lockClient.query("COMMIT");
+
+      await expect(creation).resolves.toBe(true);
+      await expect(replacement).resolves.toEqual({
+        state: "reconcile",
+        claimId: first.claimId,
+        checkoutId: null,
+      });
+    } finally {
+      await lockClient.query("ROLLBACK").catch(() => undefined);
+      lockClient.release();
+      await Promise.allSettled([creation, replacement].filter(Boolean));
+    }
+  });
+
   it("surfaces exhausted usage delivery and redrives it idempotently", async () => {
     await seedOrganizations("organization_one");
     await database.insert(schema.organizationEntitlements).values({
@@ -653,13 +1314,11 @@ describe("Polar billing and Credit periods", () => {
     expect(usage).toEqual([
       {
         organizationId: "organization_one",
-        idempotencyKey:
-          "organization_one:search:shared:consumption:credit:1",
+        idempotencyKey: "organization_one:search:shared:consumption:credit:1",
       },
       {
         organizationId: "organization_two",
-        idempotencyKey:
-          "organization_two:search:shared:consumption:credit:1",
+        idempotencyKey: "organization_two:search:shared:consumption:credit:1",
       },
     ]);
   });
@@ -687,7 +1346,7 @@ describe("Polar billing and Credit periods", () => {
     ).resolves.toMatchObject({ applied: false, balance: 25 });
   });
 
-  it("reconciles usage in the period when Polar received it", async () => {
+  it("reconciles usage by the same occurrence timestamp Polar receives", async () => {
     await seedOrganizations("organization_one");
     await database.insert(schema.organizationEntitlements).values({
       organizationId: "organization_one",
@@ -711,7 +1370,9 @@ describe("Polar billing and Credit periods", () => {
       now: new Date("2026-09-30T23:59:00Z"),
     };
     await database.transaction((tx) => reserveCredit(tx, operation));
-    await database.transaction((tx) => finalizeCreditReservation(tx, operation));
+    await database.transaction((tx) =>
+      finalizeCreditReservation(tx, operation),
+    );
     await database
       .update(schema.creditUsageOutbox)
       .set({ occurredAt: operation.now, availableAt: operation.now })
@@ -737,9 +1398,13 @@ describe("Polar billing and Credit periods", () => {
           endAt: PERIOD_END,
           now: deliveryAt,
         },
-        async () => 0,
+        async () => 1,
       ),
-    ).resolves.toMatchObject({ localCredits: 0, polarCredits: 0, status: "matched" });
+    ).resolves.toMatchObject({
+      localCredits: 1,
+      polarCredits: 1,
+      status: "matched",
+    });
     await expect(
       reconcileCreditUsage(
         database,
@@ -749,9 +1414,121 @@ describe("Polar billing and Credit periods", () => {
           endAt: new Date("2026-11-01T00:00:00Z"),
           now: deliveryAt,
         },
+        async () => 0,
+      ),
+    ).resolves.toMatchObject({
+      localCredits: 0,
+      polarCredits: 0,
+      status: "matched",
+    });
+  });
+
+  it("reopens and pages an exact historical period after late usage delivery", async () => {
+    await database.insert(schema.members).values({ clerkId: "member_one" });
+    await seedOrganizations("organization_one");
+    await database.insert(schema.organizationMemberships).values({
+      clerkId: "membership_one",
+      memberId: "member_one",
+      organizationId: "organization_one",
+      role: "org:admin",
+    });
+    await activateOrganizationEntitlement(database, {
+      memberId: "member_one",
+      organizationId: "organization_one",
+      emailVerified: true,
+      botProtectionVerified: true,
+      now: PERIOD_START,
+    });
+    await recordPolarCustomer(database, {
+      organizationId: "organization_one",
+      polarCustomerId: "customer_one",
+    });
+    const operation = {
+      organizationId: "organization_one",
+      amount: 1,
+      referenceId: "search:late-delivery",
+      idempotencyKey: "search:late-delivery",
+      reservationKey: "idempotency-key" as const,
+      now: new Date("2026-09-30T23:59:00Z"),
+    };
+    await database.transaction((tx) => reserveCredit(tx, operation));
+    await database.transaction((tx) =>
+      finalizeCreditReservation(tx, operation),
+    );
+    await database
+      .update(schema.creditUsageOutbox)
+      .set({ occurredAt: operation.now, availableAt: operation.now })
+      .where(eq(schema.creditUsageOutbox.organizationId, "organization_one"));
+    await expect(
+      reconcileCreditUsage(
+        database,
+        {
+          organizationId: "organization_one",
+          startAt: PERIOD_START,
+          endAt: PERIOD_END,
+          now: operation.now,
+        },
+        async () => 0,
+      ),
+    ).resolves.toMatchObject({ status: "matched", localCredits: 0 });
+
+    await database.transaction((tx) =>
+      rolloverCreditPeriodInTransaction(tx, "organization_one", PERIOD_END),
+    );
+    const deliveredAt = new Date("2026-10-01T00:01:00Z");
+    const [usage] = await claimCreditUsage(database, {
+      leaseOwner: "late-delivery",
+      now: deliveredAt,
+    });
+    if (!usage) throw new Error("Expected late usage");
+    await markCreditUsageDelivered(database, {
+      ids: [usage.id],
+      leaseOwner: "late-delivery",
+      deliveredAt,
+    });
+
+    const [reopened] = await database
+      .select()
+      .from(schema.creditReconciliations)
+      .where(eq(schema.creditReconciliations.periodStart, PERIOD_START));
+    expect(reopened).toMatchObject({
+      periodEnd: PERIOD_END,
+      status: "pending",
+      resolvedAt: null,
+    });
+    if (!reopened) throw new Error("Expected historical reconciliation");
+
+    const visited: Array<{ startAt: Date; endAt: Date }> = [];
+    let after: string | undefined;
+    do {
+      const page = await reconcileCreditPeriodPage(
+        database,
+        async ({ startAt, endAt }) => {
+          visited.push({ startAt, endAt });
+          return startAt.getTime() === PERIOD_START.getTime() ? 1 : 0;
+        },
+        { limit: 1, now: deliveredAt, after },
+      );
+      after = page.nextCursor ?? undefined;
+    } while (after !== undefined);
+    expect(visited).toEqual([
+      { startAt: PERIOD_START, endAt: PERIOD_END },
+      {
+        startAt: PERIOD_END,
+        endAt: new Date("2026-11-01T00:00:00Z"),
+      },
+    ]);
+    await expect(
+      reconcileCreditUsage(
+        database,
+        { reconciliationId: reopened.id, now: deliveredAt },
         async () => 1,
       ),
-    ).resolves.toMatchObject({ localCredits: 1, polarCredits: 1, status: "matched" });
+    ).resolves.toMatchObject({
+      localCredits: 1,
+      polarCredits: 1,
+      status: "matched",
+    });
   });
 
   it("pins reconciliation periods and pages every Organization with bounded work", async () => {
@@ -785,7 +1562,7 @@ describe("Polar billing and Credit periods", () => {
           visited.push(organizationId);
           return 0;
         },
-        { limit: 2, afterOrganizationId: cursor, now: NOW },
+        { limit: 2, after: cursor, now: NOW },
       );
       expect(page.reconciliations.length).toBeLessThanOrEqual(2);
       cursor = page.nextCursor ?? undefined;
@@ -827,4 +1604,58 @@ describe("Polar billing and Credit periods", () => {
     );
     expect(retried).toMatchObject({ status: "matched", attempts: 3 });
   });
+
+  it("fails closed rather than assigning a legacy reconciliation to the current period", async () => {
+    await seedOrganizations("organization_one");
+    await database.insert(schema.organizationEntitlements).values({
+      organizationId: "organization_one",
+      tier: "pro",
+      status: "active",
+      periodStart: PERIOD_START,
+      periodEnd: PERIOD_END,
+    });
+    const [legacy] = await database
+      .insert(schema.creditReconciliations)
+      .values({
+        organizationId: "organization_one",
+        localCredits: 0,
+        polarCredits: 0,
+        status: "pending",
+      })
+      .returning();
+    if (!legacy) throw new Error("Expected legacy reconciliation");
+
+    await expect(
+      reconcileCreditUsage(
+        database,
+        { reconciliationId: legacy.id, now: NOW },
+        async () => 0,
+      ),
+    ).rejects.toMatchObject({ code: "billing_period_unavailable" });
+    const [unchanged] = await database
+      .select()
+      .from(schema.creditReconciliations)
+      .where(eq(schema.creditReconciliations.id, legacy.id));
+    expect(unchanged).toMatchObject({ periodStart: null, periodEnd: null });
+  });
 });
+
+const waitForBlockedPolarCustomerQueries = async (
+  pool: Pool,
+  expected: number,
+) => {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const result = await pool.query<{ count: number }>(`
+      SELECT count(*)::integer AS count
+      FROM pg_stat_activity
+      WHERE datname = current_database()
+        AND pid <> pg_backend_pid()
+        AND state = 'active'
+        AND wait_event_type = 'Lock'
+        AND query ILIKE '%polar_customers%'
+    `);
+    if ((result.rows[0]?.count ?? 0) >= expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for blocked checkout queries");
+};

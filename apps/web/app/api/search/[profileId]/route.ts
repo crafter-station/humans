@@ -24,7 +24,11 @@ export async function GET(
   const { profileId } = await params;
   const response = await fetch(
     `${env.HUMANS_API_URL}/v1/profiles/${encodeURIComponent(profileId)}`,
-    { headers: protectedProxyHeaders(request, token), cache: "no-store" },
+    {
+      headers: protectedProxyHeaders(request, token),
+      cache: "no-store",
+      redirect: "error",
+    },
   );
   return new Response(response.body, {
     status: response.status,

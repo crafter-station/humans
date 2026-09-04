@@ -27,6 +27,7 @@ export async function POST(request: Request) {
       }),
       body: await request.text(),
       cache: "no-store",
+      redirect: "error",
     },
   );
   return new Response(response.body, {

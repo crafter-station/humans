@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import {
   boolean,
   index,
+  integer,
   pgTable,
   text,
   timestamp,
@@ -49,6 +50,13 @@ export const polarWebhookEvents = pgTable(
     subscriptionId: text("subscription_id"),
     eventType: text("event_type"),
     status: text("status"),
+    orderId: text("order_id"),
+    orderStatus: text("order_status"),
+    orderBillingReason: text("order_billing_reason"),
+    orderCurrency: text("order_currency"),
+    orderTotalAmount: integer("order_total_amount"),
+    orderRefundedAmount: integer("order_refunded_amount"),
+    orderRefundedTaxAmount: integer("order_refunded_tax_amount"),
     occurredAt: timestamp("occurred_at", { withTimezone: true }),
     applied: boolean("applied").notNull().default(false),
     processedAt: timestamp("processed_at", { withTimezone: true })
@@ -57,6 +65,7 @@ export const polarWebhookEvents = pgTable(
   },
   (table) => [
     index("polar_webhook_events_subscription_idx").on(table.subscriptionId),
+    index("polar_webhook_events_order_idx").on(table.orderId),
   ],
 );
 

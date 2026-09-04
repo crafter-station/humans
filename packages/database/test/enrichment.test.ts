@@ -1738,6 +1738,224 @@ describe("production enrichment stores", () => {
     ).resolves.toEqual([]);
   });
 
+  it.each([
+    {
+      outcome: "accepted then canceled before starting",
+      triggerRun: {
+        status: "CANCELED",
+        isCompleted: false,
+        isCancelled: true,
+      },
+      persistedStatus: undefined,
+    },
+    {
+      outcome:
+        "interrupted after persisting a pending run (reported as FAILED)",
+      triggerRun: {
+        status: "FAILED",
+        isCompleted: true,
+        isCancelled: false,
+      },
+      persistedStatus: "pending",
+    },
+    {
+      outcome: "accepted but expired before starting",
+      triggerRun: {
+        status: "EXPIRED",
+        isCompleted: true,
+        isCancelled: false,
+      },
+      persistedStatus: undefined,
+    },
+  ])("reconciles a delivered dispatch $outcome", async (scenario) => {
+    const deliveredAt = new Date("2026-09-01T00:00:00.000Z");
+    const direct = await enqueueEnrichmentDispatch(database, {
+      provider: "github",
+      dedupeKey: `github:profile_one:${scenario.triggerRun.status}`,
+      now: deliveredAt,
+      payload: {
+        profileId: "profile_one",
+        githubLogin: "ada",
+        runId: `direct-${scenario.triggerRun.status.toLowerCase()}`,
+      },
+    });
+    const fallback = await enqueueEnrichmentDispatch(database, {
+      provider: "deepline",
+      dedupeKey: `deepline:profile_one:${scenario.triggerRun.status}`,
+      now: deliveredAt,
+      payload: {
+        profileId: "profile_one",
+        runId: `fallback-${scenario.triggerRun.status.toLowerCase()}`,
+        missingFields: ["headline"],
+        prerequisiteRunIds: [
+          `direct-${scenario.triggerRun.status.toLowerCase()}`,
+        ],
+        identity: { fullName: "Profile One" },
+      },
+    });
+    expect(direct).toBeDefined();
+    expect(fallback).toBeDefined();
+
+    const [lease] = await claimEnrichmentDispatches(database, {
+      leaseOwner: "terminal-reconciliation-dispatcher",
+      now: deliveredAt,
+      limit: 1,
+    });
+    expect(lease?.id).toBe(direct?.id);
+    if (lease === undefined) throw new Error("Expected direct dispatch lease");
+    await markEnrichmentDispatchDelivered(database, {
+      dispatchId: lease.id,
+      leaseOwner: "terminal-reconciliation-dispatcher",
+      triggerRunId: `trigger-${scenario.triggerRun.status.toLowerCase()}`,
+      deliveredAt,
+    });
+    if (scenario.persistedStatus !== undefined)
+      await database.insert(schema.enrichmentRuns).values({
+        id: lease.runId,
+        profileId: lease.profileId,
+        provider: lease.provider,
+        status: scenario.persistedStatus,
+        pipelineVersion: "github-v1",
+        startedAt: deliveredAt,
+      });
+
+    const readTriggerRun = vi.fn(async () => scenario.triggerRun);
+    await expect(
+      recoverEnrichmentDispatches(
+        database,
+        new Date("2026-09-01T00:59:59.999Z"),
+        readTriggerRun,
+      ),
+    ).resolves.toMatchObject({ inspected: 0, reconciled: 0 });
+    expect(readTriggerRun).not.toHaveBeenCalled();
+
+    await expect(
+      recoverEnrichmentDispatches(
+        database,
+        new Date("2026-09-01T01:00:00.000Z"),
+        readTriggerRun,
+      ),
+    ).resolves.toEqual({
+      recovered: 0,
+      cancelled: 0,
+      inspected: 1,
+      inspectionFailures: 0,
+      reconciled: 1,
+    });
+    expect(readTriggerRun).toHaveBeenCalledWith(
+      `trigger-${scenario.triggerRun.status.toLowerCase()}`,
+    );
+    await expect(
+      database
+        .select({
+          status: schema.enrichmentRuns.status,
+          stage: schema.enrichmentRuns.stage,
+          error: schema.enrichmentRuns.error,
+          finishedAt: schema.enrichmentRuns.finishedAt,
+        })
+        .from(schema.enrichmentRuns)
+        .where(eq(schema.enrichmentRuns.id, lease.runId)),
+    ).resolves.toEqual([
+      {
+        status: "failed",
+        stage: null,
+        error: `Trigger run ended with ${scenario.triggerRun.status} before enrichment completed`,
+        finishedAt: new Date("2026-09-01T01:00:00.000Z"),
+      },
+    ]);
+    await expect(
+      claimEnrichmentDispatches(database, {
+        leaseOwner: "fallback-after-terminal-trigger-run",
+        now: new Date("2026-09-01T01:00:00.000Z"),
+      }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        id: fallback?.id,
+        provider: "deepline",
+      }),
+    ]);
+    let nextRetryId = 0;
+    const retries = await createDueEnrichmentDispatches(database, {
+      now: new Date("2026-09-02T01:00:00.000Z"),
+      createId: () =>
+        `retry-${scenario.triggerRun.status.toLowerCase()}-${++nextRetryId}`,
+    });
+    expect(retries).toContainEqual(
+      expect.objectContaining({
+        provider: "github",
+        profileId: "profile_one",
+        runId: `retry-${scenario.triggerRun.status.toLowerCase()}-1`,
+        dedupeKey: expect.stringContaining(`retry:${lease.runId}`),
+      }),
+    );
+  });
+
+  it.each([
+    {
+      status: "QUEUED",
+      isCompleted: false,
+      isCancelled: false,
+    },
+    {
+      status: "EXECUTING",
+      isCompleted: false,
+      isCancelled: false,
+    },
+  ])(
+    "does not reconcile an actively progressing $status Trigger run",
+    async (triggerRun) => {
+      const deliveredAt = new Date("2026-09-01T00:00:00.000Z");
+      const dispatch = await enqueueEnrichmentDispatch(database, {
+        provider: "github",
+        dedupeKey: `github:profile_one:active-${triggerRun.status}`,
+        now: deliveredAt,
+        payload: {
+          profileId: "profile_one",
+          githubLogin: "ada",
+          runId: `active-${triggerRun.status.toLowerCase()}`,
+        },
+      });
+      const [lease] = await claimEnrichmentDispatches(database, {
+        leaseOwner: "active-run-dispatcher",
+        now: deliveredAt,
+      });
+      expect(lease?.id).toBe(dispatch?.id);
+      if (lease === undefined)
+        throw new Error("Expected active dispatch lease");
+      await markEnrichmentDispatchDelivered(database, {
+        dispatchId: lease.id,
+        leaseOwner: "active-run-dispatcher",
+        triggerRunId: `trigger-${triggerRun.status.toLowerCase()}`,
+        deliveredAt,
+      });
+      if (triggerRun.status === "EXECUTING")
+        await database.insert(schema.enrichmentRuns).values({
+          id: lease.runId,
+          profileId: lease.profileId,
+          provider: lease.provider,
+          status: "running",
+          pipelineVersion: "github-v1",
+          startedAt: deliveredAt,
+        });
+
+      await expect(
+        recoverEnrichmentDispatches(
+          database,
+          new Date("2026-09-02T00:00:00.000Z"),
+          async () => triggerRun,
+        ),
+      ).resolves.toMatchObject({ inspected: 1, reconciled: 0 });
+      await expect(
+        database
+          .select({ status: schema.enrichmentRuns.status })
+          .from(schema.enrichmentRuns)
+          .where(eq(schema.enrichmentRuns.id, lease.runId)),
+      ).resolves.toEqual(
+        triggerRun.status === "EXECUTING" ? [{ status: "running" }] : [],
+      );
+    },
+  );
+
   it("suppresses unresolved inaccessible GitHub Profiles at the exact grace boundary", async () => {
     const now = new Date("2026-09-01T00:00:00.000Z");
     await database
@@ -1828,6 +2046,9 @@ describe("production enrichment stores", () => {
     await expect(recoverEnrichmentDispatches(database, now)).resolves.toEqual({
       recovered: 0,
       cancelled: 0,
+      inspected: 0,
+      inspectionFailures: 0,
+      reconciled: 0,
     });
     await expect(
       claimEnrichmentDispatches(database, {

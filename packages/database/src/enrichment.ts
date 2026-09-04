@@ -1319,7 +1319,15 @@ export const ENRICHMENT_REFRESH_DAYS = {
 
 const DAY_IN_MILLISECONDS = 86_400_000;
 const FAILED_REFRESH_RETRY_DAYS = 1;
+const DELIVERED_RUN_RECONCILIATION_DELAY_MILLISECONDS = 60 * 60_000;
+const DELIVERED_RUN_RECONCILIATION_LIMIT = 500;
 const enrichmentProviders = ["github", "tikhub", "deepline"] as const;
+
+export type EnrichmentTriggerRunState = {
+  status: string;
+  isCompleted: boolean;
+  isCancelled: boolean;
+};
 
 export const enrichmentRefreshDueAt = (
   provider: EnrichmentProvider,
@@ -2255,9 +2263,81 @@ export const releaseEnrichmentDispatch = async (
 export const recoverEnrichmentDispatches = async (
   database: DrizzleDatabase,
   now = new Date(),
+  readTriggerRun?: (triggerRunId: string) => Promise<EnrichmentTriggerRunState>,
 ) => {
   if (Number.isNaN(now.getTime()))
     throw new EnrichmentStoreError("invalid_dispatch");
+  const reconciliationCutoff = new Date(
+    now.getTime() - DELIVERED_RUN_RECONCILIATION_DELAY_MILLISECONDS,
+  );
+  const candidates =
+    readTriggerRun === undefined
+      ? []
+      : await database
+          .select({
+            dispatchId: enrichmentDispatches.id,
+            profileId: enrichmentDispatches.profileId,
+            provider: enrichmentDispatches.provider,
+            runId: enrichmentDispatches.runId,
+            triggerRunId: enrichmentDispatches.triggerRunId,
+            deliveredAt: enrichmentDispatches.deliveredAt,
+          })
+          .from(enrichmentDispatches)
+          .leftJoin(
+            enrichmentRuns,
+            eq(enrichmentRuns.id, enrichmentDispatches.runId),
+          )
+          .where(
+            and(
+              eq(enrichmentDispatches.state, "delivered"),
+              lte(enrichmentDispatches.deliveredAt, reconciliationCutoff),
+              or(
+                isNull(enrichmentRuns.id),
+                inArray(enrichmentRuns.status, ["pending", "running"]),
+              ),
+            ),
+          )
+          .orderBy(
+            asc(enrichmentDispatches.deliveredAt),
+            asc(enrichmentDispatches.id),
+          )
+          .limit(DELIVERED_RUN_RECONCILIATION_LIMIT);
+  const terminalCandidates: Array<
+    Omit<(typeof candidates)[number], "triggerRunId"> & {
+      triggerRunId: string;
+      triggerStatus: string;
+    }
+  > = [];
+  let inspected = 0;
+  let inspectionFailures = 0;
+  for (const candidate of candidates) {
+    if (candidate.triggerRunId === null) {
+      inspectionFailures += 1;
+      continue;
+    }
+    try {
+      const triggerRun = await readTriggerRun?.(candidate.triggerRunId);
+      if (
+        triggerRun === undefined ||
+        !/^[A-Z_]{1,50}$/.test(triggerRun.status) ||
+        typeof triggerRun.isCompleted !== "boolean" ||
+        typeof triggerRun.isCancelled !== "boolean"
+      ) {
+        inspectionFailures += 1;
+        continue;
+      }
+      inspected += 1;
+      if (triggerRun.isCompleted || triggerRun.isCancelled)
+        terminalCandidates.push({
+          ...candidate,
+          triggerRunId: candidate.triggerRunId,
+          triggerStatus: triggerRun.status,
+        });
+    } catch {
+      inspectionFailures += 1;
+    }
+  }
+
   return database.transaction(async (transaction) => {
     const recovered = await transaction
       .update(enrichmentDispatches)
@@ -2276,6 +2356,90 @@ export const recoverEnrichmentDispatches = async (
         ),
       )
       .returning({ id: enrichmentDispatches.id });
+    let reconciled = 0;
+    for (const candidate of terminalCandidates) {
+      if (
+        !enrichmentProviders.includes(candidate.provider as EnrichmentProvider)
+      )
+        throw new EnrichmentStoreError("invalid_dispatch");
+      const provider = candidate.provider as EnrichmentProvider;
+      await transaction.execute(
+        sql`select pg_advisory_xact_lock(hashtext(${candidate.runId}))`,
+      );
+      const [dispatch] = await transaction
+        .select({ id: enrichmentDispatches.id })
+        .from(enrichmentDispatches)
+        .where(
+          and(
+            eq(enrichmentDispatches.id, candidate.dispatchId),
+            eq(enrichmentDispatches.state, "delivered"),
+            eq(enrichmentDispatches.triggerRunId, candidate.triggerRunId),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      if (dispatch === undefined) continue;
+
+      const [existing] = await transaction
+        .select({
+          profileId: enrichmentRuns.profileId,
+          provider: enrichmentRuns.provider,
+          status: enrichmentRuns.status,
+        })
+        .from(enrichmentRuns)
+        .where(eq(enrichmentRuns.id, candidate.runId))
+        .limit(1);
+      if (
+        existing !== undefined &&
+        (existing.profileId !== candidate.profileId ||
+          existing.provider !== provider)
+      )
+        throw new EnrichmentStoreError("run_id_collision");
+      const error = `Trigger run ended with ${candidate.triggerStatus} before enrichment completed`;
+      if (existing === undefined) {
+        const [created] = await transaction
+          .insert(enrichmentRuns)
+          .values({
+            id: candidate.runId,
+            profileId: candidate.profileId,
+            provider,
+            status: "failed",
+            pipelineVersion:
+              provider === "github"
+                ? githubConfiguration.pipelineVersion
+                : provider === "tikhub"
+                  ? tikHubConfiguration.pipelineVersion
+                  : deeplineConfiguration.pipelineVersion,
+            startedAt: candidate.deliveredAt ?? now,
+            finishedAt: now,
+            error,
+          })
+          .onConflictDoNothing()
+          .returning({ id: enrichmentRuns.id });
+        if (created !== undefined) {
+          reconciled += 1;
+          continue;
+        }
+      }
+      const [updated] = await transaction
+        .update(enrichmentRuns)
+        .set({
+          status: "failed",
+          stage: null,
+          error,
+          finishedAt: now,
+        })
+        .where(
+          and(
+            eq(enrichmentRuns.id, candidate.runId),
+            eq(enrichmentRuns.profileId, candidate.profileId),
+            eq(enrichmentRuns.provider, provider),
+            inArray(enrichmentRuns.status, ["pending", "running"]),
+          ),
+        )
+        .returning({ id: enrichmentRuns.id });
+      if (updated !== undefined) reconciled += 1;
+    }
     const cancelled = await transaction
       .update(enrichmentDispatches)
       .set({
@@ -2292,7 +2456,13 @@ export const recoverEnrichmentDispatches = async (
         ),
       )
       .returning({ id: enrichmentDispatches.id });
-    return { recovered: recovered.length, cancelled: cancelled.length };
+    return {
+      recovered: recovered.length,
+      cancelled: cancelled.length,
+      inspected,
+      inspectionFailures,
+      reconciled,
+    };
   });
 };
 

@@ -5,7 +5,10 @@ const mocks = vi.hoisted(() => ({
   fetch: vi.fn(),
 }));
 
-vi.mock("@clerk/nextjs/server", () => ({ auth: mocks.auth }));
+vi.mock("@clerk/nextjs/server", () => ({
+  auth: mocks.auth,
+  clerkMiddleware: (handler: unknown) => handler,
+}));
 vi.mock("@/env", () => ({
   env: {
     HUMANS_API_URL: "https://worker.example",
@@ -24,6 +27,7 @@ import {
   protectedProxyHeaders,
   protectedResponseHeaders,
 } from "../app/api/proxy-security";
+import { apiProxyHeaders } from "../proxy";
 
 const validPublicProfileRequest = {
   profileReference: "11111111-1111-4111-8111-111111111111",
@@ -67,10 +71,14 @@ describe("protected web proxies", () => {
 
     expect(protectedProxyHeaders(request, "session-token")).toMatchObject({
       authorization: "Bearer session-token",
-      "X-Correlation-ID": "request-correlation",
       "X-Humans-Client-IP": "203.0.113.4",
       "X-Humans-Web-Proxy": "server-owned-proxy-secret",
     });
+    expect(
+      protectedProxyHeaders(request, "session-token")["X-Correlation-ID"],
+    ).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
     expect(protectedLocalResponseHeaders()).toEqual({
       "cache-control": "private, no-store",
       "x-robots-tag": "noindex, nofollow",
@@ -93,6 +101,27 @@ describe("protected web proxies", () => {
       "X-Correlation-ID": "response-correlation",
       "x-robots-tag": "noindex, nofollow",
     });
+  });
+
+  it("strips public-form attestations at the generic API ingress", () => {
+    const headers = apiProxyHeaders(
+      new Request("https://api.humans.crafter.run/v1/public/profile-requests", {
+        headers: {
+          host: "api.humans.crafter.run",
+          "X-Correlation-ID": "attacker-controlled",
+          "X-Humans-Internal-MCP": "forged-mcp-token",
+          "X-Humans-Public-Profile-Request": "verified",
+          "X-Humans-Web-Proxy": "forged-secret",
+          "X-Vercel-Forwarded-For": "203.0.113.4, 198.51.100.7",
+        },
+      }),
+    );
+
+    expect(headers.get("X-Humans-Internal-MCP")).toBeNull();
+    expect(headers.get("X-Humans-Public-Profile-Request")).toBeNull();
+    expect(headers.get("X-Humans-Web-Proxy")).toBe("server-owned-proxy-secret");
+    expect(headers.get("X-Humans-Client-IP")).toBe("203.0.113.4");
+    expect(headers.get("X-Correlation-ID")).not.toBe("attacker-controlled");
   });
 
   it("rejects paths outside the Contact Reveal allowlist", async () => {
@@ -192,7 +221,9 @@ describe("protected web proxies", () => {
         action: "different_action",
       },
     ]) {
-      mocks.fetch.mockResolvedValueOnce(Response.json(verification));
+      mocks.fetch
+        .mockResolvedValueOnce(new Response(null, { status: 204 }))
+        .mockResolvedValueOnce(Response.json(verification));
 
       const response = await proxyPublicProfileRequest(
         publicProfileRequest({
@@ -206,19 +237,69 @@ describe("protected web proxies", () => {
         error: { code: "verification_failed" },
       });
     }
-    expect(mocks.fetch).toHaveBeenCalledTimes(4);
+    expect(mocks.fetch).toHaveBeenCalledTimes(8);
+  });
+
+  it("reports Turnstile configuration and provider failures as unavailable", async () => {
+    for (const verification of [
+      { success: false, "error-codes": ["invalid-input-secret"] },
+      { success: false, "error-codes": ["bad-request"] },
+      { success: false, "error-codes": ["internal-error"] },
+      { success: false },
+    ]) {
+      mocks.fetch
+        .mockResolvedValueOnce(new Response(null, { status: 204 }))
+        .mockResolvedValueOnce(Response.json(verification));
+
+      const response = await proxyPublicProfileRequest(
+        publicProfileRequest({
+          ...validPublicProfileRequest,
+          turnstileToken,
+        }),
+      );
+
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "verification_unavailable" },
+      });
+    }
+  });
+
+  it("stops at the distributed verification preflight limit", async () => {
+    mocks.fetch.mockResolvedValueOnce(
+      Response.json(
+        { error: { code: "rate_limited", message: "Too many requests" } },
+        { status: 429, headers: { "RateLimit-Remaining": "0" } },
+      ),
+    );
+
+    const response = await proxyPublicProfileRequest(
+      publicProfileRequest({
+        ...validPublicProfileRequest,
+        turnstileToken,
+      }),
+    );
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("RateLimit-Remaining")).toBe("0");
+    expect(mocks.fetch).toHaveBeenCalledOnce();
+    expect(mocks.fetch.mock.calls[0]?.[0]).toBe(
+      "https://worker.example/v1/internal/public-profile-request-verifications",
+    );
   });
 
   it("fails closed when Siteverify exceeds its timeout", async () => {
     vi.useFakeTimers();
-    mocks.fetch.mockImplementationOnce(
-      (_url: string, init?: RequestInit) =>
-        new Promise((_resolve, reject) => {
-          init?.signal?.addEventListener("abort", () => {
-            reject(new DOMException("The request was aborted", "AbortError"));
-          });
-        }),
-    );
+    mocks.fetch
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockImplementationOnce(
+        (_url: string, init?: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => {
+              reject(new DOMException("The request was aborted", "AbortError"));
+            });
+          }),
+      );
 
     const pendingResponse = proxyPublicProfileRequest(
       publicProfileRequest({
@@ -234,11 +315,12 @@ describe("protected web proxies", () => {
     await expect(response.json()).resolves.toMatchObject({
       error: { code: "verification_unavailable" },
     });
-    expect(mocks.fetch).toHaveBeenCalledOnce();
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
   });
 
   it("verifies trusted request metadata and strips the token before proxying", async () => {
     mocks.fetch
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
       .mockResolvedValueOnce(
         Response.json({
           success: true,
@@ -268,9 +350,21 @@ describe("protected web proxies", () => {
     expect(response.status).toBe(202);
     expect(response.headers.get("cache-control")).toBe("private, no-store");
     expect(response.headers.get("RateLimit-Remaining")).toBe("4");
-    expect(mocks.fetch).toHaveBeenCalledTimes(2);
+    expect(mocks.fetch).toHaveBeenCalledTimes(3);
 
-    const [siteverifyUrl, siteverifyInit] = mocks.fetch.mock.calls[0] as [
+    const [preflightUrl, preflightInit] = mocks.fetch.mock.calls[0] as [
+      string,
+      RequestInit,
+    ];
+    expect(preflightUrl).toBe(
+      "https://worker.example/v1/internal/public-profile-request-verifications",
+    );
+    const preflightHeaders = new Headers(preflightInit.headers);
+    expect(preflightHeaders.get("X-Humans-Public-Profile-Request")).toBe(
+      "verification",
+    );
+
+    const [siteverifyUrl, siteverifyInit] = mocks.fetch.mock.calls[1] as [
       string,
       RequestInit,
     ];
@@ -283,7 +377,7 @@ describe("protected web proxies", () => {
     expect(siteverifyBody.get("response")).toBe(turnstileToken);
     expect(siteverifyBody.get("remoteip")).toBe("203.0.113.4");
 
-    const [workerUrl, workerInit] = mocks.fetch.mock.calls[1] as [
+    const [workerUrl, workerInit] = mocks.fetch.mock.calls[2] as [
       string,
       RequestInit,
     ];
@@ -296,6 +390,12 @@ describe("protected web proxies", () => {
     expect(workerHeaders.get("X-Humans-Client-IP")).toBe("203.0.113.4");
     expect(workerHeaders.get("X-Humans-Web-Proxy")).toBe(
       "server-owned-proxy-secret",
+    );
+    expect(workerHeaders.get("X-Humans-Public-Profile-Request")).toBe(
+      "verified",
+    );
+    expect(workerHeaders.get("X-Correlation-ID")).toBe(
+      preflightHeaders.get("X-Correlation-ID"),
     );
   });
 
@@ -338,5 +438,6 @@ describe("protected web proxies", () => {
     expect(headers.get("authorization")).toBe("Bearer session-token");
     expect(headers.get("Idempotency-Key")).toBe("reveal-attempt-a");
     expect(headers.get("X-Humans-Web-Proxy")).toBe("server-owned-proxy-secret");
+    expect(init.redirect).toBe("error");
   });
 });

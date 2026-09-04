@@ -34,6 +34,12 @@ without delegating or modifying the parent `crafter.run` nameservers. Staging
 uses the Clerk development instance; production uses the Clerk production
 instance.
 
+Vercel Preview must call
+`https://humans-api-preview.hi-541.workers.dev`; Vercel Production must call
+`https://humans-api-production.hi-541.workers.dev`. These exact hosts are pinned
+in application validation so Clerk and web-proxy credentials cannot be sent to
+another Workers account.
+
 Before deployment, verify every populated preview identifier differs from its
 production counterpart. A credential ID may be its dashboard label or last four
 characters, but must not be the credential itself.
@@ -61,27 +67,62 @@ Set each value independently in both deployed Worker environments:
 - `POLAR_BASE_URL` when billing is enabled
 - `POLAR_ORGANIZATION_ID` when billing is enabled
 - `POLAR_PRO_PRODUCT_ID` when billing is enabled
+- `POLAR_CUSTOMER_OWNER_EMAIL` when billing is enabled; use an operator-managed
+  service mailbox, never an Organization Member's address
 - `POLAR_USAGE_METER_ID` when billing is enabled
 - `POLAR_USAGE_EVENT_NAME` when billing is enabled
 - `POLAR_WEBHOOK_SECRET` when billing is enabled
 - `BILLING_APP_ORIGIN` when billing is enabled
+- `BILLING_APP_ORIGIN_ATTESTATION` in Preview only; never enter it manually
+- `BILLING_APP_ORIGIN_ATTESTATION_KEY` in Preview only; generated and rotated
+  atomically with the attestation, never enter it manually
+- `SENTRY_DSN`
+
+The Worker deploy command injects `SENTRY_RELEASE` from the clean Git `HEAD`.
+Do not set or override it manually.
 
 The committed Preview and Production Worker configuration sets
-`BILLING_REQUIRED=true`. `/health` fails closed unless every Polar setting is
-present and valid; local development may omit Polar entirely.
+`BILLING_REQUIRED=true`. `/health` fails closed unless every Polar setting,
+Clerk setting, signing secret, web-proxy secret, Sentry setting, and release SHA
+is present and structurally valid; local development may omit Polar entirely.
 
 From `apps/api`, use `bunx wrangler secret put <NAME> --env preview` or
 `bunx wrangler secret put <NAME> --env production`. `WEB_PROXY_SECRET` must
 match the corresponding Vercel environment and no other environment.
 
 Vercel requires `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`,
-`HUMANS_API_URL`, and `HUMANS_PROXY_SECRET` in separate Preview and Production
-scopes. Configure `apps/web` as the Vercel project root.
+`HUMANS_API_URL`, `HUMANS_PROXY_SECRET`, `SENTRY_AUTH_TOKEN`, `SENTRY_DSN`,
+`NEXT_PUBLIC_SENTRY_DSN`, and `NEXT_PUBLIC_SENTRY_ENVIRONMENT` in separate
+Preview and Production scopes. Configure `apps/web` as the Vercel project root;
+a Vercel build must use the matching direct `humans-api-<environment>.*.workers.dev`
+origin and never the public API alias, the other environment, or the local API
+URL default.
+
+`BILLING_APP_ORIGIN` is environment-bound. Production must use
+`https://humans.crafter.run`; Preview must use the immutable
+`https://humans-<deployment>-crafter-station.vercel.app` URL from the candidate
+Preview deployment. The API rejects a deployed Preview origin outside that
+exact project hostname pattern and rejects any Production origin other than the
+public Humans hostname. Preview must use Polar Sandbox, while Production must
+use Polar Production.
+
+Set the Preview origin only with `bun run configure:api:preview-origin` after
+`bun run verify:web:preview`. The command verifies the Vercel project, Preview
+target, immutable URL, and frozen SHA before writing both the origin and its
+release-bound signed attestation to Cloudflare. It rotates the HMAC key in the
+same atomic secret update. The attestation expires after seven days, and the
+command only attests a deployment created within the previous 24 hours.
+Preview readiness rejects a missing, expired, modified, Production-target, or
+different-deployment attestation; deploy a new Preview candidate rather than
+renewing an old attestation.
 
 Trigger.dev Preview uses the Production environment of the isolated
 `Humans Preview` project because the Free plan has no Staging environment.
 Production uses only the Production environment of the separate `Humans`
-project. Each requires its own database, provider, Polar, and Sentry settings.
+project. Each requires its own `DATABASE_URL`, `GITHUB_ENRICHMENT_TOKEN`,
+`OPENAI_API_KEY`, `OPENAI_MODEL`, `TIKHUB_API_KEY`, `DEEPLINE_API_KEY`, Polar,
+and Sentry settings. The explicit deploy scripts reject a dirty worktree and
+inject the clean Git `HEAD` as `SENTRY_RELEASE` and Trigger external ID.
 Polar webhooks and Clerk webhooks must target only the Worker URL from their own
 environment.
 
@@ -91,14 +132,23 @@ and has no metered overage price. Confirm a successful subscription payment is
 the authority for each 1,000-Credit Pro grant; subscription-state notifications
 alone must not grant Credits. In both Polar environments, confirm **Allow
 multiple subscriptions** is disabled; the checkout route also refuses to create
-a session when Polar already reports an active Pro subscription.
+a session when Polar reports any nonterminal Pro subscription. Team Customers
+must use the configured service mailbox as owner; no Clerk Member may be a Polar
+owner or billing manager. Partial and full Order refunds are retained in the
+immutable webhook audit, but do not claw back Credits or change access by
+themselves; issue a corresponding Polar subscription cancellation or revocation
+when a refund should end access.
 
 ## Release procedure
 
-1. Record the commit SHA and complete the environment inventory.
+1. Disable Vercel automatic Git deployments before changing `main`; an
+   unreviewed push to the Production branch must not bypass this gate. Record
+   the commit SHA and complete the environment inventory.
 2. Run `bun install --frozen-lockfile` with Bun 1.3.14 and Node.js 24 or newer.
 3. Run `bun run check-types`, `bun run lint`, `bun run test`, and
-   `bun run build`.
+   `SKIP_ENV_VALIDATION=1 bun run build`. The bypass is valid only for the local
+   source build; every deployment command rejects it and every deployed build
+   validates its environment-bound credentials.
 4. Run `bun run --cwd packages/database db:rehearse`. This installs every
    migration into an empty pgvector database, upgrades the production-like
    previous schema, checks the `vector` extension, newest columns, and
@@ -112,30 +162,114 @@ a session when Polar already reports an active Pro subscription.
    Trigger.dev to the isolated Preview project with
    `bun run deploy:trigger:preview:dry-run`
    followed by `bun run deploy:trigger:preview`.
-7. Deploy the Worker with `bun run deploy:api:preview` and deploy the web app to
-   a Vercel preview from the same commit.
+7. Run `bun run deploy:web:preview`. The Vercel command refuses a dirty tree,
+   verifies automatic Git deployments remain disabled, targets Preview, and
+   deploys from the repository root into the configured `apps/web` Root
+   Directory. It injects the clean `HEAD` as `HUMANS_RELEASE` and explicitly
+   binds the build and runtime to Preview. Record the
+   immutable `humans-<deployment>-crafter-station.vercel.app` URL and deployment
+   ID. Set `HUMANS_RELEASE_SHA`, `HUMANS_VERCEL_DEPLOYMENT_ID`, and
+   `HUMANS_VERCEL_DEPLOYMENT_URL`, then run `bun run verify:web:preview`. This
+   verifies the exact Vercel project, owner, Preview target, READY state, Git
+   source SHA, and release metadata. Run
+   `bun run configure:api:preview-origin`; do not set `BILLING_APP_ORIGIN`
+   manually. Then run
+   `bun run deploy:api:preview`. Confirm the web and Worker responses expose the
+   same 40-character Git SHA in `X-Humans-Release`, and confirm the web response
+   exposes `X-Humans-Environment: preview`; do not trust a mutable branch alias.
+   This ordering resolves the Preview checkout-return URL without accepting a
+   mutable or cross-project origin.
 8. Verify `/health`, `/openapi.json`, `/docs`, `/mcp`, the protected web app,
    the representative CSV journey, API/MCP acceptance, and browser acceptance
-   in preview. Attach sanitized logs and test results to the release record.
-   Run `bun run test:browser -- --project=preview-chromium` with the Preview
-   Clerk test keys, `PLAYWRIGHT_PREVIEW_URL`, and a sanitized
-   `E2E_PROFILE_QUERY`. Supply an ephemeral
-   `VERCEL_AUTOMATION_BYPASS_SECRET`; Playwright sends it only in the initial
-   Preview request and asks Vercel to establish the follow-up navigation cookie.
-   Confirm teardown deletes the disposable Member and Organization, then revoke
-   the bypass and delete local browser artifacts.
-9. Apply migrations to production, run
-   `bun run deploy:trigger:production:dry-run` followed by
-   `bun run deploy:trigger:production`, then run
-   `bun run deploy:api:production` and promote the verified Vercel deployment.
-   Stop on any version or commit mismatch.
-10. Repeat the bounded health, API/MCP, indexing, and browser checks in
-     production. Roll back application deployments on failure; restore data only
+   in Preview. Attach sanitized logs and test results to the release record.
+   Provision a new verified Member whose personal Organization is Free, active,
+   has one Member, exactly 100 Credits, no existing API keys, and no prior
+   Contact Reveals. Keep the system Operator separate. Use one consented or
+   synthetic searchable Profile that is uniquely selected by the structured
+   query and has one unpurchased professional-email Observation and one
+   unpurchased direct-professional-phone Observation.
+
+   Set `HUMANS_ACCEPTANCE_API_URL`,
+   `HUMANS_ACCEPTANCE_ENVIRONMENT=preview`, `HUMANS_ACCEPTANCE_RELEASE`,
+   `HUMANS_ACCEPTANCE_RUN_ID` (a fresh UUID),
+   `HUMANS_ACCEPTANCE_ORGANIZATION_ID`,
+   `HUMANS_ACCEPTANCE_PROFILE_QUERY`, `HUMANS_ACCEPTANCE_PROFILE_ID`,
+   `HUMANS_ACCEPTANCE_EMAIL_OBSERVATION_ID`,
+   `HUMANS_ACCEPTANCE_PHONE_OBSERVATION_ID`,
+   `HUMANS_ACCEPTANCE_ADMIN_SESSION_ID`,
+   `HUMANS_ACCEPTANCE_OPERATOR_SESSION_ID`, and the Preview
+   `CLERK_SECRET_KEY`. The script mints short-lived session tokens, creates five
+   15-minute scoped Organization API keys, proves HTTP/MCP read, debit, replay,
+   insufficient-Credit, Contact Reveal, suspension, revocation, and rate-limit
+   parity, restores its temporary zero-Credit adjustment, and revokes every
+   run-owned key in `finally`. It spends exactly 17 Credits and permanently
+   purchases both fixture Contact Reveals, so delete the disposable Member and
+   Organization after the run; never reuse a partial-run fixture.
+
+   Run `bun run accept:web:preview` with the Preview Clerk test keys, immutable
+   `PLAYWRIGHT_PREVIEW_URL`, a sanitized `E2E_PROFILE_QUERY`, and
+   `E2E_RELEASE_SHA` set to the frozen commit. Supply ephemeral
+   `E2E_OPERATOR_IMPERSONATION_URL` and `VERCEL_AUTOMATION_BYPASS_SECRET`
+   values. Playwright sends the bypass only in the initial Preview request,
+   proves ordinary-Member Operator isolation, then impersonates the Operator to
+   enter the control room and apply and reverse an audited Credit adjustment on
+   the disposable browser Organization. The command first re-verifies the
+   deployment, runs deployed API/MCP acceptance and the complete dependent
+   Preview browser projects, then writes a mode-`600` receipt containing only
+   the accepted deployment identity. It logs no key, query, Profile result, or
+   Contact Detail. Confirm teardown deletes the disposable browser Member and
+   Organization, then revoke the bypass and impersonation URLs and delete local
+   browser artifacts.
+9. Apply migrations to Production. Set
+   `HUMANS_PRODUCTION_DEPLOY_CONFIRMATION=production:trigger:proj_umusurvkybxuonbiopal:<SHA>`,
+   run `bun run deploy:trigger:production:dry-run` followed by
+   `bun run deploy:trigger:production`, then replace the confirmation with
+   `production:api:humans-api-production:<SHA>` and run
+   `bun run deploy:api:production`. Each command rejects a confirmation for a
+   different service, target, or release. Verify Production `HUMANS_API_URL` is the
+   direct Production Worker origin, then run
+   `bun run deploy:web:production:stage`. This creates a Production-target
+   deployment with `--skip-domain`, Production variables, and the same frozen
+   Git SHA without changing public domains. Record and accept its immutable URL
+   and deployment ID. Set `HUMANS_RELEASE_SHA`,
+   `HUMANS_VERCEL_DEPLOYMENT_ID`, and `HUMANS_VERCEL_DEPLOYMENT_URL`, then run
+   `bun run verify:web:production`. The verifier additionally requires a
+   Production target with no assigned aliases, preventing a Preview rebuild or
+   old Production artifact from entering promotion. Accept that exact URL,
+   including `X-Humans-Environment: production`, the release header, protected
+   browser journey, and deployed API/MCP suite with
+   `HUMANS_ACCEPTANCE_ENVIRONMENT=production` and
+   `HUMANS_ACCEPTANCE_PRODUCTION_CONFIRMATION=production:<SHA>:<ORGANIZATION_ID>:<RUN_ID>:17:75`
+   by running
+   `bun run accept:web:production`. The command runs the deployed API/MCP suite
+   and `production-profile-control` Playwright journey and writes the exact
+   Production acceptance receipt only if both pass.
+   Supply the temporary Vercel bypass only for the immutable deployment URL.
+10. Promote the accepted staged Production deployment with
+    `bun run deploy:web:production:promote` with those same three identity
+    variables. The command reruns the deployment verifier and calls only
+    Vercel's direct Production alias endpoint; it refuses a missing, stale, or
+    different-deployment acceptance receipt and never invokes the CLI path that
+    rebuilds a Preview deployment. It polls the alias operation to success and
+    verifies the frozen release and Production environment headers through
+    `https://humans.crafter.run` before returning. Because the deployment
+    already targets Production, promotion assigns domains without a second
+    build. Preview and
+    Production are necessarily separate builds because Clerk and public Sentry
+    values are compiled into Next.js; the frozen SHA is the cross-environment
+    identity, while the staged Production deployment is the artifact promoted
+    unchanged. Fast-forward `main` to the same SHA only while automatic Git
+    deployments remain disabled. Stop on any version, commit, environment, or
+    deployment mismatch.
+11. Repeat the bounded health, API/MCP, indexing, and browser checks through
+      the public production domains. Roll back application deployments on failure; restore data only
      through a reviewed Neon recovery procedure.
      Generate a short-lived supported Clerk impersonation URL for the
      GitHub-connected represented Member and run
      `bun run test:browser -- --project=production-profile-control` with
-     `PLAYWRIGHT_PRODUCTION_URL` and `E2E_PROFILE_OWNER_IMPERSONATION_URL`.
+     `PLAYWRIGHT_PRODUCTION_URL`, `E2E_PROFILE_OWNER_IMPERSONATION_URL`, and the
+      same `E2E_RELEASE_SHA`. The pre-promotion run may use the immutable staged
+      Production URL; the post-promotion run uses `https://humans.crafter.run`.
      Tracing is disabled for this project; confirm the suite restores the
      original Searchability and signs out the impersonation. Run this only for
      the intended represented Member: an initial successful claim is durable
@@ -189,7 +323,8 @@ sanitized fixture.
 - [ ] No inferred or unverified Contact Detail shipped.
 - [ ] No externally accessible or indexable Profile shipped.
 
-Release commit: `939e889`
+Accepted release commit: none. The identities below are historical setup
+evidence and are not accepted for the current candidate.
 
 Preview evidence: Vercel `dpl_6kpu7sXEZukyEpLCEREbiB3oH2U5`; Worker code
 `8e7f59e9-37ee-4677-a9f2-5c472a35afba`, with rotated-secret version

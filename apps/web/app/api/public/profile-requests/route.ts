@@ -13,6 +13,12 @@ const maximumTurnstileTokenLength = 2_048;
 const turnstileTimeoutMilliseconds = 3_000;
 const turnstileSiteverifyUrl =
   "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+const publicProfileRequestStageHeader = "X-Humans-Public-Profile-Request";
+const userTurnstileErrors = new Set([
+  "invalid-input-response",
+  "missing-input-response",
+  "timeout-or-duplicate",
+]);
 
 type TurnstileVerification = "failed" | "unavailable" | "verified";
 
@@ -38,6 +44,23 @@ export const POST = async (request: Request) => {
     return verificationFailed();
   }
 
+  const proxyHeaders = publicProxyHeaders(request);
+  const preflight = await fetch(
+    `${env.HUMANS_API_URL}/v1/internal/public-profile-request-verifications`,
+    {
+      method: "POST",
+      headers: {
+        ...proxyHeaders,
+        [publicProfileRequestStageHeader]: "verification",
+      },
+      cache: "no-store",
+      redirect: "error",
+    },
+  ).catch(() => null);
+  if (preflight === null) return proxyUnavailable();
+  if (preflight.status === 429) return proxiedResponse(preflight);
+  if (preflight.status !== 204) return proxyUnavailable();
+
   const verification = await verifyTurnstile(
     token,
     new URL(request.url).hostname,
@@ -58,19 +81,18 @@ export const POST = async (request: Request) => {
     `${env.HUMANS_API_URL}/v1/public/profile-requests`,
     {
       method: "POST",
-      headers: publicProxyHeaders(request, {
+      headers: {
+        ...proxyHeaders,
         "content-type": "application/json",
-      }),
+        [publicProfileRequestStageHeader]: "verified",
+      },
       body: proxiedBody,
       cache: "no-store",
       redirect: "error",
     },
   ).catch(() => null);
   if (response === null) return proxyUnavailable();
-  return new Response(response.body, {
-    status: response.status,
-    headers: protectedResponseHeaders(response),
-  });
+  return proxiedResponse(response);
 };
 
 const parseObject = (body: string): Record<string, unknown> | null => {
@@ -113,11 +135,20 @@ const verifyTurnstile = async (
     const result = (await response.json().catch(() => null)) as unknown;
     if (typeof result !== "object" || result === null) return "unavailable";
     const verification = result as Record<string, unknown>;
-    return verification.success === true &&
-      verification.hostname === expectedHostname &&
-      verification.action === profileRequestTurnstileAction
-      ? "verified"
-      : "failed";
+    if (verification.success === true) {
+      return verification.hostname === expectedHostname &&
+        verification.action === profileRequestTurnstileAction
+        ? "verified"
+        : "failed";
+    }
+    const errorCodes = verification["error-codes"];
+    return Array.isArray(errorCodes) &&
+      errorCodes.length > 0 &&
+      errorCodes.every(
+        (error) => typeof error === "string" && userTurnstileErrors.has(error),
+      )
+      ? "failed"
+      : "unavailable";
   } catch {
     return "unavailable";
   } finally {
@@ -168,3 +199,9 @@ const proxyUnavailable = () =>
     },
     { status: 503, headers: protectedLocalResponseHeaders() },
   );
+
+const proxiedResponse = (response: Response) =>
+  new Response(response.body, {
+    status: response.status,
+    headers: protectedResponseHeaders(response),
+  });

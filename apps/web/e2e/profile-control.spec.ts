@@ -1,90 +1,122 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 
-test("a represented Member can claim a Profile and control Searchability", async ({
-  page,
-}) => {
-  let originalSearchability: boolean | undefined;
-  const impersonationUrl = requiredEnvironment(
-    "E2E_PROFILE_OWNER_IMPERSONATION_URL",
-  );
+import {
+  prepareDeploymentContext,
+  requiredClerkId,
+  requiredHttpsUrl,
+} from "./deployment";
+import {
+  assertFreshExpectedClaimFixture,
+  authenticateImpersonatedMember,
+  readControlledProfile,
+  restoreRecordedSearchability,
+} from "./profile-control-helpers";
+import {
+  profileControlContractFromEnvironment,
+  writeProfileControlState,
+} from "./profile-control-state";
+
+test.afterEach(async ({ page }) => {
+  const contract = profileControlContractFromEnvironment();
   try {
-    await page.goto("/");
-    await page.evaluate((url) => window.location.assign(url), impersonationUrl);
-    await page.waitForFunction(() => Boolean(window.Clerk?.user?.id));
-    await page.goto("/workspace?view=profile");
-
-    const profileHeading = page.getByRole("heading", { name: /^Profile for / });
-    const claim = page.getByRole("button", {
-      name: "Verify and claim this Profile",
-    });
-    await expect(profileHeading.or(claim)).toBeVisible();
-    if (await claim.isVisible()) {
-      await claim.click();
-      await expect(
-        page.getByText(
-          "Your claim is verified. Review the Imported Profile before opting in.",
-        ),
-      ).toBeVisible();
-    }
-    await expect(profileHeading).toBeVisible();
-    originalSearchability = await readSearchability(page);
-
-    const toggleName = originalSearchability
-      ? "Stop appearing in searches"
-      : "Appear in searches";
-    await page.getByRole("button", { name: toggleName }).click();
-    await expect(
-      page.getByText(
-        originalSearchability
-          ? "Your Profile was removed from searches immediately."
-          : "Your Profile now appears in authenticated Humans searches.",
-      ),
-    ).toBeVisible();
-    await page
-      .getByRole("button", {
-        name: originalSearchability
-          ? "Appear in searches"
-          : "Stop appearing in searches",
-      })
-      .click();
-    await expect
-      .poll(() => readSearchability(page))
-      .toBe(originalSearchability);
+    await restoreRecordedSearchability(page, contract);
   } finally {
-    if (originalSearchability !== undefined) {
-      await restoreSearchability(page, originalSearchability);
-    }
     await page.evaluate(() => window.Clerk?.signOut()).catch(() => undefined);
   }
 });
 
-const readSearchability = (page: Page) =>
-  page.evaluate(async () => {
-    const response = await fetch("/api/profile", { cache: "no-store" });
-    const result = (await response.json()) as {
-      profile?: { searchable?: boolean };
-    };
-    if (!response.ok || typeof result.profile?.searchable !== "boolean") {
-      throw new Error("The represented Profile could not be read");
-    }
-    return result.profile.searchable;
+test("a represented Member claims the expected Profile and controls Searchability", async ({
+  page,
+}) => {
+  const contract = profileControlContractFromEnvironment();
+  if (
+    requiredClerkId("E2E_PRODUCTION_MEMBER_ID", "user") === contract.memberId
+  ) {
+    throw new Error(
+      "Production core and Profile-owner fixtures must be distinct Members",
+    );
+  }
+  const impersonationUrl = requiredHttpsUrl(
+    "E2E_PROFILE_OWNER_IMPERSONATION_URL",
+  );
+  const cleanupImpersonationUrl = requiredHttpsUrl(
+    "E2E_PROFILE_OWNER_CLEANUP_IMPERSONATION_URL",
+  );
+  const coreImpersonationUrl = requiredHttpsUrl(
+    "E2E_PRODUCTION_MEMBER_IMPERSONATION_URL",
+  );
+  if (
+    new Set([cleanupImpersonationUrl, coreImpersonationUrl, impersonationUrl])
+      .size !== 3
+  ) {
+    throw new Error(
+      "Production browser acceptance requires separate impersonation URLs",
+    );
+  }
+  const deployment = await prepareDeploymentContext(
+    page.context(),
+    "production",
+  );
+  if (deployment.url.href !== contract.deploymentUrl) {
+    throw new Error("Profile control deployment identity changed");
+  }
+  await authenticateImpersonatedMember(
+    page,
+    contract.deploymentUrl,
+    impersonationUrl,
+    contract.memberId,
+  );
+
+  // A surviving record from an interrupted run is restored before freshness is checked.
+  await restoreRecordedSearchability(page, contract);
+  await page.goto(new URL("/workspace?view=profile", deployment.url).href);
+  await assertFreshExpectedClaimFixture(page, contract);
+
+  const claim = page.getByRole("button", {
+    name: "Verify and claim this Profile",
   });
+  await expect(claim).toBeVisible();
+  await claim.click();
+  await expect(
+    page.getByText(
+      "Your claim is verified. Review the Imported Profile before opting in.",
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: /^Profile for / }),
+  ).toBeVisible();
 
-const restoreSearchability = async (page: Page, searchable: boolean) => {
-  if ((await readSearchability(page)) === searchable) return;
-  await page.evaluate(async (nextSearchability) => {
-    const response = await fetch("/api/profile", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ searchable: nextSearchability }),
-    });
-    if (!response.ok)
-      throw new Error("Profile Searchability restoration failed");
-  }, searchable);
-};
+  const controlled = await readControlledProfile(page);
+  if (controlled?.memberId !== contract.memberId) {
+    throw new Error("The expected Member did not control the claimed Profile");
+  }
+  if (controlled.searchable) {
+    throw new Error(
+      "A freshly claimed Profile must begin opted out of searches",
+    );
+  }
+  writeProfileControlState(contract, controlled.searchable);
 
-const requiredEnvironment = (name: string) => {
-  const value = process.env[name]?.trim();
-  if (!value) throw new Error(`${name} is required for browser acceptance`);
-  return value;
+  await page.getByRole("button", { name: "Appear in searches" }).click();
+  await expect(
+    page.getByText(
+      "Your Profile now appears in authenticated Humans searches.",
+    ),
+  ).toBeVisible();
+  await expect.poll(() => readSearchability(page)).toBe(true);
+
+  await page
+    .getByRole("button", { name: "Stop appearing in searches" })
+    .click();
+  await expect(
+    page.getByText("Your Profile was removed from searches immediately."),
+  ).toBeVisible();
+  await expect.poll(() => readSearchability(page)).toBe(false);
+});
+
+const readSearchability = async (page: import("@playwright/test").Page) => {
+  const profile = await readControlledProfile(page);
+  if (profile === null)
+    throw new Error("The controlled Profile is unavailable");
+  return profile.searchable;
 };

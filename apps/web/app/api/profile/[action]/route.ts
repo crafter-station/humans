@@ -47,6 +47,7 @@ const proxy = async (
       ),
       body: request.method === "GET" ? undefined : await request.text(),
       cache: "no-store",
+      redirect: "error",
     },
   );
   return new Response(response.body, {
