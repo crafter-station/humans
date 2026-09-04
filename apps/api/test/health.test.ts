@@ -1280,6 +1280,47 @@ describe("Humans API", () => {
     expect(oversized.status).toBe(413);
   });
 
+  it("requires the exact web proxy secret for public Profile requests when configured", async () => {
+    const bindings = {
+      WEB_PROXY_SECRET: "server-owned-proxy-secret",
+    } as Bindings;
+
+    for (const suppliedSecret of [
+      undefined,
+      "forged-secret",
+      "SERVER-OWNED-PROXY-SECRET",
+    ]) {
+      const response = await postPublicProfileRequest(
+        app,
+        crypto.randomUUID(),
+        "correction",
+        "198.51.100.101",
+        bindings,
+        suppliedSecret,
+      );
+      expect(response.status).toBe(403);
+    }
+
+    const misconfiguredDeployment = await postPublicProfileRequest(
+      app,
+      crypto.randomUUID(),
+      "correction",
+      "198.51.100.101",
+      { SENTRY_ENVIRONMENT: "production" } as Bindings,
+    );
+    expect(misconfiguredDeployment.status).toBe(403);
+
+    const proxied = await postPublicProfileRequest(
+      app,
+      crypto.randomUUID(),
+      "correction",
+      "198.51.100.101",
+      bindings,
+      bindings.WEB_PROXY_SECRET,
+    );
+    expect(proxied.status).toBe(202);
+  });
+
   it("verifies and translates signed Clerk webhooks", async () => {
     const secret = `whsec_${Buffer.alloc(32, 7).toString("base64")}`;
     const timestamp = new Date();
@@ -2430,6 +2471,7 @@ const postPublicProfileRequest = (
   kind: "correction" | "removal",
   ip: string,
   bindings?: Bindings,
+  proxySecret?: string,
 ) =>
   app.request(
     "/v1/public/profile-requests",
@@ -2438,6 +2480,9 @@ const postPublicProfileRequest = (
       headers: {
         "CF-Connecting-IP": ip,
         "content-type": "application/json",
+        ...(proxySecret === undefined
+          ? {}
+          : { "X-Humans-Web-Proxy": proxySecret }),
       },
       body: JSON.stringify({
         profileReference,

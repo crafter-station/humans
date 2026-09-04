@@ -663,6 +663,17 @@ export const createApp = (
 
   app.post("/v1/public/profile-requests", async (context) => {
     privateResponse(context);
+    const deployed =
+      context.env?.SENTRY_ENVIRONMENT === "preview" ||
+      context.env?.SENTRY_ENVIRONMENT === "production";
+    if (
+      (deployed || context.env?.WEB_PROXY_SECRET !== undefined) &&
+      (context.env?.WEB_PROXY_SECRET === undefined ||
+        context.req.header("X-Humans-Web-Proxy") !==
+          context.env.WEB_PROXY_SECRET)
+    ) {
+      return publicProfileRequestForbidden(context);
+    }
     const limited = await enforcePublicProfileRequestRateLimit(context);
     if (limited instanceof Response) return limited;
 
@@ -2780,6 +2791,17 @@ const acceptedPublicProfileRequest = (context: Context) => {
     202,
   );
 };
+
+const publicProfileRequestForbidden = (context: Context) =>
+  context.json(
+    {
+      error: {
+        code: "forbidden",
+        message: "Request origin is not allowed",
+      },
+    },
+    403,
+  );
 
 const requestTooLarge = (context: Context) =>
   context.json(

@@ -23,17 +23,18 @@ export const protectedLocalResponseHeaders = () => ({
   "x-robots-tag": "noindex, nofollow",
 });
 
+export const trustedClientIp = (request: Request) =>
+  request.headers.get("X-Vercel-Forwarded-For")?.split(",")[0]?.trim() ||
+  undefined;
+
 const proxyMetadataHeaders = (request: Request) => {
   const correlationId =
     request.headers.get("X-Correlation-ID")?.slice(0, 200) ??
     crypto.randomUUID();
-  const clientIp =
-    request.headers.get("X-Vercel-Forwarded-For")?.split(",")[0]?.trim() ??
-    "unknown";
   return {
     "X-Correlation-ID": correlationId,
     "X-Humans-Web-Proxy": env.HUMANS_PROXY_SECRET,
-    "X-Humans-Client-IP": clientIp,
+    "X-Humans-Client-IP": trustedClientIp(request) ?? "unknown",
   };
 };
 
