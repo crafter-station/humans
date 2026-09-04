@@ -4,6 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "acceptance:deployed": "node scripts/deployed-acceptance.mjs",
     "build": "wrangler deploy --dry-run --env='' --outdir dist",
     "deploy:preview": "node scripts/deploy-with-sentry.mjs preview humans-preview",
     "deploy:production": "node scripts/deploy-with-sentry.mjs production humans",

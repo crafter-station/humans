@@ -4,6 +4,12 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "accept:preview": "node scripts/accept-deployment.mjs preview",
+    "accept:production": "node scripts/accept-deployment.mjs production",
+    "configure:preview-origin": "node scripts/configure-preview-origin.mjs",
+    "deploy:preview": "node scripts/deploy.mjs preview",
+    "deploy:production:stage": "node scripts/deploy.mjs production",
+    "deploy:production:promote": "node scripts/promote-production.mjs",
     "dev": "next dev --port 3000",
     "build": "next build",
     "start": "next start",
@@ -11,7 +17,9 @@
     "lint": "biome lint .",
     "check-types": "SKIP_ENV_VALIDATION=1 next typegen && node ../../node_modules/@typescript/native/bin/tsc --noEmit",
     "test": "vitest run test",
-    "test:browser": "playwright test"
+    "test:browser": "playwright test",
+    "verify:preview": "node scripts/verify-deployment.mjs preview",
+    "verify:production": "node scripts/verify-deployment.mjs production"
   },
   "dependencies": {
     "@clerk/nextjs": "7.8.4",
