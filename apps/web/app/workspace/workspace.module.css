@@ -67,25 +67,9 @@
   background: var(--card);
 }
 
-.billingActions button {
-  min-height: 38px;
-  padding: 9px 12px;
-  color: var(--foreground);
-  white-space: nowrap;
-  background: transparent;
-  border: 1px solid var(--input);
-  cursor: pointer;
-}
-
-.billingActions button:first-child {
-  color: var(--primary-foreground);
-  background: var(--primary);
-  border-color: var(--primary);
-}
-
-.billingActions button:disabled {
-  cursor: wait;
-  opacity: 0.65;
+.billingPanel > .billingActions:only-child {
+  grid-column: 1 / -1;
+  justify-content: space-between;
 }
 
 .billingMessage {
@@ -102,14 +86,6 @@
   gap: 14px;
   padding: clamp(70px, 15vh, 150px) 0;
   color: var(--muted-foreground);
-}
-
-:global(.workspaceReadiness button) {
-  padding: 10px 14px;
-  color: var(--primary-foreground);
-  background: var(--primary);
-  border: 0;
-  cursor: pointer;
 }
 
 .content {
@@ -168,18 +144,11 @@
 }
 :global(.choice) {
   min-height: 180px;
+  height: auto;
+  align-items: stretch;
+  flex-direction: column;
   padding: 28px;
-  color: inherit;
   text-align: left;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  cursor: pointer;
-}
-:global(.choice.accent) {
-  background: var(--primary);
-  border-color: var(--primary);
-  color: var(--primary-foreground);
 }
 :global(.choice strong) {
   display: block;
@@ -190,17 +159,6 @@
 :global(.lede) {
   color: var(--muted-foreground);
   line-height: 1.5;
-}
-:global(.choice.accent span) {
-  color: var(--primary-foreground);
-}
-:global(.textAction) {
-  margin-top: 26px;
-  padding: 0;
-  color: var(--primary);
-  background: none;
-  border: 0;
-  cursor: pointer;
 }
 :global(.profileFlow) {
   max-width: 760px;
@@ -225,20 +183,6 @@
 :global(.profileFlow label span) {
   color: var(--muted-foreground);
 }
-:global(.profileFlow input),
-:global(.profileFlow select),
-:global(.profileFlow textarea) {
-  width: 100%;
-  padding: 13px 14px;
-  color: var(--foreground);
-  background: var(--background);
-  border: 1px solid var(--input);
-  border-radius: 2px;
-  font: inherit;
-}
-:global(.profileFlow textarea) {
-  resize: vertical;
-}
 :global(.split) {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -250,9 +194,6 @@
   align-items: start;
   line-height: 1.4;
 }
-:global(.profileFlow .check input) {
-  margin-top: 2px;
-}
 :global(.githubNote) {
   color: var(--muted-foreground);
   font-size: 0.85rem;
@@ -263,22 +204,6 @@
   gap: 12px;
   margin-top: 8px;
 }
-:global(.formActions button),
-:global(.published button),
-:global(.privateProfile button),
-:global(.claimCard button),
-:global(.referenceClaim button) {
-  padding: 12px 16px;
-  color: var(--foreground);
-  background: transparent;
-  border: 1px solid var(--input);
-  cursor: pointer;
-}
-:global(.formActions .publish) {
-  color: var(--primary-foreground);
-  background: var(--primary);
-  border-color: var(--primary);
-}
 :global(.published) {
   display: flex;
   justify-content: space-between;
@@ -288,10 +213,6 @@
   padding: 14px 16px;
   color: var(--foreground);
   background: var(--muted);
-}
-:global(.published button) {
-  color: var(--foreground);
-  border-color: var(--border);
 }
 :global(.privateProfile) {
   display: flex;
@@ -324,13 +245,6 @@
 :global(.referenceClaim p:not(.eyebrow)) {
   color: var(--muted-foreground);
   line-height: 1.5;
-}
-:global(.claimCard button),
-:global(.referenceClaim button) {
-  width: fit-content;
-  color: var(--primary-foreground);
-  background: var(--primary);
-  border-color: var(--primary);
 }
 :global(.pendingClaim) {
   border-color: var(--border);
@@ -368,15 +282,6 @@
   font-size: 0.82rem;
   line-height: 1.4;
 }
-:global(.contactPrivacy button) {
-  padding: 10px 12px;
-  color: var(--destructive);
-  white-space: nowrap;
-  background: transparent;
-  border: 1px solid var(--destructive);
-  cursor: pointer;
-}
-
 :global(.searchWorkspace) {
   padding: 58px 0 80px;
 }
@@ -393,15 +298,6 @@
   font-weight: 560;
   letter-spacing: -0.065em;
   line-height: 0.92;
-}
-:global(.profileLink) {
-  padding: 0 0 4px;
-  color: var(--primary);
-  white-space: nowrap;
-  background: none;
-  border: 0;
-  border-bottom: 1px solid currentColor;
-  cursor: pointer;
 }
 :global(.searchActions) {
   display: flex;
@@ -422,21 +318,6 @@
   font: 600 0.6rem / 1 var(--font-geist-mono);
   letter-spacing: 0.07em;
   text-transform: uppercase;
-}
-:global(.savedListControls select),
-:global(.savedListControls button) {
-  min-height: 34px;
-  padding: 7px 9px;
-  color: var(--foreground);
-  background: var(--card);
-  border: 1px solid var(--input);
-}
-:global(.savedListControls button) {
-  cursor: pointer;
-}
-:global(.savedListControls button:disabled) {
-  cursor: not-allowed;
-  opacity: 0.5;
 }
 :global(.savedListMessage) {
   margin: -20px 0 22px;
@@ -475,22 +356,6 @@
   padding: 10px 12px;
   background: var(--background);
 }
-:global(.savedListDrawer button) {
-  padding: 0;
-  color: var(--foreground);
-  text-align: left;
-  background: none;
-  border: 0;
-  cursor: pointer;
-}
-:global(.savedListDrawer li button:last-child) {
-  color: var(--destructive);
-  font-size: 0.72rem;
-}
-:global(.profileFlow > .profileLink) {
-  float: right;
-  margin-top: -38px;
-}
 :global(.searchFilters) {
   display: grid;
   grid-template-columns: 1.6fr repeat(7, minmax(130px, 1fr)) auto;
@@ -516,22 +381,9 @@
   letter-spacing: 0.07em;
   text-transform: uppercase;
 }
-:global(.naturalSearch input) {
-  color: var(--foreground);
-  background: transparent;
-  border: 0;
-  outline: 0;
-  font: 400 1rem / 1.4 var(--font-geist-sans);
-}
-:global(.naturalSearch button) {
-  padding: 0 24px;
-  color: var(--primary-foreground);
-  background: var(--primary);
-  border: 0;
-  cursor: pointer;
-}
-:global(.naturalSearch button:disabled) {
-  opacity: 0.65;
+:global(.naturalSearchButton) {
+  align-self: stretch;
+  height: auto;
 }
 :global(.interpretationError) {
   margin: -4px 0 14px;
@@ -563,23 +415,9 @@
   letter-spacing: 0.07em;
   text-transform: uppercase;
 }
-:global(.searchFilters input),
-:global(.searchFilters select) {
-  min-width: 0;
-  padding: 0;
-  color: var(--foreground);
-  background: transparent;
-  border: 0;
-  outline: none;
-  font: 400 0.84rem / 1.25 var(--font-geist-sans);
-}
 :global(.searchButton) {
-  padding: 0 20px;
-  color: var(--primary-foreground);
-  background: var(--primary);
-  border: 0;
-  font-weight: 700;
-  cursor: pointer;
+  align-self: stretch;
+  height: auto;
 }
 :global(.resultsMeta) {
   display: flex;
@@ -621,21 +459,6 @@
 :global(.profileTable tbody tr:hover) {
   background: var(--muted);
 }
-:global(.rowName) {
-  color: var(--foreground);
-  background: none;
-  border: 0;
-  font: 650 0.9rem / 1.2 inherit;
-  cursor: pointer;
-}
-:global(.saveButton),
-:global(.savedNote button) {
-  padding: 7px 10px;
-  color: var(--primary-foreground);
-  background: var(--primary);
-  border: 0;
-  cursor: pointer;
-}
 :global(.savedNote) {
   display: grid;
   gap: 10px;
@@ -646,14 +469,6 @@
   gap: 8px;
   color: var(--muted-foreground);
   font-size: 0.75rem;
-}
-:global(.savedNote textarea) {
-  min-height: 90px;
-  padding: 10px;
-  color: var(--foreground);
-  background: var(--background);
-  border: 1px solid var(--input);
-  resize: vertical;
 }
 :global(.skillList),
 :global(.panelSkills) {
@@ -687,13 +502,6 @@
   gap: 10px;
   padding-top: 18px;
 }
-:global(.pagination button) {
-  padding: 9px 13px;
-  color: var(--foreground);
-  background: transparent;
-  border: 1px solid var(--input);
-  cursor: pointer;
-}
 :global(.profilePanel) {
   width: min(520px, 94vw);
   padding: 34px;
@@ -704,10 +512,6 @@
 :global(.panelClose) {
   display: block;
   margin: 0 0 70px auto;
-  color: var(--muted-foreground);
-  background: none;
-  border: 0;
-  cursor: pointer;
 }
 :global(.profilePanel h2) {
   font-size: clamp(2.8rem, 8vw, 5rem);
@@ -800,27 +604,13 @@
 :global(.contactCard dd) {
   font-size: 0.78rem;
 }
-:global(.contactReveal),
-:global(.contactReport) {
-  min-height: 42px;
-  padding: 10px 12px;
-  border: 0;
-  font-weight: 700;
-  cursor: pointer;
+:global(.savedListDialogForm) {
+  display: contents;
 }
-:global(.contactReveal) {
-  color: var(--primary-foreground);
-  background: var(--primary);
-}
-:global(.contactReport) {
-  color: var(--destructive);
-  background: transparent;
-  border: 1px solid var(--destructive);
-}
-:global(.contactReveal:disabled),
-:global(.contactReport:disabled) {
-  cursor: wait;
-  opacity: 0.65;
+
+:global(.savedListDialogForm label) {
+  display: grid;
+  gap: 8px;
 }
 :global(.contactMessage) {
   margin-top: 14px;

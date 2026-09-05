@@ -321,6 +321,7 @@ export function ProfileOnboarding() {
           <Button
             className="choice"
             type="button"
+            variant="outline"
             onClick={() => setChoice("search")}
           >
             <strong>Search Humans</strong>
@@ -329,7 +330,7 @@ export function ProfileOnboarding() {
             </span>
           </Button>
           <Button
-            className="choice accent"
+            className="choice"
             type="button"
             onClick={() => setChoice("profile")}
           >
@@ -356,11 +357,7 @@ export function ProfileOnboarding() {
   return (
     <section className="onboarding profileFlow">
       <p className="eyebrow">Profile control</p>
-      <Button
-        className="profileLink"
-        type="button"
-        onClick={() => setChoice("search")}
-      >
+      <Button type="button" variant="link" onClick={() => setChoice("search")}>
         Search the directory
       </Button>
       <h1>
@@ -444,6 +441,7 @@ export function ProfileOnboarding() {
           {!searchabilityLocked && (
             <Button
               type="button"
+              variant={profile.searchable ? "destructive" : "default"}
               disabled={busy}
               onClick={() => void setSearchability(!profile.searchable)}
             >
@@ -469,6 +467,7 @@ export function ProfileOnboarding() {
             <Button
               key={type}
               type="button"
+              variant={contactSuppressions[type] ? "outline" : "destructive"}
               onClick={() => void toggleContactSuppression(type)}
             >
               {contactSuppressions[type] ? "Allow" : "Suppress"} {type} reveals
@@ -590,6 +589,7 @@ export function ProfileOnboarding() {
               <>
                 <Button
                   type="submit"
+                  variant="outline"
                   name="searchable"
                   value="false"
                   disabled={busy}
@@ -597,7 +597,6 @@ export function ProfileOnboarding() {
                   Save private Profile
                 </Button>
                 <Button
-                  className="publish"
                   type="submit"
                   name="searchable"
                   value="true"
@@ -607,7 +606,7 @@ export function ProfileOnboarding() {
                 </Button>
               </>
             ) : (
-              <Button className="publish" type="submit" disabled={busy}>
+              <Button type="submit" disabled={busy}>
                 Save Profile changes
               </Button>
             )}

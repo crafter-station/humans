@@ -4,6 +4,14 @@ import { useAuth } from "@clerk/nextjs";
 import { Badge } from "@repo/ui/components/badge";
 import { Button } from "@repo/ui/components/button";
 import { Card } from "@repo/ui/components/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@repo/ui/components/dialog";
 import { Input } from "@repo/ui/components/input";
 import { NativeSelect } from "@repo/ui/components/native-select";
 import {
@@ -61,6 +69,10 @@ type SavedList = {
   entries: Array<{ profileId: string; profileName: string; note: string }>;
 };
 type SavedListState = "error" | "loading" | "ready";
+type SavedListDialog =
+  | { type: "create"; profileId?: string }
+  | { type: "delete" }
+  | { type: "rename" };
 
 export function ProfileSearch({
   onCreateProfile,
@@ -79,6 +91,7 @@ export function ProfileSearch({
   const [listState, setListState] = useState<SavedListState>("loading");
   const [activeListId, setActiveListId] = useState<string | null>(null);
   const [listMessage, setListMessage] = useState<string | null>(null);
+  const [listDialog, setListDialog] = useState<SavedListDialog | null>(null);
   const [interpretationError, setInterpretationError] = useState<string | null>(
     null,
   );
@@ -159,9 +172,8 @@ export function ProfileSearch({
     return () => controller.abort();
   }, [orgRole]);
 
-  const createList = async (profileId?: string) => {
-    const name = window.prompt("Name this shared Saved List");
-    if (!name?.trim()) return null;
+  const createList = async (name: string, profileId?: string) => {
+    if (!name.trim()) return null;
     setListMessage(null);
     let createdListId: string | undefined;
     try {
@@ -215,7 +227,7 @@ export function ProfileSearch({
     }
     const list = activeList;
     if (list === null) {
-      await createList(profileId);
+      setListDialog({ type: "create", profileId });
       return;
     }
     const saved = list.entries.some((entry) => entry.profileId === profileId);
@@ -247,13 +259,9 @@ export function ProfileSearch({
       );
     });
   };
-  const renameActiveList = async () => {
+  const renameActiveList = async (name: string) => {
     if (listState !== "ready" || activeList === null) return;
-    const name = window.prompt(
-      "Rename this shared Saved List",
-      activeList.name,
-    );
-    if (!name?.trim() || name.trim() === activeList.name) return;
+    if (!name.trim() || name.trim() === activeList.name) return;
     setListMessage(null);
     try {
       await successfulResponse(
@@ -266,6 +274,7 @@ export function ProfileSearch({
       );
       await refreshLists(activeList.id);
       setListMessage("Saved List renamed.");
+      setListDialog(null);
     } catch (error) {
       setListMessage(
         error instanceof Error
@@ -275,13 +284,7 @@ export function ProfileSearch({
     }
   };
   const deleteActiveList = async () => {
-    if (
-      listState !== "ready" ||
-      activeList === null ||
-      !window.confirm(`Delete the shared Saved List "${activeList.name}"?`)
-    ) {
-      return;
-    }
+    if (listState !== "ready" || activeList === null) return;
     setListMessage(null);
     try {
       await successfulResponse(
@@ -292,6 +295,7 @@ export function ProfileSearch({
       );
       await refreshLists();
       setListMessage("Saved List deleted.");
+      setListDialog(null);
     } catch (error) {
       setListMessage(
         error instanceof Error
@@ -460,11 +464,7 @@ export function ProfileSearch({
           <h1>Find builders, not keywords.</h1>
         </div>
         <div className="searchActions">
-          <Button
-            className="profileLink"
-            type="button"
-            onClick={onCreateProfile}
-          >
+          <Button type="button" variant="link" onClick={onCreateProfile}>
             Manage my Profile
           </Button>
           <div className="savedListControls">
@@ -496,37 +496,44 @@ export function ProfileSearch({
             </label>
             <Button
               type="button"
+              size="sm"
+              variant="outline"
               disabled={listState !== "ready"}
-              onClick={() => void createList()}
+              onClick={() => setListDialog({ type: "create" })}
             >
               New
             </Button>
             {listState === "error" && (
-              <Button type="button" onClick={retryLists}>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={retryLists}
+              >
                 Retry
               </Button>
             )}
             <Button
               type="button"
+              size="sm"
+              variant="outline"
               disabled={listState !== "ready" || activeList === null}
-              onClick={() => void renameActiveList()}
+              onClick={() => setListDialog({ type: "rename" })}
             >
               Rename
             </Button>
             <Button
               type="button"
+              size="sm"
+              variant="destructive"
               disabled={listState !== "ready" || activeList === null}
-              onClick={() => void deleteActiveList()}
+              onClick={() => setListDialog({ type: "delete" })}
             >
               Delete
             </Button>
           </div>
           {orgRole === "org:admin" && (
-            <Button
-              className="profileLink"
-              type="button"
-              onClick={toggleRevealPolicy}
-            >
+            <Button type="button" variant="link" onClick={toggleRevealPolicy}>
               {membersCanReveal
                 ? "Restrict reveals to admins"
                 : "Allow all Members to reveal"}
@@ -553,6 +560,7 @@ export function ProfileSearch({
                 <li key={entry.profileId}>
                   <Button
                     type="button"
+                    variant="link"
                     onClick={() =>
                       updateParameters({ profile: entry.profileId }, true)
                     }
@@ -561,6 +569,8 @@ export function ProfileSearch({
                   </Button>
                   <Button
                     type="button"
+                    size="xs"
+                    variant="destructive"
                     aria-label={`Remove ${entry.profileName} from ${activeList.name}`}
                     onClick={() => void toggleSaved(entry.profileId)}
                   >
@@ -585,7 +595,11 @@ export function ProfileSearch({
             placeholder="Senior TypeScript engineers in Colombia"
           />
         </label>
-        <Button type="submit" disabled={interpreting}>
+        <Button
+          className="naturalSearchButton"
+          type="submit"
+          disabled={interpreting}
+        >
           {interpreting ? "Interpreting…" : "Interpret query"}
         </Button>
       </form>
@@ -735,7 +749,7 @@ export function ProfileSearch({
                 onClick={() => updateParameters({ profile: result.profileId })}
               >
                 <TableCell>
-                  <Button className="rowName" type="button">
+                  <Button type="button" variant="link">
                     {result.name}
                   </Button>
                 </TableCell>
@@ -767,8 +781,8 @@ export function ProfileSearch({
                 </TableCell>
                 <TableCell>
                   <Button
-                    className="saveButton"
                     type="button"
+                    size="sm"
                     disabled={listState !== "ready"}
                     onClick={(event) => {
                       event.stopPropagation();
@@ -789,13 +803,14 @@ export function ProfileSearch({
       </div>
       <div className="pagination">
         {searchParams.has("cursor") && (
-          <Button type="button" onClick={() => router.back()}>
+          <Button type="button" variant="outline" onClick={() => router.back()}>
             Previous page
           </Button>
         )}
         {nextCursor !== null && (
           <Button
             type="button"
+            variant="outline"
             onClick={() =>
               updateParameters({ cursor: nextCursor, profile: null }, true)
             }
@@ -841,6 +856,91 @@ export function ProfileSearch({
             ))}
         </SheetContent>
       </Sheet>
+      <Dialog
+        open={listDialog !== null}
+        onOpenChange={(open) => {
+          if (!open) setListDialog(null);
+        }}
+      >
+        <DialogContent>
+          {listDialog?.type === "delete" ? (
+            <>
+              <DialogHeader>
+                <DialogTitle>Delete Saved List?</DialogTitle>
+                <DialogDescription>
+                  {activeList === null
+                    ? "This Saved List is no longer available."
+                    : `This permanently deletes “${activeList.name}” and its saved entries.`}
+                </DialogDescription>
+              </DialogHeader>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setListDialog(null)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  variant="destructive"
+                  onClick={() => void deleteActiveList()}
+                >
+                  Delete Saved List
+                </Button>
+              </DialogFooter>
+            </>
+          ) : (
+            <form
+              action={async (form) => {
+                const name = String(form.get("savedListName") ?? "");
+                if (listDialog?.type === "rename") {
+                  await renameActiveList(name);
+                } else {
+                  const created = await createList(name, listDialog?.profileId);
+                  if (created !== null) setListDialog(null);
+                }
+              }}
+              className="savedListDialogForm"
+            >
+              <DialogHeader>
+                <DialogTitle>
+                  {listDialog?.type === "rename"
+                    ? "Rename Saved List"
+                    : "New Saved List"}
+                </DialogTitle>
+                <DialogDescription>
+                  Saved Lists are shared with your Organization.
+                </DialogDescription>
+              </DialogHeader>
+              <label htmlFor="saved-list-name">
+                Name
+                <Input
+                  id="saved-list-name"
+                  name="savedListName"
+                  required
+                  autoFocus
+                  defaultValue={
+                    listDialog?.type === "rename" ? activeList?.name : ""
+                  }
+                />
+              </label>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setListDialog(null)}
+                >
+                  Cancel
+                </Button>
+                <Button type="submit">
+                  {listDialog?.type === "rename" ? "Rename" : "Create"}
+                </Button>
+              </DialogFooter>
+            </form>
+          )}
+        </DialogContent>
+      </Dialog>
     </section>
   );
 }
@@ -970,11 +1070,7 @@ function ProfilePanel({
       <p className="panelHeadline">
         {profile.headline ?? profile.primaryRole ?? "Builder"}
       </p>
-      <Button
-        className="saveButton"
-        type="button"
-        onClick={() => void onToggle(profile.profileId)}
-      >
+      <Button type="button" onClick={() => void onToggle(profile.profileId)}>
         {entry === undefined ? "+ Save to list" : "Remove from list"}
       </Button>
       {entry !== undefined && (
@@ -1066,7 +1162,6 @@ function ProfilePanel({
               </dl>
               {detail.value ? (
                 <Button
-                  className="contactReport"
                   type="button"
                   variant="destructive"
                   disabled={pendingContact === detail.observationId}
@@ -1078,7 +1173,6 @@ function ProfilePanel({
                 </Button>
               ) : (
                 <Button
-                  className="contactReveal"
                   type="button"
                   disabled={pendingContact === detail.observationId}
                   onClick={() => void reveal(detail)}

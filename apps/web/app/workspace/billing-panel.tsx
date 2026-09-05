@@ -152,6 +152,7 @@ export function BillingPanel() {
               ) : null}
               <Button
                 type="button"
+                variant="outline"
                 disabled={busy !== null}
                 onClick={() => void openBilling("portal")}
               >
@@ -172,6 +173,7 @@ export function BillingPanel() {
           </p>
           <Button
             type="button"
+            variant="outline"
             onClick={() => {
               setMessage(null);
               window.dispatchEvent(new Event("humans:credits-changed"));
