@@ -22,15 +22,31 @@ export default async function WorkspaceLayout({
     <SidebarProvider defaultOpen={defaultOpen}>
       <AppSidebar />
       <SidebarInset>
-        <header className="flex h-14 shrink-0 items-center justify-between gap-2 border-b px-4">
-          <div className="flex items-center gap-2">
+        <header className="flex h-14 shrink-0 items-center justify-between gap-4 border-b px-[clamp(1rem,4vw,4rem)]">
+          <div className="flex min-w-0 items-center gap-2">
             <SidebarTrigger className="-ml-1" />
             <Separator orientation="vertical" className="h-4" />
-            <span className="text-sm font-medium">Protected directory</span>
+            <span className="truncate text-sm font-medium">
+              Protected directory
+            </span>
           </div>
-          <div className="flex items-center gap-2">
-            <ModeToggle />
-            <OrganizationSwitcher hidePersonal />
+          <div className="flex min-w-0 max-w-[min(60%,22rem)] shrink items-center justify-end gap-2">
+            <div className="shrink-0">
+              <ModeToggle />
+            </div>
+            <OrganizationSwitcher
+              hidePersonal
+              appearance={{
+                elements: {
+                  rootBox: "min-w-0 max-w-full overflow-hidden",
+                  organizationSwitcherTrigger:
+                    "min-w-0 max-w-full overflow-hidden",
+                  organizationPreview: "min-w-0",
+                  organizationPreviewTextContainer: "min-w-0",
+                  organizationPreviewMainIdentifier: "truncate",
+                },
+              }}
+            />
           </div>
         </header>
         {children}
