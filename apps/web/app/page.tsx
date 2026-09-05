@@ -1,5 +1,6 @@
 import { Show, SignInButton, SignUpButton } from "@clerk/nextjs";
 import { Button } from "@repo/ui/components/button";
+import { ModeToggle } from "@repo/ui/components/mode-toggle";
 import Link from "next/link";
 
 import styles from "./page.module.css";
@@ -10,6 +11,7 @@ export default function Home() {
       <nav className={styles.nav}>
         <span className={styles.wordmark}>Humans</span>
         <div className={styles.actions}>
+          <ModeToggle />
           <Link className={styles.requestLink} href="/profile-request">
             Correct or remove a Profile
           </Link>

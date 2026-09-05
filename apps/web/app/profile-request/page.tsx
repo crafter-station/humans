@@ -2,6 +2,7 @@
 
 import { Button } from "@repo/ui/components/button";
 import { Input } from "@repo/ui/components/input";
+import { ModeToggle } from "@repo/ui/components/mode-toggle";
 import { NativeSelect } from "@repo/ui/components/native-select";
 import { Textarea } from "@repo/ui/components/textarea";
 import Link from "next/link";
@@ -198,9 +199,12 @@ export default function ProfileRequestPage() {
         <Link className={styles.wordmark} href="/">
           Humans
         </Link>
-        <Link className={styles.back} href="/">
-          Back to product
-        </Link>
+        <div className={styles.navActions}>
+          <ModeToggle />
+          <Link className={styles.back} href="/">
+            Back to product
+          </Link>
+        </div>
       </nav>
       <div className={styles.layout}>
         <header className={styles.intro}>

@@ -13,6 +13,12 @@
   border-bottom: 1px solid var(--border);
 }
 
+.navActions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 .wordmark {
   font-size: 1.35rem;
   font-weight: 750;

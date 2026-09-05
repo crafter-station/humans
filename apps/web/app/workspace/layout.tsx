@@ -1,6 +1,7 @@
 import { OrganizationSwitcher } from "@clerk/nextjs";
 import { auth } from "@clerk/nextjs/server";
 import { Separator } from "@repo/ui/components/separator";
+import { ModeToggle } from "@repo/ui/components/mode-toggle";
 import {
   SidebarInset,
   SidebarProvider,
@@ -27,7 +28,10 @@ export default async function WorkspaceLayout({
             <Separator orientation="vertical" className="h-4" />
             <span className="text-sm font-medium">Protected directory</span>
           </div>
-          <OrganizationSwitcher hidePersonal />
+          <div className="flex items-center gap-2">
+            <ModeToggle />
+            <OrganizationSwitcher hidePersonal />
+          </div>
         </header>
         {children}
       </SidebarInset>
