@@ -75,7 +75,9 @@ export const authenticateMemberWithSignInTicket = async (
     await page.waitForFunction(() => Boolean(window.Clerk?.loaded));
     const signedIn = await page.evaluate(async (signInTicket) => {
       try {
-        const signIn = await window.Clerk.client.signIn.create({
+        const client = window.Clerk.client;
+        if (!client) return false;
+        const signIn = await client.signIn.create({
           strategy: "ticket",
           ticket: signInTicket,
         });
