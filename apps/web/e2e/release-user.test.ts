@@ -30,7 +30,8 @@ const release = "b".repeat(40);
 const environment = { E2E_RELEASE_SHA: release };
 const now = Date.UTC(2026, 8, 4, 12);
 const runStartedAt = now - 60_000;
-const runId = "690b5b64-f2a1-4ac7-88bd-d63b454f6802";
+const legacyRunId = "690b5b64-f2a1-4ac7-88bd-d63b454f6802";
+const runId = legacyRunId.replaceAll("-", "").slice(0, 22);
 const email = `humans-release-${runStartedAt}-${runId}+clerk_test@example.com`;
 const userId = "user_release_member";
 const organizationId = "org_release_owned";
@@ -78,6 +79,24 @@ describe("release Member state", () => {
       userId,
     });
     expect(readFileSync(file, "utf8")).not.toContain("Fingerprint");
+  });
+
+  it("accepts legacy UUID-stamped state for cleanup", () => {
+    const file = temporaryFile();
+    const legacyEmail = `humans-release-${runStartedAt}-${legacyRunId}+clerk_test@example.com`;
+
+    writeReleaseUser(
+      { email: legacyEmail },
+      credentials,
+      file,
+      environment,
+      now,
+    );
+
+    expect(readReleaseUser(credentials, file, environment, now)).toMatchObject({
+      email: legacyEmail,
+      runId: legacyRunId,
+    });
   });
 
   it("rejects unexpected persisted fields and a different release run", () => {

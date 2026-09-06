@@ -121,7 +121,7 @@ const signUpPreviewMember = async (
   deployment: URL,
 ): Promise<WorkspaceIdentity> => {
   await setupClerkTestingTokenSafely(page);
-  const nonce = `${Date.now()}-${crypto.randomUUID()}`;
+  const nonce = `${Date.now()}-${crypto.randomUUID().replaceAll("-", "").slice(0, 22)}`;
   const email = `humans-release-${nonce}+clerk_test@example.com`;
   const password = `Humans-release-${nonce}!Aa1`;
   const credentials = releaseUserCredentialsFromEnvironment();

@@ -928,14 +928,14 @@ const clerkHeaders = (secretKey: string) => ({
 const parsePreviewDisposableEmail = (value: unknown) => {
   if (typeof value !== "string" || value !== value.toLowerCase()) return null;
   const match =
-    /^humans-release-(\d{13})-([0-9a-f-]{36})\+clerk_test@example\.com$/.exec(
+    /^humans-release-(\d{13})-([0-9a-f]{22}|[0-9a-f-]{36})\+clerk_test@example\.com$/.exec(
       value,
     );
   if (
     match === null ||
     match[1] === undefined ||
     match[2] === undefined ||
-    !uuidPattern.test(match[2])
+    !(match[2].length === 22 || uuidPattern.test(match[2]))
   ) {
     return null;
   }
