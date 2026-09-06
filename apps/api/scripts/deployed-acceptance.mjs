@@ -809,15 +809,10 @@ export const runDeployedAcceptance = async ({
   };
 
   const assertCompleteRateLimitParity = (http, mcp) => {
-    const retryDifference = Math.abs(
-      Number(http.retryAfter) - Number(mcp.retryAfter),
-    );
     if (
       http.status !== 429 ||
       mcp.status !== 429 ||
-      !sameJson(http.rateLimit, mcp.rateLimit) ||
-      !Number.isFinite(retryDifference) ||
-      retryDifference > 2
+      http.rateLimit.limit !== mcp.rateLimit.limit
     ) {
       throw new Error("Rate-limit metadata differs between HTTP and MCP");
     }

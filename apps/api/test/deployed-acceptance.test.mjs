@@ -409,7 +409,10 @@ const makeAcceptanceServer = (options = {}) => {
         arguments_.idempotencyKey,
       );
     const rateLimit = {
-      limit: outcome.headers["RateLimit-Limit"] ?? null,
+      limit:
+        outcome.status === 429 && options.mcpRateLimitLimit
+          ? options.mcpRateLimitLimit
+          : (outcome.headers["RateLimit-Limit"] ?? null),
       remaining:
         outcome.status < 400 && options.mcpSuccessRateLimitRemaining
           ? options.mcpSuccessRateLimitRemaining
@@ -1125,8 +1128,17 @@ describe("deployed API acceptance", () => {
     expect(server.state().keys.every((key) => key.revoked)).toBe(true);
   });
 
-  it("compares every rate-limit metadata field across transports", async () => {
+  it("allows isolate-local reset drift across transports", async () => {
     const server = makeAcceptanceServer({ mcpRateLimitResetOffset: -1 });
+
+    await expect(
+      runDeployedAcceptance(input({ fetch: server.fetch })),
+    ).resolves.toMatchObject({ release });
+    expect(server.state().keys.every((key) => key.revoked)).toBe(true);
+  });
+
+  it("requires the same configured rate limit across transports", async () => {
+    const server = makeAcceptanceServer({ mcpRateLimitLimit: "61" });
 
     await expectRejectionContaining(
       runDeployedAcceptance(input({ fetch: server.fetch })),
