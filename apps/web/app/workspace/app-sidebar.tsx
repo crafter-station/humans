@@ -31,7 +31,11 @@ export function AppSidebar() {
   const view = useSearchParams().get("view") ?? "search";
 
   return (
-    <Sidebar collapsible="icon" variant="inset">
+    <Sidebar
+      collapsible="icon"
+      variant="inset"
+      className="p-3 group-data-[collapsible=icon]:p-2"
+    >
       <SidebarHeader className="px-2 pt-2 pb-3">
         <SidebarMenu className="gap-1">
           <SidebarMenuItem>
