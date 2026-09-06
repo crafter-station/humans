@@ -28,6 +28,11 @@ export const requiredVercelEnvironmentKeys = Object.freeze([
   "TURNSTILE_SECRET_KEY",
 ]);
 
+export const vercelDeploymentTargetArguments = (environment) =>
+  environment === "preview"
+    ? ["--target", "preview", "--force"]
+    : ["--prod", "--skip-domain", "--force"];
+
 const generatedReleaseKeys = [
   "HUMANS_RELEASE",
   "HUMANS_RELEASE_ENVIRONMENT",

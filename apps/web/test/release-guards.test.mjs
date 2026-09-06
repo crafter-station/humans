@@ -27,6 +27,7 @@ import {
   requiredVercelEnvironmentKeys,
   selectVercelAliasInventory,
   snapshotPublicProductionAliases,
+  vercelDeploymentTargetArguments,
 } from "../scripts/release-guards.mjs";
 
 const release = "a".repeat(40);
@@ -72,6 +73,19 @@ const deployment = {
 };
 
 describe("Vercel release guards", () => {
+  it("keeps the Production-only skip-domain flag out of Preview", () => {
+    expect(vercelDeploymentTargetArguments("preview")).toEqual([
+      "--target",
+      "preview",
+      "--force",
+    ]);
+    expect(vercelDeploymentTargetArguments("production")).toEqual([
+      "--prod",
+      "--skip-domain",
+      "--force",
+    ]);
+  });
+
   it.each([
     ["staging", "scripts/deploy.mjs", ["preview"]],
     ["promotion", "scripts/promote-production.mjs", []],

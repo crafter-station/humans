@@ -14,6 +14,7 @@ import {
   assertPreviewAcceptance,
   assertVercelEnvironmentInventory,
   assertVercelReleaseGuard,
+  vercelDeploymentTargetArguments,
 } from "./release-guards.mjs";
 
 const [environment] = process.argv.slice(2);
@@ -130,9 +131,7 @@ run(
     "--yes",
     "--scope",
     scope,
-    ...(environment === "preview"
-      ? ["--target", "preview", "--skip-domain", "--force"]
-      : ["--prod", "--skip-domain", "--force"]),
+    ...vercelDeploymentTargetArguments(environment),
     "--build-env",
     `HUMANS_RELEASE=${release}`,
     "--build-env",
