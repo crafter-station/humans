@@ -581,6 +581,7 @@ export const purchaseContactReveal = async (
           observation: original.observation,
           reveal,
           newlyReserved: false,
+          previouslyPurchased: replay.status === "reopened",
           operationIdempotencyKey: replay.idempotencyKey,
         };
       }
@@ -643,6 +644,7 @@ export const purchaseContactReveal = async (
           observation,
           reveal: existingPurchase,
           newlyReserved: false,
+          previouslyPurchased: true,
           operationIdempotencyKey: input.idempotencyKey,
         };
       }
@@ -717,6 +719,7 @@ export const purchaseContactReveal = async (
             observation,
             reveal: renewed,
             newlyReserved: true,
+            previouslyPurchased: false,
             operationIdempotencyKey: input.idempotencyKey,
           };
         }
@@ -750,6 +753,7 @@ export const purchaseContactReveal = async (
           observation,
           reveal: existing,
           newlyReserved: false,
+          previouslyPurchased: true,
           operationIdempotencyKey:
             reservationRequest?.idempotencyKey ?? input.idempotencyKey,
         };
@@ -770,6 +774,7 @@ export const purchaseContactReveal = async (
         observation,
         reveal: inserted,
         newlyReserved: true,
+        previouslyPurchased: false,
         operationIdempotencyKey: input.idempotencyKey,
       };
     });
@@ -886,8 +891,8 @@ export const purchaseContactReveal = async (
       observationId: finalized.observationId,
       type: finalized.detail.type,
       value: finalized.detail.value,
-      price: reserved.newlyReserved ? finalized.reveal.price : 0,
-      previouslyPurchased: !reserved.newlyReserved,
+      price: reserved.previouslyPurchased ? 0 : finalized.reveal.price,
+      previouslyPurchased: reserved.previouslyPurchased,
     };
     await database
       .update(securityAuditEvents)

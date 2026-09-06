@@ -532,13 +532,13 @@ describe("Contact Reveals", () => {
       type: "professional-email" as const,
       idempotencyKey: "replay:original",
     };
-    await expect(purchaseContactReveal(database, input)).resolves.toMatchObject(
-      {
-        observationId: "email_observation",
-        value: "alex@example.com",
-        price: 5,
-      },
-    );
+    const original = await purchaseContactReveal(database, input);
+    expect(original).toMatchObject({
+      observationId: "email_observation",
+      value: "alex@example.com",
+      price: 5,
+      previouslyPurchased: false,
+    });
     await database.insert(schema.profileObservations).values({
       id: "new_email_observation",
       profileId: "profile_one",
@@ -550,12 +550,8 @@ describe("Contact Reveals", () => {
       confidence: 0.99,
       collectedAt: new Date("2026-09-01T12:00:00Z"),
     });
-    await expect(purchaseContactReveal(database, input)).resolves.toMatchObject(
-      {
-        observationId: "email_observation",
-        value: "alex@example.com",
-        price: 0,
-      },
+    await expect(purchaseContactReveal(database, input)).resolves.toEqual(
+      original,
     );
     await expect(
       purchaseContactReveal(database, {
