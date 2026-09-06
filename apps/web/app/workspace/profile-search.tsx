@@ -33,6 +33,8 @@ import { Textarea } from "@repo/ui/components/textarea";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useEffectEvent, useRef, useState } from "react";
 
+import { fetchHumansApi } from "@/api-client";
+
 type SearchResult = {
   profileId: string;
   name: string;
@@ -80,7 +82,7 @@ export function ProfileSearch({
   onCreateProfile: () => void;
 }) {
   const router = useRouter();
-  const { orgRole } = useAuth();
+  const { getToken, orgRole } = useAuth();
   const searchParams = useSearchParams();
   const [results, setResults] = useState<SearchResult[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
@@ -328,10 +330,14 @@ export function ProfileSearch({
     const idempotencyKey =
       searchRequestIds.current.get(requestKey) ?? crypto.randomUUID();
     searchRequestIds.current.set(requestKey, idempotencyKey);
-    void fetch(`/api/search?${requestKey}`, {
-      signal: controller.signal,
-      headers: { "Idempotency-Key": idempotencyKey },
-    })
+    void fetchHumansApi(
+      getToken,
+      `/v1/profiles/search?${requestKey}`,
+      {
+        signal: controller.signal,
+        headers: { "Idempotency-Key": idempotencyKey },
+      },
+    )
       .then(async (response) => {
         if (!response.ok) throw new Error("Search is temporarily unavailable");
         return (await response.json()) as {
@@ -354,14 +360,16 @@ export function ProfileSearch({
           setMessage(error instanceof Error ? error.message : "Search failed");
       });
     return () => controller.abort();
-  }, [requestKey]);
+  }, [getToken, requestKey]);
 
   useEffect(() => {
     if (selectedProfileId === null) return;
     const controller = new AbortController();
-    void fetch(`/api/search/${encodeURIComponent(selectedProfileId)}`, {
-      signal: controller.signal,
-    })
+    void fetchHumansApi(
+      getToken,
+      `/v1/profiles/${encodeURIComponent(selectedProfileId)}`,
+      { signal: controller.signal },
+    )
       .then(async (response) => {
         if (!response.ok) throw new Error("Profile is no longer available");
         return (await response.json()) as { profile: ProfileDetail };
@@ -371,7 +379,7 @@ export function ProfileSearch({
         if (!controller.signal.aborted) setProfile(null);
       });
     return () => controller.abort();
-  }, [selectedProfileId]);
+  }, [getToken, selectedProfileId]);
 
   const applyFilters = (form: FormData) => {
     setMessage("Searching protected Profiles...");
@@ -396,11 +404,17 @@ export function ProfileSearch({
   const interpretQuery = async (form: FormData) => {
     setInterpreting(true);
     setInterpretationError(null);
-    const response = await fetch("/api/search/interpret", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ query: String(form.get("naturalQuery") ?? "") }),
-    });
+    const response = await fetchHumansApi(
+      getToken,
+      "/v1/profiles/search/interpret",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          query: String(form.get("naturalQuery") ?? ""),
+        }),
+      },
+    );
     const payload = (await response.json()) as {
       filters?: {
         query?: string;

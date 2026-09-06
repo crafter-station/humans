@@ -1,18 +1,6 @@
 version: 2
 updates:
-  - package-ecosystem: bun
-    directory: /
-    schedule:
-      interval: weekly
-      day: monday
-      time: "09:00"
-      timezone: America/New_York
-    groups:
-      production-dependencies:
-        dependency-type: production
-      development-dependencies:
-        dependency-type: development
-    open-pull-requests-limit: 5
+  # Re-enable Bun updates after dependabot-core#15850 fixes npm aliases.
   - package-ecosystem: github-actions
     directory: /
     schedule:

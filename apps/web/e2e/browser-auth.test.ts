@@ -33,7 +33,9 @@ describe("Clerk browser acceptance authentication", () => {
       request: () => ({ url: () => "https://clerk.example.test/v1/client" }),
     } as unknown as Route;
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const error = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
 
     await setupClerkTestingTokenSafely(page);
     const handled = handler?.(route);
@@ -82,9 +84,9 @@ describe("Clerk browser acceptance authentication", () => {
 
   it("replaces Clerk transport details with a constant diagnostic", async () => {
     const secret = "private-secret";
-    const fetcher = vi.fn<typeof fetch>().mockRejectedValue(
-      new Error(`request leaked ${secret}`),
-    );
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockRejectedValue(new Error(`request leaked ${secret}`));
 
     const error = await verifyPersonalOrganization(
       {

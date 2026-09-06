@@ -5,8 +5,8 @@ import {
   POLAR_API_VERSION,
   POLAR_PRODUCTION_BASE_URL,
   POLAR_SANDBOX_BASE_URL,
-  PolarBillingError,
   type PolarBillingClock,
+  PolarBillingError,
 } from "../src/index.js";
 
 const ORGANIZATION_ID = "11111111-1111-4111-8111-111111111111";
@@ -147,6 +147,16 @@ const portalResponse = (overrides: Record<string, unknown> = {}) => ({
   customer_portal_url: "https://polar.sh/acme/portal?token=portal_secret",
   customer_id: CUSTOMER_ID,
   customer: customerResponse(),
+  ...overrides,
+});
+
+const usageEventResponse = (overrides: Record<string, unknown> = {}) => ({
+  id: SESSION_ID,
+  timestamp: "2026-09-01T12:34:56.789Z",
+  organization_id: ORGANIZATION_ID,
+  external_customer_id: CLERK_ORGANIZATION_ID,
+  name: "credit.finalized",
+  source: "user",
   ...overrides,
 });
 
@@ -1605,37 +1615,62 @@ describe("finalized Credit usage", () => {
   });
 });
 
-describe("meter reconciliation", () => {
-  it("reads quantities for one external Customer in UTC", async () => {
+describe("usage reconciliation", () => {
+  it("counts meter events inside an exact half-open period", async () => {
     const { client, requests } = makeClient([
       jsonResponse({
-        quantities: [
-          { timestamp: "2026-09-01T00:00:00Z", quantity: 41 },
-          { timestamp: "2026-09-02T00:00:00Z", quantity: 17 },
-        ],
-        total: 58,
+        items: [usageEventResponse()],
+        pagination: { total_count: 58, max_page: 58 },
       }),
     ]);
+    const startAt = new Date("2026-09-01T12:34:56.789Z");
+    const endAt = new Date("2026-10-01T12:34:56.789Z");
 
     await expect(
-      client.getMeterQuantities({
+      client.getFinalizedCreditUsageCount({
+        clerkOrganizationId: CLERK_ORGANIZATION_ID,
+        startAt,
+        endAt,
+      }),
+    ).resolves.toBe(58);
+
+    expect(requests[0]?.url).toBe(
+      `${POLAR_PRODUCTION_BASE_URL}/events/?organization_id=${ORGANIZATION_ID}&external_customer_id=${CLERK_ORGANIZATION_ID}&meter_id=${USAGE_METER_ID}&name=credit.finalized&source=user&start_timestamp=2026-09-01T12%3A34%3A56.788Z&end_timestamp=2026-10-01T12%3A34%3A56.789Z&page=1&limit=1`,
+    );
+    expect(requests[0]?.method).toBe("GET");
+  });
+
+  it.each([
+    {},
+    { items: [], pagination: { total_count: 1, max_page: 1 } },
+    { items: [{}], pagination: { total_count: 1, max_page: 2 } },
+    { items: [{}], pagination: { total_count: 1, max_page: 1 } },
+    {
+      items: [
+        usageEventResponse({
+          external_customer_id: OTHER_CLERK_ORGANIZATION_ID,
+        }),
+      ],
+      pagination: { total_count: 1, max_page: 1 },
+    },
+    {
+      items: [usageEventResponse({ timestamp: "2026-10-01T12:34:56.789Z" })],
+      pagination: { total_count: 1, max_page: 1 },
+    },
+    { items: [], pagination: { total_count: -1, max_page: 0 } },
+  ])("rejects an inconsistent event count response", async (response) => {
+    const { client } = makeClient([jsonResponse(response)]);
+
+    await expect(
+      client.getFinalizedCreditUsageCount({
         clerkOrganizationId: CLERK_ORGANIZATION_ID,
         startAt: new Date("2026-09-01T00:00:00Z"),
         endAt: new Date("2026-10-01T00:00:00Z"),
-        interval: "day",
       }),
-    ).resolves.toEqual({
-      quantities: [
-        { timestamp: new Date("2026-09-01T00:00:00Z"), quantity: 41 },
-        { timestamp: new Date("2026-09-02T00:00:00Z"), quantity: 17 },
-      ],
-      total: 58,
+    ).rejects.toMatchObject({
+      code: "malformed_response",
+      details: { operation: "list_usage_events" },
     });
-
-    expect(requests[0]?.url).toBe(
-      `${POLAR_PRODUCTION_BASE_URL}/meters/${USAGE_METER_ID}/quantities?start_timestamp=2026-09-01T00%3A00%3A00.000Z&end_timestamp=2026-10-01T00%3A00%3A00.000Z&interval=day&timezone=UTC&external_customer_id=${CLERK_ORGANIZATION_ID}`,
-    );
-    expect(requests[0]?.method).toBe("GET");
   });
 });
 

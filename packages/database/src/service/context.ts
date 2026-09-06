@@ -16,9 +16,8 @@ import type {
   completePolarCheckout,
   getBillingCustomerSeed,
   getOrganizationBillingOverview,
-  recordPolarOrderRefund,
   recordPolarCustomer,
-  releaseExpiredPolarCheckoutReconciliation,
+  recordPolarOrderRefund,
   releasePolarCheckoutLease,
 } from "../billing";
 import type { runChargedProfileSearch } from "../charged-search";
@@ -78,6 +77,7 @@ import type {
 } from "./errors";
 import type {
   ClerkProjectionEvent,
+  ClerkProjectionStatus,
   GitHubVerification,
   MemberProfile,
   ProfileInput,
@@ -104,6 +104,10 @@ export class Database extends Context.Service<
     readonly projectClerkEvent: (
       event: ClerkProjectionEvent,
     ) => Effect.Effect<boolean, DatabaseUnavailable>;
+    readonly getClerkProjectionStatus: (
+      memberId: string,
+      organizationId: string,
+    ) => Effect.Effect<ClerkProjectionStatus, DatabaseUnavailable>;
     readonly getWorkspace: (
       memberId: string,
       organizationId: string,
@@ -142,12 +146,6 @@ export class Database extends Context.Service<
       input: Parameters<typeof clearPolarCheckoutClaim>[1],
     ) => Effect.Effect<
       Awaited<ReturnType<typeof clearPolarCheckoutClaim>>,
-      DatabaseUnavailable
-    >;
-    readonly releaseExpiredPolarCheckoutReconciliation: (
-      input: Parameters<typeof releaseExpiredPolarCheckoutReconciliation>[1],
-    ) => Effect.Effect<
-      Awaited<ReturnType<typeof releaseExpiredPolarCheckoutReconciliation>>,
       DatabaseUnavailable
     >;
     readonly releasePolarCheckoutLease: (

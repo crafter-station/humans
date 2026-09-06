@@ -143,6 +143,25 @@ describe("Clerk API keys", () => {
 describe("Clerk sessions", () => {
   beforeEach(() => vi.clearAllMocks());
 
+  it("accepts Production session tokens only from canonical web origins", async () => {
+    const authenticateRequest = vi.fn(async () => ({ isAuthenticated: false }));
+    createClerkClient.mockReturnValue({ authenticateRequest });
+
+    await clerkIdentityBoundary.authenticate(new Request("https://api.humns.co"), {
+      ...bindings,
+      SENTRY_ENVIRONMENT: "production",
+    });
+
+    expect(authenticateRequest).toHaveBeenCalledWith(expect.any(Request), {
+      acceptsToken: "session_token",
+      authorizedParties: [
+        "https://humns.co",
+        "https://acceptance.humns.co",
+        "https://humans.crafter.run",
+      ],
+    });
+  });
+
   it("revokes Member sessions across every Clerk page", async () => {
     const firstPage = Array.from({ length: 500 }, (_, index) => ({
       id: `session-${index}`,

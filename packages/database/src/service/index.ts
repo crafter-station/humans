@@ -11,7 +11,6 @@ import {
   setPolarSubscriptionStatus,
   suspendPrincipal,
 } from "../abuse-controls";
-import { runChargedProfileSearch } from "../charged-search";
 import {
   beginPolarCheckoutCreation,
   claimPolarCheckout,
@@ -19,11 +18,11 @@ import {
   completePolarCheckout,
   getBillingCustomerSeed,
   getOrganizationBillingOverview,
-  recordPolarOrderRefund,
   recordPolarCustomer,
-  releaseExpiredPolarCheckoutReconciliation,
+  recordPolarOrderRefund,
   releasePolarCheckoutLease,
 } from "../billing";
+import { runChargedProfileSearch } from "../charged-search";
 import {
   ContactRevealError,
   getOrganizationContactRevealPolicy,
@@ -55,8 +54,8 @@ import {
   requestProfileClaim,
   setMemberStatements,
   setProfileSearchability,
-  suppressKnownMinorProfile,
   submitPublicProfileRequest,
+  suppressKnownMinorProfile,
 } from "../profile-control";
 import {
   addSavedListEntry,
@@ -100,6 +99,8 @@ export {
 } from "./errors";
 export type {
   ClerkProjectionEvent,
+  ClerkProjectionState,
+  ClerkProjectionStatus,
   GitHubVerification,
   MemberProfile,
   MemberProjection,
@@ -239,10 +240,6 @@ export const makeDatabaseService = (
     clearPolarCheckoutClaim: (input) =>
       saved("Database.clearPolarCheckoutClaim", () =>
         clearPolarCheckoutClaim(database, input),
-      ),
-    releaseExpiredPolarCheckoutReconciliation: (input) =>
-      saved("Database.releaseExpiredPolarCheckoutReconciliation", () =>
-        releaseExpiredPolarCheckoutReconciliation(database, input),
       ),
     releasePolarCheckoutLease: (input) =>
       saved("Database.releasePolarCheckoutLease", () =>

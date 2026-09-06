@@ -1,17 +1,17 @@
 import {
+  reconcileCreditPeriodPage,
+  recoverCreditUsageLeases,
+} from "@humans/database/billing";
+import {
   createDueEnrichmentDispatches,
   deleteExpiredEnrichmentCheckpoints,
   recoverEnrichmentDispatches,
   suppressGitHubInaccessibleProfiles,
 } from "@humans/database/enrichment";
-import {
-  reconcileCreditPeriodPage,
-  recoverCreditUsageLeases,
-} from "@humans/database/billing";
 import { idempotencyKeys, runs, schedules } from "@trigger.dev/sdk";
 
-import { withDatabaseRuntime, withPolarBillingRuntime } from "../runtime.js";
 import { reconcileAllCreditPeriodPages } from "../billing.js";
+import { withDatabaseRuntime, withPolarBillingRuntime } from "../runtime.js";
 import { billingUsageDeliveryTask } from "./billing.js";
 import { enrichmentDispatcherTask } from "./dispatcher.js";
 
@@ -85,14 +85,11 @@ export const billingReconciliationSchedule = schedules.task({
           reconcileCreditPeriodPage(
             database,
             ({ organizationId, startAt, endAt }) =>
-              client
-                .getMeterQuantities({
-                  clerkOrganizationId: organizationId,
-                  startAt,
-                  endAt,
-                  interval: "day",
-                })
-                .then(({ total }) => total),
+              client.getFinalizedCreditUsageCount({
+                clerkOrganizationId: organizationId,
+                startAt,
+                endAt,
+              }),
             { limit: 50, now: timestamp, after },
           ),
       }),

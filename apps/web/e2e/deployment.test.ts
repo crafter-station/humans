@@ -7,8 +7,8 @@ vi.mock("./vercel-bypass", () => ({ establishVercelBypass }));
 
 import { deploymentUrl, prepareDeploymentContext } from "./deployment";
 
-const publicProductionUrl = "https://humans.crafter.run/";
-const productionAcceptanceUrl = "https://acceptance.humans.crafter.run/";
+const publicProductionUrl = "https://humns.co/";
+const productionAcceptanceUrl = "https://acceptance.humns.co/";
 
 afterEach(() => {
   vi.clearAllMocks();
@@ -37,9 +37,9 @@ describe("Production deployment URL", () => {
 
   it.each([
     "https://humans-abcdef123-crafter-station.vercel.app/",
-    "https://another.humans.crafter.run/",
-    "https://humans.crafter.run",
-    "https://acceptance.humans.crafter.run",
+    "https://another.humns.co/",
+    "https://humns.co",
+    "https://acceptance.humns.co",
   ])("rejects the Production origin %s", (url) => {
     vi.stubEnv("PLAYWRIGHT_PRODUCTION_URL", url);
     vi.stubEnv("HUMANS_PRODUCTION_ACCEPTANCE_URL", productionAcceptanceUrl);
@@ -53,7 +53,7 @@ describe("Production deployment URL", () => {
     vi.stubEnv("PLAYWRIGHT_PRODUCTION_URL", productionAcceptanceUrl);
     vi.stubEnv(
       "HUMANS_PRODUCTION_ACCEPTANCE_URL",
-      "https://other.humans.crafter.run/",
+      "https://other.humns.co/",
     );
 
     expect(() => deploymentUrl("production")).toThrow(

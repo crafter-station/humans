@@ -12,6 +12,7 @@ import {
 import { DatabaseUnavailable, WorkspaceForbidden } from "./errors";
 import type {
   ClerkProjectionEvent,
+  ClerkProjectionState,
   DrizzleDatabase,
   MemberProjection,
   OrganizationProjection,
@@ -172,6 +173,91 @@ export const makeClerkService = (database: DrizzleDatabase) => {
       Effect.withSpan("Database.getWorkspace"),
     );
 
+  const getClerkProjectionStatus = (memberId: string, organizationId: string) =>
+    Effect.tryPromise({
+      try: async () => {
+        const [
+          [member],
+          [organization],
+          memberships,
+          [memberVersion],
+          [organizationVersion],
+          [membershipVersion],
+        ] = await Promise.all([
+          database
+            .select({ active: members.active })
+            .from(members)
+            .where(eq(members.clerkId, memberId))
+            .limit(1),
+          database
+            .select({ active: organizations.active })
+            .from(organizations)
+            .where(eq(organizations.clerkId, organizationId))
+            .limit(1),
+          database
+            .select({
+              active: organizationMemberships.active,
+              memberId: organizationMemberships.memberId,
+              organizationId: organizationMemberships.organizationId,
+            })
+            .from(organizationMemberships)
+            .where(
+              or(
+                eq(organizationMemberships.memberId, memberId),
+                eq(organizationMemberships.organizationId, organizationId),
+              ),
+            ),
+          database
+            .select({ active: clerkProjectionVersions.active })
+            .from(clerkProjectionVersions)
+            .where(
+              and(
+                eq(clerkProjectionVersions.entityType, "member"),
+                eq(clerkProjectionVersions.entityId, memberId),
+              ),
+            )
+            .limit(1),
+          database
+            .select({ active: clerkProjectionVersions.active })
+            .from(clerkProjectionVersions)
+            .where(
+              and(
+                eq(clerkProjectionVersions.entityType, "organization"),
+                eq(clerkProjectionVersions.entityId, organizationId),
+              ),
+            )
+            .limit(1),
+          database
+            .select({ active: clerkProjectionVersions.active })
+            .from(clerkProjectionVersions)
+            .where(
+              and(
+                eq(clerkProjectionVersions.entityType, "membership"),
+                eq(
+                  clerkProjectionVersions.entityId,
+                  `${memberId}:${organizationId}`,
+                ),
+              ),
+            )
+            .limit(1),
+        ]);
+        const membership = memberships.find(
+          (candidate) =>
+            candidate.memberId === memberId &&
+            candidate.organizationId === organizationId,
+        );
+
+        return {
+          member: projectionState(member, memberVersion),
+          membership: memberships.some((candidate) => candidate.active)
+            ? "active"
+            : projectionState(membership, membershipVersion),
+          organization: projectionState(organization, organizationVersion),
+        };
+      },
+      catch: (cause) => new DatabaseUnavailable({ cause }),
+    }).pipe(Effect.withSpan("Database.getClerkProjectionStatus"));
+
   const provisionWorkspace = (
     memberId: string,
     provision: () => Promise<ProvisionedWorkspace>,
@@ -209,7 +295,21 @@ export const makeClerkService = (database: DrizzleDatabase) => {
       catch: (cause) => new DatabaseUnavailable({ cause }),
     }).pipe(Effect.withSpan("Database.provisionWorkspace"));
 
-  return { getWorkspace, projectClerkEvent, provisionWorkspace };
+  return {
+    getClerkProjectionStatus,
+    getWorkspace,
+    projectClerkEvent,
+    provisionWorkspace,
+  };
+};
+
+const projectionState = (
+  projection: { active: boolean } | undefined,
+  version: { active: boolean } | undefined,
+): ClerkProjectionState => {
+  if (projection?.active) return "active";
+  if (version?.active !== false) return "unobserved";
+  return projection === undefined ? "absent" : "inactive";
 };
 
 const upsertOrganization = async (

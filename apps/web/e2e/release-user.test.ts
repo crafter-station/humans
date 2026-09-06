@@ -265,6 +265,27 @@ describe("release Member state", () => {
     expect(existsSync(file)).toBe(false);
   });
 
+  it("validates the projection ingress before deleting Preview fixtures", async () => {
+    const file = temporaryFile();
+    writeCompleteState(file);
+    const clerk = fakeClerk();
+
+    await expect(
+      cleanupReleaseUser(credentials, {
+        environment: {
+          ...environment,
+          HUMANS_ACCEPTANCE_API_URL: "https://api.humns.co/",
+          HUMANS_PROXY_SECRET: "unit-proxy-secret",
+        },
+        fetcher: clerk.fetcher,
+        file,
+        now: () => now,
+      }),
+    ).rejects.toThrow("projection verification configuration is invalid");
+    expect(clerk.deleteRequests()).toEqual([]);
+    expect(existsSync(file)).toBe(true);
+  });
+
   it("deletes only the validated disposable fixture and verifies Humans", async () => {
     const file = temporaryFile();
     writeCompleteState(file);

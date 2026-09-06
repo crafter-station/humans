@@ -2,7 +2,6 @@ import { Pool } from "@neondatabase/serverless";
 import {
   and,
   asc,
-  count,
   eq,
   gt,
   gte,
@@ -16,6 +15,7 @@ import {
   sql,
 } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/neon-serverless";
+import { alias } from "drizzle-orm/pg-core";
 
 import {
   confirmPaidCreditPeriodInTransaction,
@@ -24,6 +24,7 @@ import {
 import * as schema from "./schema";
 import {
   creditAccounts,
+  creditLedgerEntries,
   creditReconciliations,
   creditUsageOutbox,
   memberFreeCreditClaims,
@@ -38,6 +39,11 @@ import type { DrizzleDatabase, Transaction } from "./service/types";
 
 export const CREDIT_USAGE_DELIVERY_MAX_ATTEMPTS = 8;
 export type BillingDatabase = DrizzleDatabase;
+
+const reservationLedgerEntries = alias(
+  creditLedgerEntries,
+  "reservation_ledger_entries",
+);
 
 export type PolarSubscriptionStatus =
   | "incomplete"
@@ -238,8 +244,6 @@ export const getBillingCustomerSeed = async (
 };
 
 const checkoutClaimLeaseMilliseconds = 5 * 60_000;
-const checkoutReconciliationQuarantineMilliseconds =
-  checkoutClaimLeaseMilliseconds;
 
 export const claimPolarCheckout = (
   database: DrizzleDatabase,
@@ -416,41 +420,6 @@ export const clearPolarCheckoutClaim = async (
     )
     .returning({ organizationId: polarCustomers.organizationId });
   return cleared !== undefined;
-};
-
-export const releaseExpiredPolarCheckoutReconciliation = async (
-  database: DrizzleDatabase,
-  input: { organizationId: string; claimId: string; now?: Date },
-) => {
-  const now = input.now ?? new Date();
-  if (!input.organizationId.trim() || !input.claimId.trim() || !validDate(now))
-    throw new BillingStoreError("invalid_billing_input");
-  const [released] = await database
-    .update(polarCustomers)
-    .set({
-      checkoutClaimId: null,
-      checkoutClaimExpiresAt: null,
-      checkoutId: null,
-      checkoutUrl: null,
-      checkoutExpiresAt: null,
-      updatedAt: now,
-    })
-    .where(
-      and(
-        eq(polarCustomers.organizationId, input.organizationId),
-        eq(polarCustomers.checkoutClaimId, input.claimId),
-        isNull(polarCustomers.checkoutClaimExpiresAt),
-        isNull(polarCustomers.checkoutId),
-        lte(
-          polarCustomers.updatedAt,
-          new Date(
-            now.getTime() - checkoutReconciliationQuarantineMilliseconds,
-          ),
-        ),
-      ),
-    )
-    .returning({ organizationId: polarCustomers.organizationId });
-  return released !== undefined;
 };
 
 export const releasePolarCheckoutLease = async (
@@ -1014,23 +983,37 @@ export const backfillFinalizedCreditUsage = async (
         )
       order by consumption.created_at, consumption.id
       limit ${limit}
+    ), inserted_usage as (
+      insert into credit_usage_outbox (
+        consumption_entry_id,
+        ordinal,
+        idempotency_key,
+        organization_id,
+        occurred_at
+      )
+      select
+        consumption.id,
+        ordinal,
+        consumption.organization_id || ':' || consumption.idempotency_key || ':credit:' || ordinal,
+        consumption.organization_id,
+        consumption.created_at
+      from missing_consumptions consumption
+      cross join lateral generate_series(1, abs(consumption.amount)) ordinal
+      on conflict (consumption_entry_id, ordinal) do nothing
+      returning organization_id, occurred_at
     )
-    insert into credit_usage_outbox (
-      consumption_entry_id,
-      ordinal,
-      idempotency_key,
-      organization_id,
-      occurred_at
+    update credit_reconciliations reconciliation
+    set
+      status = 'pending',
+      resolved_at = null,
+      revision = reconciliation.revision + 1
+    where exists (
+      select 1
+      from inserted_usage usage
+      where usage.organization_id = reconciliation.organization_id
+        and reconciliation.period_start <= usage.occurred_at
+        and reconciliation.period_end > usage.occurred_at
     )
-    select
-      consumption.id,
-      ordinal,
-      consumption.organization_id || ':' || consumption.idempotency_key || ':credit:' || ordinal,
-      consumption.organization_id,
-      consumption.created_at
-    from missing_consumptions consumption
-    cross join lateral generate_series(1, abs(consumption.amount)) ordinal
-    on conflict (consumption_entry_id, ordinal) do nothing
   `);
 };
 
@@ -1182,17 +1165,22 @@ export const markCreditUsageDelivered = async (
     if (delivered.length !== input.ids.length)
       throw new BillingStoreError("usage_lease_lost");
     for (const item of delivered) {
-      let periods = await tx
-        .select()
-        .from(creditReconciliations)
+      const reopened = await tx
+        .update(creditReconciliations)
+        .set({
+          status: "pending",
+          resolvedAt: null,
+          revision: sql`${creditReconciliations.revision} + 1`,
+        })
         .where(
           and(
             eq(creditReconciliations.organizationId, item.organizationId),
             lte(creditReconciliations.periodStart, item.occurredAt),
             gt(creditReconciliations.periodEnd, item.occurredAt),
           ),
-        );
-      if (periods.length === 0) {
+        )
+        .returning({ id: creditReconciliations.id });
+      if (reopened.length === 0) {
         const [entitlement] = await tx
           .select({
             periodStart: organizationEntitlements.periodStart,
@@ -1220,25 +1208,23 @@ export const markCreditUsageDelivered = async (
               periodEnd: entitlement.periodEnd,
             })
             .onConflictDoNothing();
-          periods = await tx
-            .select()
-            .from(creditReconciliations)
+          await tx
+            .update(creditReconciliations)
+            .set({
+              status: "pending",
+              resolvedAt: null,
+              revision: sql`${creditReconciliations.revision} + 1`,
+            })
             .where(
               and(
                 eq(creditReconciliations.organizationId, item.organizationId),
                 lte(creditReconciliations.periodStart, item.occurredAt),
                 gt(creditReconciliations.periodEnd, item.occurredAt),
               ),
-            );
+            )
+            .returning({ id: creditReconciliations.id });
         }
       }
-      const [period] = periods;
-      if (periods.length !== 1 || !period)
-        throw new BillingStoreError("billing_period_unavailable");
-      await tx
-        .update(creditReconciliations)
-        .set({ status: "pending", resolvedAt: null })
-        .where(eq(creditReconciliations.id, period.id));
     }
   });
 };
@@ -1486,33 +1472,70 @@ export const reconcileCreditUsage = async (
   if (!reconciliation) return null;
   if (!reconciliation.periodStart || !reconciliation.periodEnd)
     throw new BillingStoreError("billing_period_unavailable");
-  const target = {
-    organizationId: reconciliation.organizationId,
-    startAt: reconciliation.periodStart,
-    endAt: reconciliation.periodEnd,
-  };
-  const [usage] = await database
-    .select({ total: count() })
-    .from(creditUsageOutbox)
-    .where(
-      and(
-        eq(creditUsageOutbox.organizationId, target.organizationId),
-        eq(creditUsageOutbox.state, "delivered"),
-        gte(creditUsageOutbox.occurredAt, target.startAt),
-        lt(creditUsageOutbox.occurredAt, target.endAt),
-      ),
-    );
-  const localCredits = Number(usage?.total ?? 0);
-  await database
-    .update(creditReconciliations)
-    .set({
-      localCredits,
-      status: "pending",
-      attempts: sql`${creditReconciliations.attempts} + 1`,
-      checkedAt: now,
-      lastError: null,
-    })
-    .where(eq(creditReconciliations.id, reconciliation.id));
+  const started = await database.transaction(async (tx) => {
+    await backfillFinalizedCreditUsage(tx);
+    const [current] = await tx
+      .select()
+      .from(creditReconciliations)
+      .where(eq(creditReconciliations.id, reconciliation.id))
+      .limit(1)
+      .for("update");
+    if (!current) return null;
+    if (!current.periodStart || !current.periodEnd)
+      throw new BillingStoreError("billing_period_unavailable");
+    const target = {
+      organizationId: current.organizationId,
+      startAt: current.periodStart,
+      endAt: current.periodEnd,
+    };
+    const [usage] = await tx
+      .select({
+        total: sql<string>`coalesce(sum(abs(${reservationLedgerEntries.amount})), 0)`,
+      })
+      .from(creditLedgerEntries)
+      .innerJoin(
+        reservationLedgerEntries,
+        and(
+          eq(
+            reservationLedgerEntries.organizationId,
+            creditLedgerEntries.organizationId,
+          ),
+          sql`${reservationLedgerEntries.referenceId} is not distinct from ${creditLedgerEntries.referenceId}`,
+          eq(reservationLedgerEntries.kind, "reservation"),
+          or(
+            sql`${creditLedgerEntries.idempotencyKey} = ${reservationLedgerEntries.idempotencyKey} || ':consumption'`,
+            sql`${creditLedgerEntries.idempotencyKey} = regexp_replace(${reservationLedgerEntries.idempotencyKey}, ':reservation$', ':consumption')`,
+          ),
+        ),
+      )
+      .where(
+        and(
+          eq(creditLedgerEntries.organizationId, target.organizationId),
+          eq(creditLedgerEntries.kind, "consumption"),
+          gte(creditLedgerEntries.createdAt, target.startAt),
+          lt(creditLedgerEntries.createdAt, target.endAt),
+        ),
+      );
+    const localCredits = Number(usage?.total ?? 0);
+    const [claimed] = await tx
+      .update(creditReconciliations)
+      .set({
+        localCredits,
+        status: "pending",
+        attempts: sql`${creditReconciliations.attempts} + 1`,
+        revision: sql`${creditReconciliations.revision} + 1`,
+        checkedAt: now,
+        lastError: null,
+      })
+      .where(eq(creditReconciliations.id, reconciliation.id))
+      .returning();
+    return claimed ? { reconciliation: claimed, localCredits, target } : null;
+  });
+  if (!started) return null;
+  const { localCredits, target } = started;
+
+  const currentResult = () =>
+    reconciliationPeriod(database, started.reconciliation.id);
 
   let polarCredits: number;
   try {
@@ -1527,9 +1550,14 @@ export const reconcileCreditUsage = async (
         lastError: safeProviderErrorCode(error),
         resolvedAt: null,
       })
-      .where(eq(creditReconciliations.id, reconciliation.id))
+      .where(
+        and(
+          eq(creditReconciliations.id, started.reconciliation.id),
+          eq(creditReconciliations.revision, started.reconciliation.revision),
+        ),
+      )
       .returning();
-    return failed ?? null;
+    return failed ?? currentResult();
   }
   const status = localCredits === polarCredits ? "matched" : "drift";
   const [completed] = await database
@@ -1540,9 +1568,14 @@ export const reconcileCreditUsage = async (
       lastError: null,
       resolvedAt: status === "matched" ? now : null,
     })
-    .where(eq(creditReconciliations.id, reconciliation.id))
+    .where(
+      and(
+        eq(creditReconciliations.id, started.reconciliation.id),
+        eq(creditReconciliations.revision, started.reconciliation.revision),
+      ),
+    )
     .returning();
-  return completed ?? null;
+  return completed ?? currentResult();
 };
 
 type CreditReconciliationCursor = {

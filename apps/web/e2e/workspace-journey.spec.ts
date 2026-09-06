@@ -1,6 +1,12 @@
-import { setupClerkTestingToken } from "@clerk/testing/playwright";
 import { expect, type Page, test } from "@playwright/test";
 
+import {
+  assertWorkspaceRequiresAuthentication,
+  authenticateImpersonatedMember,
+  setupClerkTestingTokenSafely,
+  signOutAndVerify,
+  verifyPersonalOrganization,
+} from "./browser-auth";
 import {
   environmentForProject,
   prepareDeploymentContext,
@@ -8,6 +14,7 @@ import {
   requiredClerkId,
   requiredEnvironment,
   requiredHttpsUrl,
+  requiredUuid,
 } from "./deployment";
 import {
   releaseUserCredentialsFromEnvironment,
@@ -15,6 +22,13 @@ import {
 } from "./release-user";
 
 test.describe.configure({ mode: "serial" });
+
+const publicProductionUrl = "https://humns.co/";
+
+type WorkspaceIdentity = {
+  memberId: string;
+  organizationId: string;
+};
 
 test("anonymous access remains private and non-indexable", async ({
   page,
@@ -28,6 +42,7 @@ test("anonymous access remains private and non-indexable", async ({
   const root = await page.goto(url.href);
   expect(root?.status()).toBe(200);
   assertDeploymentHeaders(root?.headers(), environment);
+  await assertWorkspaceRequiresAuthentication(page, url);
   await expect(page.locator('meta[name="robots"]')).toHaveAttribute(
     "content",
     "noindex, nofollow",
@@ -66,13 +81,25 @@ test("a disposable Member can use the core Organization journey", async ({
 }, testInfo) => {
   const environment = environmentForProject(testInfo.project.name);
   const { url } = await prepareDeploymentContext(page.context(), environment);
+  if (environment === "production" && url.href === publicProductionUrl) {
+    test.skip(
+      true,
+      "The public post-promotion pass must not reuse the deleted core fixture",
+    );
+  }
 
+  let authenticated = false;
   try {
-    if (environment === "preview") {
-      await signUpPreviewMember(page, url);
-    } else {
-      await signInProductionMember(page, url);
-    }
+    const identity =
+      environment === "preview"
+        ? await signUpPreviewMember(page, url)
+        : await signInProductionMember(page, url);
+    authenticated = true;
+    await verifyPersonalOrganization({
+      ...identity,
+      secretKey: requiredEnvironment("CLERK_SECRET_KEY"),
+    });
+    await assertWorkspaceProjection(page, identity);
 
     const operations = await page.goto(new URL("/operations", url).href);
     expect(operations?.status()).toBe(404);
@@ -83,12 +110,17 @@ test("a disposable Member can use the core Organization journey", async ({
 
     await runCoreWorkspaceJourney(page, environment);
   } finally {
-    await page.evaluate(() => window.Clerk?.signOut()).catch(() => undefined);
+    if (authenticated && !page.isClosed()) {
+      await signOutAndVerify(page, url);
+    }
   }
 });
 
-const signUpPreviewMember = async (page: Page, deployment: URL) => {
-  await setupClerkTestingToken({ page });
+const signUpPreviewMember = async (
+  page: Page,
+  deployment: URL,
+): Promise<WorkspaceIdentity> => {
+  await setupClerkTestingTokenSafely(page);
   const nonce = `${Date.now()}-${crypto.randomUUID()}`;
   const email = `humans-release-${nonce}+clerk_test@example.com`;
   const password = `Humans-release-${nonce}!Aa1`;
@@ -125,9 +157,13 @@ const signUpPreviewMember = async (page: Page, deployment: URL) => {
     throw new Error("Clerk did not activate the personal Organization");
   }
   writeReleaseUser({ email, organizationId, userId }, credentials);
+  return { memberId: userId, organizationId };
 };
 
-const signInProductionMember = async (page: Page, deployment: URL) => {
+const signInProductionMember = async (
+  page: Page,
+  deployment: URL,
+): Promise<WorkspaceIdentity> => {
   const expectedMemberId = requiredClerkId("E2E_PRODUCTION_MEMBER_ID", "user");
   const expectedOrganizationId = requiredClerkId(
     "E2E_PRODUCTION_ORGANIZATION_ID",
@@ -137,17 +173,18 @@ const signInProductionMember = async (page: Page, deployment: URL) => {
     "E2E_PRODUCTION_MEMBER_IMPERSONATION_URL",
   );
 
-  await page.goto(deployment.href);
-  await page.evaluate((url) => window.location.assign(url), impersonationUrl);
-  await page.waitForFunction(() => Boolean(window.Clerk?.user?.id));
-  expect(await page.evaluate(() => window.Clerk?.user?.id)).toBe(
+  await authenticateImpersonatedMember(
+    page,
+    deployment.href,
+    impersonationUrl,
     expectedMemberId,
-  );
-  await page.goto(new URL("/workspace", deployment).href);
-  await page.waitForFunction(() => Boolean(window.Clerk?.organization?.id));
-  expect(await page.evaluate(() => window.Clerk?.organization?.id)).toBe(
     expectedOrganizationId,
   );
+  await page.goto(new URL("/workspace", deployment).href);
+  return {
+    memberId: expectedMemberId,
+    organizationId: expectedOrganizationId,
+  };
 };
 
 const runCoreWorkspaceJourney = async (
@@ -176,9 +213,20 @@ const runCoreWorkspaceJourney = async (
     .getByLabel("Search", { exact: true })
     .fill(requiredEnvironment("E2E_PROFILE_QUERY"));
   await expect.poll(() => readSavedLists(page)).toEqual([]);
+  const searchResponse = page.waitForResponse(
+    (response) =>
+      response.request().method() === "GET" &&
+      new URL(response.url()).pathname === "/v1/profiles/search",
+  );
   await page.getByRole("button", { name: "Apply filters" }).click();
-  const firstResult = page.locator("tbody tr").first();
-  await expect(firstResult).toBeVisible();
+  await assertUniqueExpectedSearchResult(
+    await searchResponse,
+    requiredUuid("HUMANS_ACCEPTANCE_PROFILE_ID"),
+  );
+  const results = page.locator("tbody tr");
+  await expect(results).toHaveCount(1);
+  const expectedResult = results.first();
+  await expect(expectedResult).toBeVisible();
   await expect.poll(() => readCredits(billing)).toBe(creditsBeforeSearch - 1);
 
   const listName = `${environment} release ${crypto.randomUUID()}`;
@@ -192,7 +240,7 @@ const runCoreWorkspaceJourney = async (
     );
     await withPrompt(
       page,
-      () => firstResult.getByRole("button", { name: "+ Save" }).click(),
+      () => expectedResult.getByRole("button", { name: "+ Save" }).click(),
       listName,
     );
     listId = parseCreatedListId(await (await createResponse).json());
@@ -200,15 +248,32 @@ const runCoreWorkspaceJourney = async (
       page.getByText("Saved List created and Profile added."),
     ).toBeVisible();
     await expect(
-      firstResult.getByRole("button", { name: "Saved" }),
+      expectedResult.getByRole("button", { name: "Saved" }),
     ).toBeVisible();
 
-    const profileName = await firstResult.locator("td").first().innerText();
-    await firstResult.getByRole("button", { name: profileName }).click();
+    await expectedResult.locator("td").first().getByRole("button").click();
+    const selectedExpectedProfile = await page.evaluate(
+      (profileId) =>
+        new URL(window.location.href).searchParams.get("profile") === profileId,
+      requiredUuid("HUMANS_ACCEPTANCE_PROFILE_ID"),
+    );
+    if (!selectedExpectedProfile) {
+      throw new Error("The expected Profile detail was not selected");
+    }
     await page.getByLabel("Team note").fill("Browser acceptance note");
     await page.getByRole("button", { name: "Save note" }).click();
     await expect(page.getByText("Team note saved.")).toBeVisible();
+    const reloadedSearchResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === "GET" &&
+        new URL(response.url()).pathname === "/v1/profiles/search",
+    );
     await page.reload();
+    await assertUniqueExpectedSearchResult(
+      await reloadedSearchResponse,
+      requiredUuid("HUMANS_ACCEPTANCE_PROFILE_ID"),
+    );
+    await expect(page.locator("tbody tr")).toHaveCount(1);
     await expect(page.getByLabel("Team note")).toHaveValue(
       "Browser acceptance note",
     );
@@ -251,6 +316,71 @@ const runCoreWorkspaceJourney = async (
       );
       for (const list of runOwnedLists) await deleteSavedList(page, list.id);
     }
+  }
+};
+
+const assertWorkspaceProjection = async (
+  page: Page,
+  identity: WorkspaceIdentity,
+) => {
+  const outcome = await page.evaluate(async (expected) => {
+    try {
+      const response = await fetch("/api/workspace", { method: "POST" });
+      const body = (await response.json()) as unknown;
+      if (
+        response.status !== 200 ||
+        typeof body !== "object" ||
+        body === null ||
+        Array.isArray(body)
+      ) {
+        return "invalid";
+      }
+      return "memberId" in body &&
+        body.memberId === expected.memberId &&
+        "organizationId" in body &&
+        body.organizationId === expected.organizationId &&
+        "organizationName" in body &&
+        body.organizationName === "My Organization" &&
+        "role" in body &&
+        body.role === "org:admin"
+        ? "exact"
+        : "mismatch";
+    } catch {
+      return "invalid";
+    }
+  }, identity);
+  if (outcome !== "exact") {
+    throw new Error(
+      "The workspace personal Organization projection is invalid",
+    );
+  }
+};
+
+const assertUniqueExpectedSearchResult = async (
+  response: import("@playwright/test").Response,
+  expectedProfileId: string,
+) => {
+  let exact = false;
+  try {
+    const body = (await response.json()) as unknown;
+    exact =
+      response.status() === 200 &&
+      typeof body === "object" &&
+      body !== null &&
+      !Array.isArray(body) &&
+      "results" in body &&
+      Array.isArray(body.results) &&
+      body.results.length === 1 &&
+      typeof body.results[0] === "object" &&
+      body.results[0] !== null &&
+      !Array.isArray(body.results[0]) &&
+      "profileId" in body.results[0] &&
+      body.results[0].profileId === expectedProfileId;
+  } catch {
+    exact = false;
+  }
+  if (!exact) {
+    throw new Error("Search did not return only the expected Profile");
   }
 };
 

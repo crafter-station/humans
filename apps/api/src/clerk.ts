@@ -153,6 +153,7 @@ export const clerkIdentityBoundary: IdentityBoundary = {
     });
     const state = await clerk.authenticateRequest(request, {
       acceptsToken: "session_token",
+      authorizedParties: sessionAuthorizedParties(bindings),
     });
     if (!state.isAuthenticated) return null;
 
@@ -612,6 +613,20 @@ export const clerkIdentityBoundary: IdentityBoundary = {
         }
       : null;
   },
+};
+
+const sessionAuthorizedParties = (bindings: Bindings) => {
+  if (bindings.SENTRY_ENVIRONMENT === "production") {
+    return [
+      "https://humns.co",
+      "https://acceptance.humns.co",
+      "https://humans.crafter.run",
+    ];
+  }
+  if (bindings.SENTRY_ENVIRONMENT === "preview") {
+    return bindings.BILLING_APP_ORIGIN ? [bindings.BILLING_APP_ORIGIN] : [];
+  }
+  return ["http://localhost:3000", "http://127.0.0.1:3000"];
 };
 
 const isApiScope = (scope: string): scope is ApiScope =>

@@ -1197,7 +1197,7 @@ describe("deployed API acceptance", () => {
     await expect(
       runDeployedAcceptance(
         input({
-          apiUrl: "https://api.humans.crafter.run",
+          apiUrl: "https://api.humns.co",
           environment: "production",
           productionConfirmation: "wrong",
           fetch: async () => {
@@ -1234,7 +1234,7 @@ describe("deployed API acceptance", () => {
     await expect(
       runDeployedAcceptance(
         input({
-          apiUrl: "https://api.humans.crafter.run",
+          apiUrl: "https://api.humns.co",
           environment: "production",
           productionConfirmation: confirmation,
           ...change,

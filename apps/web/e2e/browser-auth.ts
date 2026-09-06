@@ -52,7 +52,9 @@ export const authenticateImpersonatedMember = async (
     );
     if (!matches) throw new Error("identity mismatch");
   } catch {
-    throw new Error("The impersonation did not authenticate the expected Member");
+    throw new Error(
+      "The impersonation did not authenticate the expected Member",
+    );
   }
 };
 
@@ -64,11 +66,7 @@ export const authenticateMemberWithSignInTicket = async (
   secretKey: string,
   fetcher: Fetcher = fetch,
 ) => {
-  const ticket = await createSignInTicket(
-    expectedMemberId,
-    secretKey,
-    fetcher,
-  );
+  const ticket = await createSignInTicket(expectedMemberId, secretKey, fetcher);
   await setupClerkTestingTokenSafely(page);
   try {
     await page.goto(deploymentUrl);
@@ -171,7 +169,9 @@ export const assertWorkspaceRequiresAuthentication = async (
   const location = response.headers().location;
   await response.dispose();
   if (status < 300 || status >= 400 || !location) {
-    throw new Error("Signed-out access did not redirect away from the workspace");
+    throw new Error(
+      "Signed-out access did not redirect away from the workspace",
+    );
   }
 };
 

@@ -73,7 +73,10 @@ access-token, and webhook settings documented in `apps/api/.dev.vars.example`.
 The web application requires
 `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, and
 `HUMANS_PROXY_SECRET`; set `HUMANS_API_URL` when the API is not available at
-`http://localhost:8787`.
+`http://localhost:8787`. Browser Profile search uses
+`NEXT_PUBLIC_HUMANS_API_URL`, which has the same local default but must be set to
+the environment's pinned `workers.dev` origin for deployed builds. Public
+Production switches to `https://api.humns.co` at runtime.
 
 | Environment | Cloudflare environment | Worker name             | Secret source                    |
 | ----------- | ---------------------- | ----------------------- | -------------------------------- |

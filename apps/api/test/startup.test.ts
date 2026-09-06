@@ -5,6 +5,7 @@ import {
   createApp,
   deployedApiConfigurationValid,
 } from "../src/app";
+import { clerkIdentityBoundary } from "../src/clerk";
 import { createPolarBoundary } from "../src/polar";
 
 it("initializes without generating randomness at module scope", () => {
@@ -18,6 +19,85 @@ it("initializes without generating randomness at module scope", () => {
     }),
   ).not.toThrow();
   expect(randomUUID).not.toHaveBeenCalled();
+});
+
+it("permits browser API preflights only from trusted web origins", async () => {
+  const app = createApp(
+    () => {
+      throw new Error("CORS requests must not initialize the database");
+    },
+    {
+      ...clerkIdentityBoundary,
+      authenticate: async () => null,
+      authenticateApiKey: async () => null,
+    },
+  );
+  const preflight = (
+    origin: string,
+    environment: "local" | "preview" | "production",
+  ) =>
+    app.request(
+      "https://api.humns.co/v1/profiles/search",
+      {
+        method: "OPTIONS",
+        headers: {
+          Origin: origin,
+          "Access-Control-Request-Headers": "authorization,idempotency-key",
+          "Access-Control-Request-Method": "GET",
+        },
+      },
+      { SENTRY_ENVIRONMENT: environment } as Bindings,
+    );
+
+  const production = await preflight(
+    "https://humns.co",
+    "production",
+  );
+  expect(production.status).toBe(204);
+  expect(production.headers.get("access-control-allow-origin")).toBe(
+    "https://humns.co",
+  );
+
+  const retiringProduction = await preflight(
+    "https://humans.crafter.run",
+    "production",
+  );
+  expect(retiringProduction.status).toBe(204);
+  expect(retiringProduction.headers.get("access-control-allow-origin")).toBe(
+    "https://humans.crafter.run",
+  );
+  expect(production.headers.get("access-control-allow-headers")).toBe(
+    "Authorization, Content-Type, Idempotency-Key",
+  );
+
+  const unauthenticated = await app.request(
+    "https://api.humns.co/v1/profiles/search?q=anthony",
+    { headers: { Origin: "https://humns.co" } },
+    { SENTRY_ENVIRONMENT: "production" } as Bindings,
+  );
+  expect(unauthenticated.status).toBe(401);
+  expect(unauthenticated.headers.get("access-control-allow-origin")).toBe(
+    "https://humns.co",
+  );
+
+  const preview = await preflight(
+    "https://humans-abcdef123-crafter-station.vercel.app",
+    "preview",
+  );
+  expect(preview.status).toBe(204);
+  expect(preview.headers.get("access-control-allow-origin")).toBe(
+    "https://humans-abcdef123-crafter-station.vercel.app",
+  );
+
+  const local = await preflight("http://localhost:3000", "local");
+  expect(local.status).toBe(204);
+  expect(local.headers.get("access-control-allow-origin")).toBe(
+    "http://localhost:3000",
+  );
+
+  const untrusted = await preflight("https://attacker.example", "production");
+  expect(untrusted.status).toBe(403);
+  expect(untrusted.headers.has("access-control-allow-origin")).toBe(false);
 });
 
 it("reports caught service failures without request data", async () => {

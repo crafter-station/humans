@@ -42,4 +42,9 @@ jobs:
       - name: Build
         run: bun run build
         env:
-          SKIP_ENV_VALIDATION: "1"
+          CLERK_SECRET_KEY: sk_test_ci_only
+          HUMANS_PROXY_SECRET: ci-only-proxy-secret
+          HUMANS_RELEASE_ENVIRONMENT: local
+          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: pk_test_ci_only
+          NEXT_PUBLIC_TURNSTILE_SITE_KEY: 1x00000000000000000000AA
+          TURNSTILE_SECRET_KEY: 1x00000000000000000000AA

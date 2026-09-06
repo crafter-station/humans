@@ -152,6 +152,9 @@ export const cleanupProductionMember = async (
 ) => {
   const now = options.now ?? Date.now;
   assertCleanupInput(input, now());
+  if (options.verifyProjection === undefined) {
+    productionProjectionConfiguration(options.environment ?? process.env);
+  }
   const fetcher = options.fetcher ?? fetch;
   const stateFile = options.stateFile ?? defaultCleanupStateFile;
   const priorValidation = readCleanupState(input.contract, stateFile, now());
@@ -803,11 +806,7 @@ const pollHumansProjection = async (
   fetcher: typeof fetch,
   sleep: (milliseconds: number) => Promise<unknown> = delay,
 ) => {
-  const api = approvedApiUrl(environment, "production");
-  const proxySecret = requiredEnvironment(environment, "HUMANS_PROXY_SECRET");
-  if (proxySecret.length < 16) {
-    throw new Error("Humans projection verification configuration is invalid");
-  }
+  const { api, proxySecret } = productionProjectionConfiguration(environment);
   const endpoint = new URL("/v1/internal/clerk-projections", api);
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const response = await clerkFetch(
@@ -817,6 +816,7 @@ const pollHumansProjection = async (
         method: "POST",
         headers: {
           "content-type": "application/json",
+          "X-Humans-Clerk-Projection": "cleanup",
           "X-Humans-Web-Proxy": proxySecret,
         },
         body: JSON.stringify({
@@ -846,6 +846,15 @@ const pollHumansProjection = async (
   throw new Error("Humans projection deletion could not be verified");
 };
 
+const productionProjectionConfiguration = (environment: Environment) => {
+  const api = approvedApiUrl(environment);
+  const proxySecret = requiredEnvironment(environment, "HUMANS_PROXY_SECRET");
+  if (proxySecret.length < 16) {
+    throw new Error("Humans projection verification configuration is invalid");
+  }
+  return { api, proxySecret };
+};
+
 const isInactiveProjection = (value: unknown) =>
   isRecord(value) &&
   (value.member === "inactive" || value.member === "absent") &&
@@ -855,10 +864,7 @@ const isInactiveProjection = (value: unknown) =>
     ["member", "membership", "organization"].includes(key),
   );
 
-const approvedApiUrl = (
-  environment: Environment,
-  target: "preview" | "production",
-) => {
+const approvedApiUrl = (environment: Environment) => {
   const value = requiredEnvironment(environment, "HUMANS_ACCEPTANCE_API_URL");
   let url: URL;
   try {
@@ -866,16 +872,9 @@ const approvedApiUrl = (
   } catch {
     throw new Error("Humans projection verification configuration is invalid");
   }
-  const hosts =
-    target === "preview"
-      ? new Set(["humans-api-preview.hi-541.workers.dev"])
-      : new Set([
-          "humans-api-production.hi-541.workers.dev",
-          "api.humans.crafter.run",
-        ]);
   if (
     url.protocol !== "https:" ||
-    !hosts.has(url.hostname) ||
+    url.hostname !== "humans-api-production.hi-541.workers.dev" ||
     url.username ||
     url.password ||
     url.port ||
@@ -986,6 +985,7 @@ const isClerkResource = (
 
 const isClerkId = (value: unknown, prefix: "org" | "user") =>
   typeof value === "string" &&
+  value.length <= 128 &&
   new RegExp(`^${prefix}_[A-Za-z0-9_-]+$`).test(value);
 
 const isIsoTimestamp = (value: unknown) =>

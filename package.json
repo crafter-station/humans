@@ -30,6 +30,7 @@
     "verify:web:production": "bun run --cwd apps/web verify:production",
     "lint": "biome lint .",
     "format": "biome format --write .",
+    "setup:polar:sandbox": "node scripts/setup-polar-sandbox.mjs",
     "check-types": "turbo run check-types",
     "test": "turbo run test",
     "test:browser": "bun run --cwd apps/web test:browser"

@@ -4,16 +4,15 @@ import {
   type CreatePolarBillingClientOptions,
   createPolarBillingClient,
   type EnsurePolarCustomerInput,
-  type GetMeterQuantitiesInput,
+  type GetFinalizedCreditUsageCountInput,
   POLAR_PRODUCTION_BASE_URL,
   POLAR_SANDBOX_BASE_URL,
   PolarBillingError,
-  type PolarCheckoutSession,
   type PolarCheckout,
+  type PolarCheckoutSession,
   type PolarCustomer,
   type PolarCustomerPortalSession,
   type PolarCustomerState,
-  type PolarMeterQuantities,
 } from "@humans/polar-billing";
 import { Webhook } from "standardwebhooks";
 import { z } from "zod";
@@ -135,10 +134,10 @@ export type PolarBoundary = {
     organizationId: string,
     bindings: Bindings,
   ): Promise<PolarCustomerState>;
-  getMeterQuantities(
-    input: GetMeterQuantitiesInput,
+  getFinalizedCreditUsageCount(
+    input: GetFinalizedCreditUsageCountInput,
     bindings: Bindings,
-  ): Promise<PolarMeterQuantities>;
+  ): Promise<number>;
   verifySubscriptionWebhook(
     request: Request,
     bindings: Bindings,
@@ -265,7 +264,7 @@ const applicationOrigin = (bindings: Bindings) => {
     bindings.SENTRY_ENVIRONMENT === "preview"
       ? /^humans-[a-z0-9]{9}-crafter-station\.vercel\.app$/i.test(url.hostname)
       : bindings.SENTRY_ENVIRONMENT === "production"
-        ? url.hostname === "humans.crafter.run"
+        ? url.hostname === "humns.co"
         : true;
   if (
     (url.protocol !== "https:" && url.protocol !== "http:") ||
@@ -620,8 +619,8 @@ export const createPolarBoundary = (
     return billingClient(bindings, fetch).getCustomerState(organizationId);
   },
 
-  getMeterQuantities(input, bindings) {
-    return billingClient(bindings, fetch).getMeterQuantities(input);
+  getFinalizedCreditUsageCount(input, bindings) {
+    return billingClient(bindings, fetch).getFinalizedCreditUsageCount(input);
   },
 
   async verifySubscriptionWebhook(request, bindings) {

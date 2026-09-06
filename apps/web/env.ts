@@ -63,6 +63,7 @@ const validatedEnv = createEnv({
   },
   client: {
     NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: z.string().min(1),
+    NEXT_PUBLIC_HUMANS_API_URL: apiUrl,
     NEXT_PUBLIC_TURNSTILE_SITE_KEY: turnstileKey,
   },
   runtimeEnv: {
@@ -74,6 +75,9 @@ const validatedEnv = createEnv({
     HUMANS_RELEASE_ENVIRONMENT: releaseEnvironment,
     NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:
       process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY,
+    NEXT_PUBLIC_HUMANS_API_URL:
+      process.env.NEXT_PUBLIC_HUMANS_API_URL ??
+      (releaseEnvironment === "local" ? "http://localhost:8787" : undefined),
     NEXT_PUBLIC_TURNSTILE_SITE_KEY: process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY,
     TURNSTILE_SECRET_KEY: process.env.TURNSTILE_SECRET_KEY,
   },

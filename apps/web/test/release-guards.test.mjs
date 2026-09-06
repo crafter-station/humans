@@ -144,6 +144,9 @@ describe("Vercel release guards", () => {
     expect(requiredVercelEnvironmentKeys).toContain(
       "NEXT_PUBLIC_TURNSTILE_SITE_KEY",
     );
+    expect(requiredVercelEnvironmentKeys).toContain(
+      "NEXT_PUBLIC_HUMANS_API_URL",
+    );
     expect(requiredVercelEnvironmentKeys).toContain("TURNSTILE_SECRET_KEY");
     expect(() =>
       assertVercelEnvironmentInventory({
@@ -244,9 +247,9 @@ describe("Vercel release guards", () => {
   it("accepts only unused non-public owned Production acceptance origins", () => {
     expect(
       assertProductionAcceptanceUrl(PRODUCTION_ACCEPTANCE_URL).hostname,
-    ).toBe("acceptance.humans.crafter.run");
+    ).toBe("acceptance.humns.co");
     expect(() =>
-      assertProductionAcceptanceUrl("https://humans.crafter.run/"),
+      assertProductionAcceptanceUrl("https://humns.co/"),
     ).toThrow("fixed Production acceptance URL");
     expect(() =>
       assertProductionAcceptanceUrl(
@@ -255,11 +258,11 @@ describe("Vercel release guards", () => {
     ).toThrow("fixed Production acceptance URL");
     expect(() =>
       assertProductionAcceptanceUrl(
-        "https://another.acceptance.humans.crafter.run/",
+        "https://another.acceptance.humns.co/",
       ),
     ).toThrow("fixed Production acceptance URL");
     expect(() =>
-      assertProductionAcceptanceUrl("https://acceptance.humans.crafter.run"),
+      assertProductionAcceptanceUrl("https://acceptance.humns.co"),
     ).toThrow("fixed Production acceptance URL");
     expect(() =>
       assertTemporaryAliasAvailable(
@@ -286,7 +289,7 @@ describe("Vercel release guards", () => {
 
   it("requires the fixed canary to be an unbound verified project domain", () => {
     const domain = {
-      apexName: "crafter.run",
+      apexName: "humns.co",
       customEnvironmentId: null,
       gitBranch: null,
       name: productionAcceptanceHostname,
@@ -314,7 +317,7 @@ describe("Vercel release guards", () => {
     expect(() =>
       assertProductionAcceptanceDomain({
         ...domain,
-        redirect: "humans.crafter.run",
+        redirect: "humns.co",
         redirectStatusCode: 308,
       }),
     ).toThrow("canary domain");
@@ -376,10 +379,7 @@ describe("Vercel release guards", () => {
   });
 
   it("detects any public alias movement during staged acceptance", () => {
-    const records = [
-      publicAlias("api.humans.crafter.run", "alias_api"),
-      publicAlias("humans.crafter.run", "alias_web"),
-    ];
+    const records = [publicAlias("humns.co", "alias_web")];
     const before = snapshotPublicProductionAliases(records, VERCEL_PROJECT_ID);
     expect(() =>
       assertPublicProductionAliasesUnchanged(before, [...before]),
@@ -387,7 +387,6 @@ describe("Vercel release guards", () => {
     expect(() =>
       assertPublicProductionAliasesUnchanged(before, [
         { ...before[0], deploymentId },
-        before[1],
       ]),
     ).toThrow("moved");
   });
@@ -418,13 +417,13 @@ describe("Vercel release guards", () => {
     expect(() =>
       assertFrozenDeployment({
         ...input,
-        deployment: { ...deployment, alias: ["humans.crafter.run"] },
+        deployment: { ...deployment, alias: ["humns.co"] },
       }),
     ).toThrow("frozen release");
     expect(() =>
       assertFrozenDeployment({
         ...input,
-        deploymentAliases: { aliases: [{ alias: "humans.crafter.run" }] },
+        deploymentAliases: { aliases: [{ alias: "humns.co" }] },
       }),
     ).toThrow("frozen release");
     expect(() =>

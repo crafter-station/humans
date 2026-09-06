@@ -48,6 +48,8 @@
   "env": {
     "preview": {
       "name": "humans-api-preview",
+      "workers_dev": true,
+      "preview_urls": true,
       "vars": {
         "BILLING_REQUIRED": "true",
         "SENTRY_ENVIRONMENT": "preview"
@@ -93,6 +95,9 @@
     },
     "production": {
       "name": "humans-api-production",
+      "workers_dev": true,
+      "preview_urls": true,
+      "routes": [{ "pattern": "api.humns.co", "custom_domain": true }],
       "vars": {
         "BILLING_REQUIRED": "true",
         "SENTRY_ENVIRONMENT": "production"

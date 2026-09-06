@@ -320,7 +320,7 @@ export const runDeployedAcceptance = async ({
     preview: new Set(["humans-api-preview.hi-541.workers.dev"]),
     production: new Set([
       "humans-api-production.hi-541.workers.dev",
-      "api.humans.crafter.run",
+      "api.humns.co",
     ]),
   };
   if (!Object.hasOwn(approvedHosts, environment)) {

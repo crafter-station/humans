@@ -6,8 +6,8 @@ export type ReleaseEnvironment = "preview" | "production";
 
 const immutableDeployment =
   /^humans-[a-z0-9]{9}-crafter-station\.vercel\.app$/i;
-const publicProductionUrl = "https://humans.crafter.run/";
-const productionAcceptanceUrl = "https://acceptance.humans.crafter.run/";
+const publicProductionUrl = "https://humns.co/";
+const productionAcceptanceUrl = "https://acceptance.humns.co/";
 
 export const requiredEnvironment = (name: string) => {
   const value = process.env[name]?.trim();

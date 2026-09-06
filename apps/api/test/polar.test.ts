@@ -284,7 +284,7 @@ describe("Polar configuration boundary", () => {
     expect(
       polarBoundary.billingConfigured({
         ...bindings,
-        BILLING_APP_ORIGIN: "https://humans.crafter.run",
+        BILLING_APP_ORIGIN: "https://humns.co",
         SENTRY_ENVIRONMENT: "production",
       }),
     ).toBe(true);
@@ -309,7 +309,7 @@ describe("Polar configuration boundary", () => {
       polarBoundary.billingConfigured({
         ...bindings,
         POLAR_BASE_URL: "https://sandbox-api.polar.sh/v1",
-        BILLING_APP_ORIGIN: "https://humans.crafter.run",
+        BILLING_APP_ORIGIN: "https://humns.co",
         SENTRY_ENVIRONMENT: "production",
       }),
     ).toThrowError(

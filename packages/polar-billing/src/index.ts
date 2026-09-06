@@ -38,7 +38,7 @@ export type PolarBillingOperation =
   | "create_customer_session"
   | "list_subscriptions"
   | "ingest_usage"
-  | "get_meter_quantities";
+  | "list_usage_events";
 
 const ERROR_MESSAGES: Record<PolarBillingErrorCode, string> = {
   invalid_configuration: "Invalid Polar billing configuration.",
@@ -148,23 +148,10 @@ export type PolarUsageIngestResult = {
   duplicates: number;
 };
 
-export type PolarMeterInterval = "year" | "month" | "week" | "day" | "hour";
-
-export type GetMeterQuantitiesInput = {
+export type GetFinalizedCreditUsageCountInput = {
   clerkOrganizationId: string;
   startAt: Date;
   endAt: Date;
-  interval: PolarMeterInterval;
-};
-
-export type PolarMeterQuantity = {
-  timestamp: Date;
-  quantity: number;
-};
-
-export type PolarMeterQuantities = {
-  quantities: readonly PolarMeterQuantity[];
-  total: number;
 };
 
 export type PolarBillingClient = {
@@ -187,9 +174,9 @@ export type PolarBillingClient = {
   ingestFinalizedCreditUsage(
     events: readonly FinalizedCreditUsage[],
   ): Promise<PolarUsageIngestResult>;
-  getMeterQuantities(
-    input: GetMeterQuantitiesInput,
-  ): Promise<PolarMeterQuantities>;
+  getFinalizedCreditUsageCount(
+    input: GetFinalizedCreditUsageCountInput,
+  ): Promise<number>;
 };
 
 export type CreatePolarBillingClientOptions = {
@@ -213,13 +200,6 @@ const CLERK_ORGANIZATION_ID = /^org_[A-Za-z0-9_-]+$/;
 const RFC_3339 =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const METER_INTERVALS = new Set<PolarMeterInterval>([
-  "year",
-  "month",
-  "week",
-  "day",
-  "hour",
-]);
 const MAX_ATTEMPTS = 3;
 const CUSTOMER_MEMBER_PAGE_LIMIT = 100;
 const MAX_CUSTOMER_MEMBER_LIST_PAGES = 10;
@@ -1693,10 +1673,10 @@ export const createPolarBillingClient = (
       return { inserted, duplicates };
     },
 
-    async getMeterQuantities(input) {
+    async getFinalizedCreditUsageCount(input) {
       const value = assertExactInputKeys(
         input,
-        ["clerkOrganizationId", "startAt", "endAt", "interval"],
+        ["clerkOrganizationId", "startAt", "endAt"],
         "input",
       );
       const clerkOrganizationId = requireClerkOrganizationId(
@@ -1705,48 +1685,72 @@ export const createPolarBillingClient = (
       const startAt = requireInputDate(value.startAt, "startAt");
       const endAt = requireInputDate(value.endAt, "endAt");
       if (startAt.getTime() >= endAt.getTime()) inputError("endAt");
-      const interval = value.interval;
-      if (
-        typeof interval !== "string" ||
-        !METER_INTERVALS.has(interval as PolarMeterInterval)
-      )
-        return inputError("interval");
+      // Polar's event filters are exclusive. Humans emits millisecond-precision
+      // timestamps, so subtracting one millisecond preserves [startAt, endAt).
+      const exclusiveStartAt = new Date(startAt.getTime() - 1);
+      if (!Number.isFinite(exclusiveStartAt.getTime())) inputError("startAt");
       const query = new URLSearchParams({
-        start_timestamp: startAt.toISOString(),
-        end_timestamp: endAt.toISOString(),
-        interval,
-        timezone: "UTC",
+        organization_id: organizationId,
         external_customer_id: clerkOrganizationId,
+        meter_id: usageMeterId,
+        name: usageEventName,
+        source: "user",
+        start_timestamp: exclusiveStartAt.toISOString(),
+        end_timestamp: endAt.toISOString(),
+        page: "1",
+        limit: "1",
       });
       const response = requireResponseObject(
         await request(
-          "get_meter_quantities",
-          `/meters/${encodeURIComponent(usageMeterId)}/quantities?${query.toString()}`,
+          "list_usage_events",
+          `/events/?${query.toString()}`,
           "GET",
           200,
         ),
-        "get_meter_quantities",
+        "list_usage_events",
       );
-      const responseQuantities = response.quantities;
-      if (!Array.isArray(responseQuantities))
-        return malformedResponse("get_meter_quantities");
-      const quantities = responseQuantities.map((item) => {
-        const quantity = requireResponseObject(item, "get_meter_quantities");
-        return {
-          timestamp: requireResponseDate(
-            quantity.timestamp,
-            "get_meter_quantities",
-          ),
-          quantity: requireResponseNumber(
-            quantity.quantity,
-            "get_meter_quantities",
-          ),
-        };
-      });
-      return {
-        quantities,
-        total: requireResponseNumber(response.total, "get_meter_quantities"),
-      };
+      if (!Array.isArray(response.items))
+        return malformedResponse("list_usage_events");
+      const pagination = requireResponseObject(
+        response.pagination,
+        "list_usage_events",
+      );
+      const totalCount = requireResponseInteger(
+        pagination.total_count,
+        "list_usage_events",
+      );
+      const maxPage = requireResponseInteger(
+        pagination.max_page,
+        "list_usage_events",
+      );
+      if (
+        response.items.length !== Math.min(totalCount, 1) ||
+        maxPage !== totalCount
+      )
+        malformedResponse("list_usage_events");
+      for (const item of response.items) {
+        const event = requireResponseObject(item, "list_usage_events");
+        requireUuidResponse(event.id, "list_usage_events");
+        const timestamp = requireResponseDate(
+          event.timestamp,
+          "list_usage_events",
+        );
+        if (
+          requireUuidResponse(event.organization_id, "list_usage_events") !==
+            organizationId ||
+          requireResponseString(
+            event.external_customer_id,
+            "list_usage_events",
+          ) !== clerkOrganizationId ||
+          requireResponseString(event.name, "list_usage_events") !==
+            usageEventName ||
+          event.source !== "user" ||
+          timestamp.getTime() < startAt.getTime() ||
+          timestamp.getTime() >= endAt.getTime()
+        )
+          malformedResponse("list_usage_events");
+      }
+      return totalCount;
     },
   };
 };

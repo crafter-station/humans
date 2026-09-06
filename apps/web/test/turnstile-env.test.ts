@@ -22,6 +22,10 @@ const loadEnv = async (
     HUMANS_PROXY_SECRET: "server-owned-proxy-secret",
     HUMANS_RELEASE_ENVIRONMENT: environment,
     NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: "pk_test_environment_validation",
+    NEXT_PUBLIC_HUMANS_API_URL:
+      environment === "local"
+        ? "http://localhost:8787"
+        : "https://humans-api-production.hi-541.workers.dev",
     SKIP_ENV_VALIDATION: "0",
     ...turnstile,
   };

@@ -24,7 +24,6 @@ import {
   recordPolarOrderRefund,
   redriveCreditUsage,
   releaseCreditUsage,
-  releaseExpiredPolarCheckoutReconciliation,
   releasePolarCheckoutLease,
 } from "../src/billing";
 import {
@@ -1000,7 +999,7 @@ describe("Polar billing and Credit periods", () => {
     ).resolves.toBe(false);
   });
 
-  it("fences an expired checkout lease before any Polar creation", async () => {
+  it("fences an expired lease and keeps a started checkout claim sticky", async () => {
     await seedOrganizations("organization_one");
     await recordPolarCustomer(database, {
       organizationId: "organization_one",
@@ -1052,25 +1051,15 @@ describe("Polar billing and Credit periods", () => {
       checkoutId: null,
     });
     await expect(
-      releaseExpiredPolarCheckoutReconciliation(database, {
-        organizationId: "organization_one",
-        claimId: replacement.claimId,
-        now: new Date("2026-09-03T12:11:00Z"),
-      }),
-    ).resolves.toBe(false);
-    await expect(
-      releaseExpiredPolarCheckoutReconciliation(database, {
-        organizationId: "organization_one",
-        claimId: replacement.claimId,
-        now: new Date("2026-09-03T12:11:01Z"),
-      }),
-    ).resolves.toBe(true);
-    await expect(
       claimPolarCheckout(database, {
         organizationId: "organization_one",
-        now: new Date("2026-09-03T12:11:01Z"),
+        now: new Date("2027-09-03T12:11:01Z"),
       }),
-    ).resolves.toMatchObject({ state: "claimed" });
+    ).resolves.toEqual({
+      state: "reconcile",
+      claimId: replacement.claimId,
+      checkoutId: null,
+    });
   });
 
   it("releases only the caller's unstarted checkout lease", async () => {
@@ -1423,6 +1412,233 @@ describe("Polar billing and Credit periods", () => {
     });
   });
 
+  it("detects finalized usage that has not been delivered to Polar", async () => {
+    await seedOrganizations("organization_one");
+    await database.insert(schema.organizationEntitlements).values({
+      organizationId: "organization_one",
+      tier: "free",
+      status: "active",
+      periodStart: PERIOD_START,
+      periodEnd: PERIOD_END,
+    });
+    await applyCreditEntry(database, {
+      organizationId: "organization_one",
+      idempotencyKey: "grant:pending-reconciliation",
+      kind: "grant",
+      amount: 1,
+    });
+    const operation = {
+      organizationId: "organization_one",
+      amount: 1,
+      referenceId: "search:pending-reconciliation",
+      idempotencyKey: "search:pending-reconciliation",
+      reservationKey: "idempotency-key" as const,
+      now: NOW,
+    };
+    await database.transaction((tx) => reserveCredit(tx, operation));
+    await database.transaction((tx) =>
+      finalizeCreditReservation(tx, operation),
+    );
+
+    await expect(
+      reconcileCreditUsage(
+        database,
+        {
+          organizationId: "organization_one",
+          startAt: PERIOD_START,
+          endAt: PERIOD_END,
+          now: NOW,
+        },
+        async () => 0,
+      ),
+    ).resolves.toMatchObject({
+      localCredits: 1,
+      polarCredits: 0,
+      status: "drift",
+    });
+  });
+
+  it("counts the complete finalized ledger beyond one backfill batch", async () => {
+    await seedOrganizations("organization_one");
+    await database.insert(schema.organizationEntitlements).values({
+      organizationId: "organization_one",
+      tier: "free",
+      status: "active",
+      periodStart: PERIOD_START,
+      periodEnd: PERIOD_END,
+    });
+    await database.insert(schema.creditLedgerEntries).values(
+      Array.from({ length: 101 }, (_, index) => {
+        const suffix = String(index).padStart(3, "0");
+        const referenceId = `search:legacy-${suffix}`;
+        const createdAt = new Date(PERIOD_START.getTime() + 86_400_000 + index);
+        return [
+          {
+            id: `legacy_reservation_${suffix}`,
+            organizationId: "organization_one",
+            idempotencyKey: `legacy-${suffix}`,
+            kind: "reservation",
+            amount: -1,
+            referenceId,
+            createdAt,
+          },
+          {
+            id: `legacy_consumption_${suffix}`,
+            organizationId: "organization_one",
+            idempotencyKey: `legacy-${suffix}:consumption`,
+            kind: "consumption",
+            amount: 0,
+            referenceId,
+            createdAt,
+          },
+        ];
+      }).flat(),
+    );
+
+    await expect(
+      reconcileCreditUsage(
+        database,
+        {
+          organizationId: "organization_one",
+          startAt: PERIOD_START,
+          endAt: PERIOD_END,
+          now: NOW,
+        },
+        async () => 0,
+      ),
+    ).resolves.toMatchObject({
+      localCredits: 101,
+      polarCredits: 0,
+      status: "drift",
+    });
+  });
+
+  it("acknowledges historical usage without a reconstructable billing period", async () => {
+    await seedOrganizations("organization_one");
+    await database.insert(schema.organizationEntitlements).values({
+      organizationId: "organization_one",
+      tier: "free",
+      status: "active",
+      periodStart: PERIOD_START,
+      periodEnd: PERIOD_END,
+    });
+    const occurredAt = new Date("2026-08-15T12:00:00Z");
+    await database.insert(schema.creditLedgerEntries).values([
+      {
+        id: "historical_reservation",
+        organizationId: "organization_one",
+        idempotencyKey: "historical",
+        kind: "reservation",
+        amount: -1,
+        referenceId: "search:historical",
+        createdAt: occurredAt,
+      },
+      {
+        id: "historical_consumption",
+        organizationId: "organization_one",
+        idempotencyKey: "historical:consumption",
+        kind: "consumption",
+        amount: 0,
+        referenceId: "search:historical",
+        createdAt: occurredAt,
+      },
+    ]);
+    const deliveredAt = new Date("2100-09-03T12:00:00Z");
+    const [usage] = await claimCreditUsage(database, {
+      leaseOwner: "historical-delivery",
+      now: deliveredAt,
+    });
+    if (!usage) throw new Error("Expected historical usage");
+
+    await expect(
+      markCreditUsageDelivered(database, {
+        ids: [usage.id],
+        leaseOwner: "historical-delivery",
+        deliveredAt,
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      database
+        .select({ state: schema.creditUsageOutbox.state })
+        .from(schema.creditUsageOutbox),
+    ).resolves.toEqual([{ state: "delivered" }]);
+  });
+
+  it("does not overwrite a late delivery with a stale matched result", async () => {
+    await seedOrganizations("organization_one");
+    await database.insert(schema.organizationEntitlements).values({
+      organizationId: "organization_one",
+      tier: "free",
+      status: "active",
+      periodStart: PERIOD_START,
+      periodEnd: PERIOD_END,
+    });
+    await applyCreditEntry(database, {
+      organizationId: "organization_one",
+      idempotencyKey: "grant:reconciliation-race",
+      kind: "grant",
+      amount: 1,
+    });
+    let meterReadStarted: (() => void) | undefined;
+    let finishMeterRead: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      meterReadStarted = resolve;
+    });
+    const finish = new Promise<void>((resolve) => {
+      finishMeterRead = resolve;
+    });
+    const reconciliation = reconcileCreditUsage(
+      database,
+      {
+        organizationId: "organization_one",
+        startAt: PERIOD_START,
+        endAt: PERIOD_END,
+        now: NOW,
+      },
+      async () => {
+        meterReadStarted?.();
+        await finish;
+        return 0;
+      },
+    );
+    await started;
+
+    const operation = {
+      organizationId: "organization_one",
+      amount: 1,
+      referenceId: "search:reconciliation-race",
+      idempotencyKey: "search:reconciliation-race",
+      reservationKey: "idempotency-key" as const,
+      now: NOW,
+    };
+    await database.transaction((tx) => reserveCredit(tx, operation));
+    await database.transaction((tx) =>
+      finalizeCreditReservation(tx, operation),
+    );
+    await database
+      .update(schema.creditUsageOutbox)
+      .set({ occurredAt: NOW, availableAt: NOW })
+      .where(eq(schema.creditUsageOutbox.organizationId, "organization_one"));
+    const [usage] = await claimCreditUsage(database, {
+      leaseOwner: "reconciliation-race",
+      now: NOW,
+    });
+    if (!usage) throw new Error("Expected late usage");
+    await markCreditUsageDelivered(database, {
+      ids: [usage.id],
+      leaseOwner: "reconciliation-race",
+      deliveredAt: NOW,
+    });
+    finishMeterRead?.();
+
+    await expect(reconciliation).resolves.toMatchObject({ status: "pending" });
+    await expect(
+      database.select().from(schema.creditReconciliations),
+    ).resolves.toEqual([
+      expect.objectContaining({ status: "pending", resolvedAt: null }),
+    ]);
+  });
+
   it("reopens and pages an exact historical period after late usage delivery", async () => {
     await database.insert(schema.members).values({ clerkId: "member_one" });
     await seedOrganizations("organization_one");
@@ -1470,7 +1686,7 @@ describe("Polar billing and Credit periods", () => {
         },
         async () => 0,
       ),
-    ).resolves.toMatchObject({ status: "matched", localCredits: 0 });
+    ).resolves.toMatchObject({ status: "drift", localCredits: 1 });
 
     await database.transaction((tx) =>
       rolloverCreditPeriodInTransaction(tx, "organization_one", PERIOD_END),

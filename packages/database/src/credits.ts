@@ -1,4 +1,4 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, lte, sql } from "drizzle-orm";
 
 import {
   creditAccounts,
@@ -831,7 +831,7 @@ export const finalizeCreditReservation = async (
       .returning();
   }
   if (!consumption) throw new Error("credit_consumption_insert_failed");
-  await tx
+  const queuedUsage = await tx
     .insert(creditUsageOutbox)
     .values(
       Array.from({ length: input.amount }, (_, index) => ({
@@ -844,7 +844,23 @@ export const finalizeCreditReservation = async (
     )
     .onConflictDoNothing({
       target: [creditUsageOutbox.consumptionEntryId, creditUsageOutbox.ordinal],
-    });
+    })
+    .returning({ id: creditUsageOutbox.id });
+  if (queuedUsage.length > 0)
+    await tx
+      .update(creditReconciliations)
+      .set({
+        status: "pending",
+        resolvedAt: null,
+        revision: sql`${creditReconciliations.revision} + 1`,
+      })
+      .where(
+        and(
+          eq(creditReconciliations.organizationId, input.organizationId),
+          lte(creditReconciliations.periodStart, consumption.createdAt),
+          gt(creditReconciliations.periodEnd, consumption.createdAt),
+        ),
+      );
   return { applied: !state.consumption };
 };
 

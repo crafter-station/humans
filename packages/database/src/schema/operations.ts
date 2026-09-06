@@ -155,6 +155,7 @@ export const creditReconciliations = pgTable(
     periodEnd: timestamp("period_end", { withTimezone: true }),
     status: text("status").notNull(),
     attempts: integer("attempts").notNull().default(0),
+    revision: integer("revision").notNull().default(0),
     lastError: text("last_error"),
     checkedAt: timestamp("checked_at", { withTimezone: true })
       .notNull()
@@ -168,7 +169,9 @@ export const creditReconciliations = pgTable(
     ),
     uniqueIndex("credit_reconciliations_period_unique")
       .on(table.organizationId, table.periodStart, table.periodEnd)
-      .where(sql`${table.periodStart} is not null and ${table.periodEnd} is not null`),
+      .where(
+        sql`${table.periodStart} is not null and ${table.periodEnd} is not null`,
+      ),
   ],
 );
 

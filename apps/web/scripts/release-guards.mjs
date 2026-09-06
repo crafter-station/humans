@@ -7,12 +7,11 @@ import {
 export const VERCEL_PROJECT_ID = "prj_1rRwDoknIk65eWIHIScwyuuHDthI";
 export const VERCEL_OWNER_ID = "team_aWZAJNYntEQ3eN0NdKiQnf6v";
 export const PRODUCTION_ACCEPTANCE_URL =
-  "https://acceptance.humans.crafter.run/";
+  "https://acceptance.humns.co/";
 const productionAcceptanceHostname = new URL(PRODUCTION_ACCEPTANCE_URL)
   .hostname;
 export const PUBLIC_PRODUCTION_ALIASES = Object.freeze([
-  "api.humans.crafter.run",
-  "humans.crafter.run",
+  "humns.co",
 ]);
 
 export const requiredVercelEnvironmentKeys = Object.freeze([
@@ -20,6 +19,7 @@ export const requiredVercelEnvironmentKeys = Object.freeze([
   "HUMANS_API_URL",
   "HUMANS_PROXY_SECRET",
   "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY",
+  "NEXT_PUBLIC_HUMANS_API_URL",
   "NEXT_PUBLIC_SENTRY_DSN",
   "NEXT_PUBLIC_SENTRY_ENVIRONMENT",
   "NEXT_PUBLIC_TURNSTILE_SITE_KEY",
@@ -151,7 +151,7 @@ export const assertProductionAcceptanceUrl = (value) => {
 export const assertProductionAcceptanceDomain = (domain) => {
   if (
     domain?.name !== productionAcceptanceHostname ||
-    domain?.apexName !== "crafter.run" ||
+    domain?.apexName !== "humns.co" ||
     domain?.projectId !== VERCEL_PROJECT_ID ||
     domain?.verified !== true ||
     domain?.redirect !== null ||
@@ -254,7 +254,10 @@ export const assertOnlyTemporaryDeploymentAlias = (inventory, identity) => {
 };
 
 export const snapshotPublicProductionAliases = (aliases, projectId) => {
-  if (!Array.isArray(aliases) || aliases.length !== 2) {
+  if (
+    !Array.isArray(aliases) ||
+    aliases.length !== PUBLIC_PRODUCTION_ALIASES.length
+  ) {
     throw new Error("The public Production aliases are unavailable");
   }
   const snapshot = aliases

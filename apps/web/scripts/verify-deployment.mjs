@@ -128,7 +128,7 @@ export const readVercelProjectDomain = (domain) =>
 
 export const readVercelAliasInventory = (alias) =>
   selectVercelAliasInventory(
-    vercelJson("/v4/aliases?domain=crafter.run&limit=100", {
+    vercelJson("/v4/aliases?domain=humns.co&limit=100", {
       paginate: true,
     }),
     alias,

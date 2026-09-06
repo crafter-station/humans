@@ -91,6 +91,61 @@ type DatabaseLayerFactory = (bindings: Bindings) => DatabaseLayer;
 const isOrganizationAdminRole = (role: string) =>
   role === "org:admin" || role === "admin";
 
+const browserApiPath = (path: string) =>
+  path === "/v1/profiles/search" ||
+  path === "/v1/profiles/search/interpret" ||
+  /^\/v1\/profiles\/[^/]+$/.test(path);
+
+const trustedBrowserOrigin = (
+  value: string | undefined,
+  environment: string | undefined,
+) => {
+  if (value === undefined) return null;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (url.origin !== value) return null;
+
+  if (environment === "production") {
+    if (url.origin === "https://humns.co") return url.origin;
+    if (url.origin === "https://humans.crafter.run") return url.origin;
+    if (url.origin === "https://acceptance.humns.co")
+      return url.origin;
+  }
+  if (
+    (environment === "preview" || environment === "production") &&
+    url.protocol === "https:" &&
+    /^humans-[a-z0-9]{9}-crafter-station\.vercel\.app$/i.test(url.hostname)
+  ) {
+    return url.origin;
+  }
+  if (
+    environment !== "preview" &&
+    environment !== "production" &&
+    url.protocol === "http:" &&
+    url.port === "3000" &&
+    (url.hostname === "localhost" || url.hostname === "127.0.0.1")
+  ) {
+    return url.origin;
+  }
+  return null;
+};
+
+const browserCorsHeaders = (
+  context: Context<{ Bindings: Bindings }>,
+  origin: string,
+) => {
+  context.header("Access-Control-Allow-Origin", origin);
+  context.header(
+    "Access-Control-Expose-Headers",
+    "RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset, Retry-After, X-Correlation-ID",
+  );
+  context.header("Vary", "Origin");
+};
+
 const healthResponse = z
   .object({
     checks: z.object({
@@ -451,6 +506,19 @@ const publicProfileRequestInput = z
   })
   .strict();
 
+const clerkProjectionInput = z
+  .object({
+    memberId: z
+      .string()
+      .max(128)
+      .regex(/^user_[A-Za-z0-9_-]+$/),
+    organizationId: z
+      .string()
+      .max(128)
+      .regex(/^org_[A-Za-z0-9_-]+$/),
+  })
+  .strict();
+
 const maximumPublicProfileRequestBytes = 4_096;
 
 const operatorDecision = z
@@ -641,6 +709,34 @@ export const createApp = (
     if (environment === "preview" || environment === "production")
       context.header("X-Humans-Environment", environment);
   });
+  app.use("/v1/*", async (context, next) => {
+    if (!browserApiPath(context.req.path)) return next();
+
+    const origin = trustedBrowserOrigin(
+      context.req.header("Origin"),
+      context.env?.SENTRY_ENVIRONMENT,
+    );
+    if (
+      context.req.method === "OPTIONS" &&
+      context.req.header("Access-Control-Request-Method")
+    ) {
+      if (origin === null) {
+        privateResponse(context);
+        return context.body(null, 403);
+      }
+      browserCorsHeaders(context, origin);
+      context.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      context.header(
+        "Access-Control-Allow-Headers",
+        "Authorization, Content-Type, Idempotency-Key",
+      );
+      context.header("Access-Control-Max-Age", "600");
+      return context.body(null, 204);
+    }
+
+    await next();
+    if (origin !== null) browserCorsHeaders(context, origin);
+  });
   let naturalSearch: NaturalSearchInterpreter | undefined;
   const organizationRequests = new Map<string, number[]>();
   const memberRequests = new Map<string, number[]>();
@@ -823,6 +919,50 @@ export const createApp = (
       return limited instanceof Response ? limited : context.body(null, 204);
     },
   );
+
+  app.post("/v1/internal/clerk-projections", async (context) => {
+    privateResponse(context);
+    if (
+      context.env?.WEB_PROXY_SECRET === undefined ||
+      context.req.header("X-Humans-Web-Proxy") !==
+        context.env.WEB_PROXY_SECRET ||
+      context.req.header("X-Humans-Clerk-Projection") !== "cleanup"
+    ) {
+      return internalForbidden(context);
+    }
+    const input = clerkProjectionInput.safeParse(
+      await context.req.json().catch(() => null),
+    );
+    if (!input.success)
+      return validationError(context, "invalid_clerk_projection_target");
+
+    try {
+      const projection = await runDatabase(context, (database) =>
+        database.getClerkProjectionStatus(
+          input.data.memberId,
+          input.data.organizationId,
+        ),
+      );
+      if (
+        Object.values(projection).some(
+          (state) => state !== "inactive" && state !== "absent",
+        )
+      ) {
+        return context.json(
+          {
+            error: {
+              code: "clerk_projections_pending",
+              message: "Clerk projection cleanup is pending",
+            },
+          },
+          409,
+        );
+      }
+      return context.json(projection, 200);
+    } catch (error) {
+      return unavailable(context, error, "clerk.projections.read");
+    }
+  });
 
   app.post("/v1/public/profile-requests", async (context) => {
     privateResponse(context);
@@ -1152,17 +1292,14 @@ export const createApp = (
               reason: input.data.reason,
             },
             (target) =>
-              polar
-                .getMeterQuantities(
-                  {
-                    clerkOrganizationId: target.organizationId,
-                    startAt: target.startAt,
-                    endAt: target.endAt,
-                    interval: "day",
-                  },
-                  context.env,
-                )
-                .then(({ total }) => total),
+              polar.getFinalizedCreditUsageCount(
+                {
+                  clerkOrganizationId: target.organizationId,
+                  startAt: target.startAt,
+                  endAt: target.endAt,
+                },
+                context.env,
+              ),
           ),
         );
         return reconciliation
@@ -1686,6 +1823,7 @@ export const createApp = (
             );
           }
         } else {
+          // List absence cannot prove that the original checkout POST failed.
           const knownCheckout = await polar.findProCheckoutByClaim(
             claimId,
             admin.organizationId,
@@ -1705,13 +1843,6 @@ export const createApp = (
                 organizationId: admin.organizationId,
                 claimId,
                 checkoutId: null,
-              }),
-            );
-          } else if (knownCheckout === null) {
-            cleared = await runDatabase(context, (database) =>
-              database.releaseExpiredPolarCheckoutReconciliation({
-                organizationId: admin.organizationId,
-                claimId,
               }),
             );
           }
@@ -3218,6 +3349,17 @@ const publicProfileRequestForbidden = (context: Context) =>
       error: {
         code: "forbidden",
         message: "Request origin is not allowed",
+      },
+    },
+    403,
+  );
+
+const internalForbidden = (context: Context) =>
+  context.json(
+    {
+      error: {
+        code: "forbidden",
+        message: "Internal request is not authorized",
       },
     },
     403,

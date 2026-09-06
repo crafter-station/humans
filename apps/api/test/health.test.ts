@@ -67,7 +67,7 @@ describe("Humans API", () => {
     const rateLimitBinding = { limit: async () => ({ success: true }) };
     const healthResponse = await app.request("/health", {}, {
       API_KEY_RATE_LIMITER: rateLimitBinding,
-      BILLING_APP_ORIGIN: "https://humans.crafter.run",
+      BILLING_APP_ORIGIN: "https://humns.co",
       BILLING_REQUIRED: "true",
       CLERK_BOT_PROTECTION_ENABLED: "true",
       CLERK_PUBLISHABLE_KEY: `pk_live_${"a".repeat(24)}`,
@@ -292,6 +292,178 @@ describe("Humans API", () => {
     expect(deleteFirstWorkspace.status).toBe(403);
   });
 
+  it("verifies Clerk projection cleanup only for the exact web proxy", async () => {
+    const memberId = "user_projectioncleanup";
+    const organizationId = "org_projectioncleanup";
+    const proxySecret = "server-owned-proxy-secret";
+    const release = "b".repeat(40);
+    const bindings = {
+      SENTRY_ENVIRONMENT: "preview",
+      SENTRY_RELEASE: release,
+      WEB_PROXY_SECRET: proxySecret,
+    } as Bindings;
+    const cleanupHeaders = {
+      "X-Humans-Clerk-Projection": "cleanup",
+      "X-Humans-Web-Proxy": proxySecret,
+    };
+    const request = (headers: Record<string, string>, body: unknown) =>
+      app.request(
+        "/v1/internal/clerk-projections",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", ...headers },
+          body: JSON.stringify(body),
+        },
+        bindings,
+      );
+
+    const unauthorized = await request({}, { memberId, organizationId });
+    expect(unauthorized.status).toBe(403);
+    const publiclyProxied = await request(
+      { "X-Humans-Web-Proxy": proxySecret },
+      { memberId, organizationId },
+    );
+    expect(publiclyProxied.status).toBe(403);
+    const malformed = await request(cleanupHeaders, {
+      memberId: "member_wrong",
+      organizationId,
+    });
+    expect(malformed.status).toBe(422);
+
+    await postWebhook(app, {
+      id: "evt_projection_cleanup_membership",
+      sourceUpdatedAt: 20,
+      type: "membership.upsert",
+      member: {
+        clerkId: memberId,
+        email: "cleanup@example.com",
+        imageUrl: null,
+        name: "Cleanup Member",
+      },
+      membership: {
+        clerkId: "orgmem_projectioncleanup",
+        memberId,
+        organizationId,
+        role: "org:admin",
+      },
+      organization: {
+        clerkId: organizationId,
+        name: "Cleanup Organization",
+        slug: "cleanup-organization",
+      },
+    });
+    const relatedOrganizationId = "org_projectioncleanuprelated";
+    await postWebhook(app, {
+      id: "evt_projection_cleanup_related_membership",
+      sourceUpdatedAt: 20,
+      type: "membership.upsert",
+      member: {
+        clerkId: memberId,
+        email: "cleanup@example.com",
+        imageUrl: null,
+        name: "Cleanup Member",
+      },
+      membership: {
+        clerkId: "orgmem_projectioncleanuprelated",
+        memberId,
+        organizationId: relatedOrganizationId,
+        role: "org:member",
+      },
+      organization: {
+        clerkId: relatedOrganizationId,
+        name: "Related Organization",
+        slug: "related-organization",
+      },
+    });
+
+    const active = await request(cleanupHeaders, { memberId, organizationId });
+    expect(active.status).toBe(409);
+
+    await postWebhook(app, {
+      id: "evt_projection_cleanup_membership_deleted",
+      sourceUpdatedAt: 21,
+      type: "membership.delete",
+      memberId,
+      organizationId,
+    });
+    await postWebhook(app, {
+      id: "evt_projection_cleanup_member_deleted",
+      sourceUpdatedAt: 21,
+      type: "member.delete",
+      memberId,
+    });
+    await postWebhook(app, {
+      id: "evt_projection_cleanup_organization_deleted",
+      sourceUpdatedAt: 21,
+      type: "organization.delete",
+      organizationId,
+    });
+
+    const relatedActive = await request(cleanupHeaders, {
+      memberId,
+      organizationId,
+    });
+    expect(relatedActive.status).toBe(409);
+    await postWebhook(app, {
+      id: "evt_projection_cleanup_related_membership_deleted",
+      sourceUpdatedAt: 21,
+      type: "membership.delete",
+      memberId,
+      organizationId: relatedOrganizationId,
+    });
+
+    const inactive = await request(cleanupHeaders, {
+      memberId,
+      organizationId,
+    });
+    expect(inactive.status).toBe(200);
+    expect(inactive.headers.get("x-humans-environment")).toBe("preview");
+    expect(inactive.headers.get("x-humans-release")).toBe(release);
+    await expect(inactive.json()).resolves.toEqual({
+      member: "inactive",
+      membership: "inactive",
+      organization: "inactive",
+    });
+
+    const absentMemberId = "user_absentprojection";
+    const absentOrganizationId = "org_absentprojection";
+    const neverObserved = await request(cleanupHeaders, {
+      memberId: absentMemberId,
+      organizationId: absentOrganizationId,
+    });
+    expect(neverObserved.status).toBe(409);
+    await postWebhook(app, {
+      id: "evt_absent_projection_membership_deleted",
+      sourceUpdatedAt: 22,
+      type: "membership.delete",
+      memberId: absentMemberId,
+      organizationId: absentOrganizationId,
+    });
+    await postWebhook(app, {
+      id: "evt_absent_projection_member_deleted",
+      sourceUpdatedAt: 22,
+      type: "member.delete",
+      memberId: absentMemberId,
+    });
+    await postWebhook(app, {
+      id: "evt_absent_projection_organization_deleted",
+      sourceUpdatedAt: 22,
+      type: "organization.delete",
+      organizationId: absentOrganizationId,
+    });
+
+    const absent = await request(cleanupHeaders, {
+      memberId: absentMemberId,
+      organizationId: absentOrganizationId,
+    });
+    expect(absent.status).toBe(200);
+    await expect(absent.json()).resolves.toEqual({
+      member: "absent",
+      membership: "absent",
+      organization: "absent",
+    });
+  });
+
   it("provisions one personal Organization and preserves invitation membership", async () => {
     identity.sessions.set("new_session", {
       memberId: "new_member",
@@ -418,7 +590,7 @@ describe("Humans API", () => {
             }
           : null,
       }),
-      getMeterQuantities: async () => ({ quantities: [], total: 0 }),
+      getFinalizedCreditUsageCount: async () => 0,
       verifySubscriptionWebhook: async () => null,
       verifyBillingWebhook: async () => null,
     } satisfies PolarBoundary;
@@ -533,12 +705,15 @@ describe("Humans API", () => {
       .where(
         eq(schema.polarCustomers.organizationId, "personal_billing_member"),
       );
-    const boundedRetry = await billingApp.request("/v1/billing/checkout", {
+    const ambiguousRetry = await billingApp.request("/v1/billing/checkout", {
       method: "POST",
       headers: { authorization: "Bearer billing_session" },
     });
-    expect(boundedRetry.status).toBe(201);
-    expect(createProCheckout).toHaveBeenCalledTimes(4);
+    expect(ambiguousRetry.status).toBe(409);
+    await expect(ambiguousRetry.json()).resolves.toMatchObject({
+      error: { code: "checkout_in_progress" },
+    });
+    expect(createProCheckout).toHaveBeenCalledTimes(3);
 
     await database
       .update(schema.polarCustomers)
@@ -561,8 +736,8 @@ describe("Humans API", () => {
     await expect(recovered.json()).resolves.toMatchObject({
       url: checkoutSession.url,
     });
-    expect(createProCheckout).toHaveBeenCalledTimes(4);
-    expect(findOpenProCheckout).toHaveBeenCalledTimes(4);
+    expect(createProCheckout).toHaveBeenCalledTimes(3);
+    expect(findOpenProCheckout).toHaveBeenCalledTimes(3);
     expect(findProCheckoutByClaim).toHaveBeenCalledTimes(3);
 
     knownCheckoutStatus = "succeeded";
@@ -578,7 +753,7 @@ describe("Humans API", () => {
       headers: { authorization: "Bearer billing_session" },
     });
     expect(afterSucceeded.status).toBe(201);
-    expect(createProCheckout).toHaveBeenCalledTimes(5);
+    expect(createProCheckout).toHaveBeenCalledTimes(4);
 
     subscriptionStatus = "active";
     const activeSubscription = await billingApp.request(
@@ -605,7 +780,7 @@ describe("Humans API", () => {
       },
     );
     expect(afterPreflightFailure.status).toBe(201);
-    expect(createProCheckout).toHaveBeenCalledTimes(6);
+    expect(createProCheckout).toHaveBeenCalledTimes(5);
 
     subscriptionStatus = "active";
     await billingApp.request("/v1/billing/checkout", {
@@ -629,7 +804,7 @@ describe("Humans API", () => {
       },
     );
     expect(afterRejectedCreation.status).toBe(201);
-    expect(createProCheckout).toHaveBeenCalledTimes(8);
+    expect(createProCheckout).toHaveBeenCalledTimes(7);
 
     billingIdentity.sessions.set("billing_invited_session", {
       memberId: "billing_invited_member",
@@ -715,7 +890,7 @@ describe("Humans API", () => {
         },
         proSubscription: null,
       }),
-      getMeterQuantities: async () => ({ quantities: [], total: 0 }),
+      getFinalizedCreditUsageCount: async () => 0,
       verifySubscriptionWebhook: async () => null,
       verifyBillingWebhook: async () => null,
     } satisfies PolarBoundary;
@@ -801,7 +976,7 @@ describe("Humans API", () => {
         },
         proSubscription: null,
       }),
-      getMeterQuantities: async () => ({ quantities: [], total: 0 }),
+      getFinalizedCreditUsageCount: async () => 0,
       verifySubscriptionWebhook: async () => null,
       verifyBillingWebhook: async () => null,
     } satisfies PolarBoundary;

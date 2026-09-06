@@ -255,6 +255,24 @@ describe("Production Member cleanup", () => {
     expect(existsSync(stateFile)).toBe(false);
   });
 
+  it("validates the projection ingress before deleting Production fixtures", async () => {
+    const stateFile = temporaryFile();
+    const clerk = fakeClerk();
+
+    await expect(
+      cleanupProductionMember(validInput(), {
+        environment: {
+          HUMANS_ACCEPTANCE_API_URL: "https://api.humns.co/",
+          HUMANS_PROXY_SECRET: "unit-proxy-secret",
+        },
+        fetcher: clerk.fetcher,
+        now: () => now,
+        stateFile,
+      }),
+    ).rejects.toThrow("projection verification configuration is invalid");
+    expect(clerk.deleteRequests()).toEqual([]);
+  });
+
   it("deletes only the validated Organization and Member, then verifies Humans", async () => {
     const stateFile = temporaryFile();
     const clerk = fakeClerk();

@@ -25,20 +25,61 @@ branches, API credentials, webhook secrets, or encryption/signing secrets.
 | Deepline credential ID | Local credential | Pending | Pending |
 | Sentry project/environment | Local | `cueva/humans-preview` (`4512020599144448`) / Preview | `cueva/humans` (`4512020552089600`) / Production |
 
-The production web application is `https://humans.crafter.run`. The HTTP API,
+The production web application is `https://humns.co`. The HTTP API,
 MCP endpoint, Scalar documentation, and OpenAPI contract are available at
-`https://api.humans.crafter.run`. Spaceship DNS points both hostnames to Vercel;
-the API hostname is host-gated at the Vercel edge and rewritten to the production
-Cloudflare Worker. The API continues to execute entirely on Cloudflare Workers,
-without delegating or modifying the parent `crafter.run` nameservers. Staging
-uses the Clerk development instance; production uses the Clerk production
-instance.
+`https://api.humns.co`. Spaceship remains the registrar, while the domain uses
+Cloudflare's authoritative nameservers. The apex is a DNS-only record targeting
+Vercel. The API hostname is a Cloudflare Worker Custom Domain and reaches the
+Production Worker directly with Cloudflare-managed DNS and TLS. Staging uses
+the Clerk development instance; production uses the Clerk production instance.
+
+On the public Production hostname, browser Profile search, natural-language
+interpretation, and Profile detail requests call `api.humns.co`
+directly with a short-lived Clerk session token. The Worker permits those
+browser routes only from the public web origin and release-acceptance origins.
+Other `/api/*` browser requests are same-origin Next.js handlers because they
+perform server-only work or attach server-owned trust metadata.
 
 Vercel Preview must call
 `https://humans-api-preview.hi-541.workers.dev`; Vercel Production must call
 `https://humans-api-production.hi-541.workers.dev`. These exact hosts are pinned
 in application validation so Clerk and web-proxy credentials cannot be sent to
 another Workers account.
+The browser API origin uses the same pinned Worker in Preview and immutable
+staged Production deployments. It switches to the public API alias only when
+the page itself is running at `humns.co`, preventing pre-promotion
+acceptance from calling the previously promoted API alias.
+
+### Production domain cutover
+
+Vercel already owns verified project domains for `humns.co` and
+`acceptance.humns.co`; Cloudflare has their DNS-only Vercel records and owns the
+`api.humns.co` Worker Custom Domain. Spaceship remains the registrar. The
+registrar nameservers must be `maxine.ns.cloudflare.com` and
+`ricardo.ns.cloudflare.com` before public DNS uses those records.
+
+Coordinate the provider changes with the first release on the new domain:
+
+- Change the Clerk Production application domain to `humns.co`, publish every
+  DNS record Clerk requires in Cloudflare, and restrict Clerk's subdomain
+  allowlist.
+- Use the replacement Production Turnstile widget restricted to `humns.co` and
+  `acceptance.humns.co`; its site and secret keys are configured in Vercel
+  Production for the next deployment. Delete the old Production widget after
+  the new release is promoted and its Profile request form passes acceptance.
+- Change the Production Worker `BILLING_APP_ORIGIN` secret to
+  `https://humns.co` immediately before deploying the Worker version that
+  validates that origin.
+- Keep Vercel's Production `HUMANS_API_URL` and
+  `NEXT_PUBLIC_HUMANS_API_URL` pinned to the direct Production `workers.dev`
+  origin. The browser selects `api.humns.co` only on the public apex.
+- After new-domain acceptance passes, configure a permanent `308` redirect
+  from `https://humans.crafter.run` to `https://humns.co` and remove
+  `api.humans.crafter.run` from Vercel without redirecting it.
+- The Production API temporarily accepts Clerk session tokens and browser CORS
+  from `https://humans.crafter.run` so the previously promoted web release
+  remains usable while the new release is staged. Remove that compatibility
+  origin in the first release after the redirect is verified.
 
 Before deployment, verify every populated preview identifier differs from its
 production counterpart. A credential ID may be its dashboard label or last four
@@ -91,15 +132,17 @@ From `apps/api`, use `bunx wrangler secret put <NAME> --env preview` or
 match the corresponding Vercel environment and no other environment.
 
 Vercel requires `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`,
-`HUMANS_API_URL`, `HUMANS_PROXY_SECRET`, `SENTRY_AUTH_TOKEN`, `SENTRY_DSN`,
-`NEXT_PUBLIC_SENTRY_DSN`, and `NEXT_PUBLIC_SENTRY_ENVIRONMENT` in separate
-Preview and Production scopes. Configure `apps/web` as the Vercel project root;
-a Vercel build must use the matching direct `humans-api-<environment>.*.workers.dev`
-origin and never the public API alias, the other environment, or the local API
-URL default.
+`HUMANS_API_URL`, `HUMANS_PROXY_SECRET`, `NEXT_PUBLIC_HUMANS_API_URL`,
+`SENTRY_AUTH_TOKEN`, `SENTRY_DSN`, `NEXT_PUBLIC_SENTRY_DSN`, and
+`NEXT_PUBLIC_SENTRY_ENVIRONMENT` in separate Preview and Production scopes.
+Configure `apps/web` as the Vercel project root; both API URL variables must use
+the matching direct `humans-api-<environment>.*.workers.dev` origin and never
+the public API alias, the other environment, or the local API URL default. The
+browser client switches to the public alias at runtime only on the public
+Production web hostname.
 
 `BILLING_APP_ORIGIN` is environment-bound. Production must use
-`https://humans.crafter.run`; Preview must use the immutable
+`https://humns.co`; Preview must use the immutable
 `https://humans-<deployment>-crafter-station.vercel.app` URL from the candidate
 Preview deployment. The API rejects a deployed Preview origin outside that
 exact project hostname pattern and rejects any Production origin other than the
@@ -125,6 +168,9 @@ and Sentry settings. The explicit deploy scripts reject a dirty worktree and
 inject the clean Git `HEAD` as `SENTRY_RELEASE` and Trigger external ID.
 Polar webhooks and Clerk webhooks must target only the Worker URL from their own
 environment.
+
+Use [`polar-sandbox.md`](polar-sandbox.md) to provision and verify the isolated
+Sandbox catalog used by local development and Preview.
 
 Before recording either Polar product ID, verify the product is a fixed
 `$20 USD` monthly subscription, maps only to the configured Humans usage meter,
@@ -252,7 +298,7 @@ when a refund should end access.
     different-deployment acceptance receipt and never invokes the CLI path that
     rebuilds a Preview deployment. It polls the alias operation to success and
     verifies the frozen release and Production environment headers through
-    `https://humans.crafter.run` before returning. Because the deployment
+    `https://humns.co` before returning. Because the deployment
     already targets Production, promotion assigns domains without a second
     build. Preview and
     Production are necessarily separate builds because Clerk and public Sentry
@@ -269,7 +315,7 @@ when a refund should end access.
      `bun run test:browser -- --project=production-profile-control` with
      `PLAYWRIGHT_PRODUCTION_URL`, `E2E_PROFILE_OWNER_IMPERSONATION_URL`, and the
       same `E2E_RELEASE_SHA`. The pre-promotion run may use the immutable staged
-      Production URL; the post-promotion run uses `https://humans.crafter.run`.
+      Production URL; the post-promotion run uses `https://humns.co`.
      Tracing is disabled for this project; confirm the suite restores the
      original Searchability and signs out the impersonation. Run this only for
      the intended represented Member: an initial successful claim is durable
@@ -335,15 +381,15 @@ HTTP, MCP `list_search_facets`, and revoke checks; the revoked key returned
 `401`. The exposed Preview Clerk and web-proxy credentials were rotated and the
 retired Clerk key was rejected.
 
-Production evidence: Vercel `dpl_AjaXzBaBodtu15qGWWdoSAirmF3J`; Worker
-`6ce29841-eff4-4605-a00a-8ac1a1b696ca`; Vercel certificate
-`cert_tsCUhrgR628SZSgsMzc4RdZB` covers the web hostname, while
-`cert_RXIyHRmGUm3ACkiDJqCjb0VR` and `cert_Htwkez7nFvuHNceXjKcy6FWn` cover the
-API hostname. Health, OpenAPI, and docs returned `200`; unauthenticated Profile
-and MCP requests returned `401`. GitHub sign-in, Clerk callback,
+Historical Production evidence predates the `humns.co` cutover: Vercel
+`dpl_AjaXzBaBodtu15qGWWdoSAirmF3J`; Worker
+`6ce29841-eff4-4605-a00a-8ac1a1b696ca`. It is not acceptance evidence for the
+new web or API domains. Health, OpenAPI, and docs returned `200`;
+unauthenticated Profile and MCP requests returned `401`. GitHub sign-in, Clerk callback,
 Organization creation/selection, and authenticated workspace reads completed.
 A short-lived Organization API key completed list, create, protected HTTP, MCP
-`list_search_facets`, and revoke checks through `api.humans.crafter.run`; the
+`list_search_facets`, and revoke checks through the retired
+`api.humans.crafter.run`; the
 revoked key returned `401`. The root response includes private/no-cache and
 no-index headers, and `robots.txt` disallows all crawlers.
 

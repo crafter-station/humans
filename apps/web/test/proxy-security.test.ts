@@ -17,17 +17,18 @@ vi.mock("@/env", () => ({
   },
 }));
 
+import {
+  POST as proxyBilling,
+  GET as proxyBillingGet,
+} from "../app/api/billing/[[...path]]/route";
 import { POST as proxyContactReveal } from "../app/api/contact-reveals/[[...path]]/route";
-import { POST as proxyBilling } from "../app/api/billing/[[...path]]/route";
-import { GET as proxyBillingGet } from "../app/api/billing/[[...path]]/route";
-import { POST as proxyPublicProfileRequest } from "../app/api/public/profile-requests/route";
-import { PUT as proxySavedList } from "../app/api/saved-lists/[[...path]]/route";
 import {
   protectedLocalResponseHeaders,
   protectedProxyHeaders,
   protectedResponseHeaders,
 } from "../app/api/proxy-security";
-import { apiProxyHeaders } from "../proxy";
+import { POST as proxyPublicProfileRequest } from "../app/api/public/profile-requests/route";
+import { PUT as proxySavedList } from "../app/api/saved-lists/[[...path]]/route";
 
 const validPublicProfileRequest = {
   profileReference: "11111111-1111-4111-8111-111111111111",
@@ -101,27 +102,6 @@ describe("protected web proxies", () => {
       "X-Correlation-ID": "response-correlation",
       "x-robots-tag": "noindex, nofollow",
     });
-  });
-
-  it("strips public-form attestations at the generic API ingress", () => {
-    const headers = apiProxyHeaders(
-      new Request("https://api.humans.crafter.run/v1/public/profile-requests", {
-        headers: {
-          host: "api.humans.crafter.run",
-          "X-Correlation-ID": "attacker-controlled",
-          "X-Humans-Internal-MCP": "forged-mcp-token",
-          "X-Humans-Public-Profile-Request": "verified",
-          "X-Humans-Web-Proxy": "forged-secret",
-          "X-Vercel-Forwarded-For": "203.0.113.4, 198.51.100.7",
-        },
-      }),
-    );
-
-    expect(headers.get("X-Humans-Internal-MCP")).toBeNull();
-    expect(headers.get("X-Humans-Public-Profile-Request")).toBeNull();
-    expect(headers.get("X-Humans-Web-Proxy")).toBe("server-owned-proxy-secret");
-    expect(headers.get("X-Humans-Client-IP")).toBe("203.0.113.4");
-    expect(headers.get("X-Correlation-ID")).not.toBe("attacker-controlled");
   });
 
   it("rejects paths outside the Contact Reveal allowlist", async () => {

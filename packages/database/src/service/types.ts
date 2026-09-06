@@ -56,6 +56,18 @@ export type ProvisionedWorkspace = {
   organization: OrganizationProjection;
 };
 
+export type ClerkProjectionState =
+  | "active"
+  | "inactive"
+  | "absent"
+  | "unobserved";
+
+export type ClerkProjectionStatus = {
+  member: ClerkProjectionState;
+  membership: ClerkProjectionState;
+  organization: ClerkProjectionState;
+};
+
 export type GitHubVerification = {
   accountId: string;
   login: string;

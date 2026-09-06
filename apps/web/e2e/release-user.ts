@@ -215,6 +215,9 @@ export const cleanupReleaseUser = async (
   const now = options.now ?? Date.now;
   const tracked = readReleaseUser(credentials, file, environment, now());
   if (tracked === null) return;
+  if (options.verifyProjection === undefined) {
+    previewProjectionConfiguration(environment);
+  }
   const fetcher = options.fetcher ?? fetch;
 
   await assertClerkInstance(credentials.secretKey, fetcher);
@@ -807,11 +810,7 @@ const pollHumansProjection = async (
   fetcher: typeof fetch,
   sleep: (milliseconds: number) => Promise<unknown> = delay,
 ) => {
-  const api = approvedPreviewApiUrl(environment);
-  const proxySecret = requiredEnvironment(environment, "HUMANS_PROXY_SECRET");
-  if (proxySecret.length < 16) {
-    throw new Error("Humans projection verification configuration is invalid");
-  }
+  const { api, proxySecret } = previewProjectionConfiguration(environment);
   const endpoint = new URL("/v1/internal/clerk-projections", api);
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const response = await sanitizedFetch(
@@ -821,6 +820,7 @@ const pollHumansProjection = async (
         method: "POST",
         headers: {
           "content-type": "application/json",
+          "X-Humans-Clerk-Projection": "cleanup",
           "X-Humans-Web-Proxy": proxySecret,
         },
         body: JSON.stringify({
@@ -848,6 +848,15 @@ const pollHumansProjection = async (
     await sleep(250);
   }
   throw new Error("Humans projection deletion could not be verified");
+};
+
+const previewProjectionConfiguration = (environment: Environment) => {
+  const api = approvedPreviewApiUrl(environment);
+  const proxySecret = requiredEnvironment(environment, "HUMANS_PROXY_SECRET");
+  if (proxySecret.length < 16) {
+    throw new Error("Humans projection verification configuration is invalid");
+  }
+  return { api, proxySecret };
 };
 
 const approvedPreviewApiUrl = (environment: Environment) => {
@@ -973,6 +982,7 @@ const isOptionalClerkId = (value: unknown, prefix: "org" | "user") =>
 
 const isClerkId = (value: unknown, prefix: "org" | "user") =>
   typeof value === "string" &&
+  value.length <= 128 &&
   new RegExp(`^${prefix}_[A-Za-z0-9_-]+$`).test(value);
 
 const isIsoTimestamp = (value: unknown) =>

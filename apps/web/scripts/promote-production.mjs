@@ -138,12 +138,12 @@ for (;;) {
   let webResponse;
   try {
     [webResponse, apiResponse] = await Promise.all([
-      fetch("https://humans.crafter.run/", {
+      fetch("https://humns.co/", {
         cache: "no-store",
         redirect: "error",
         signal: AbortSignal.timeout(10_000),
       }),
-      fetch("https://api.humans.crafter.run/health", {
+      fetch("https://api.humns.co/health", {
         cache: "no-store",
         redirect: "error",
         signal: AbortSignal.timeout(10_000),
