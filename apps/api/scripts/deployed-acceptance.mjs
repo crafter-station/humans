@@ -680,8 +680,15 @@ export const runDeployedAcceptance = async ({
   };
 
   const normalizeMcpTool = async (key, name, arguments_) => {
+    const responseWithId = await mcpRequest(key, "tools/call", {
+      name,
+      arguments: arguments_,
+    });
+    if (responseWithId.response.status !== 200) {
+      return normalizeHttp(Promise.resolve(responseWithId));
+    }
     const envelope = await mcpEnvelope(
-      mcpRequest(key, "tools/call", { name, arguments: arguments_ }),
+      Promise.resolve(responseWithId),
       200,
       `MCP ${name}`,
     );

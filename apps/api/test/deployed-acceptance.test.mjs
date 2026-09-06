@@ -494,7 +494,12 @@ const makeAcceptanceServer = (options = {}) => {
         ? json(options.unauthenticatedBody, 401)
         : error(401, "unauthorized");
 
-    if (url.pathname === "/mcp") return mcp(apiKey(authorization), body);
+    if (url.pathname === "/mcp") {
+      const key = apiKey(authorization);
+      const denied = authenticate(key);
+      if (denied) return json(denied.body, denied.status, denied.headers);
+      return mcp(key, body);
+    }
 
     if (authorization === "Bearer admin_session") {
       if (url.pathname.endsWith("/workspace"))
