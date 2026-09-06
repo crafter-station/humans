@@ -5,6 +5,7 @@ import { isClerkAPIResponseError } from "@clerk/backend/errors";
 
 const creditSpend = 17;
 const maximumRateLimitProbes = 120;
+const rateLimitPropagationDelayMilliseconds = 2_000;
 const maximumRequests = 240;
 const runTimeoutMilliseconds = 10 * 60_000;
 const requestTimeoutMilliseconds = 20_000;
@@ -316,6 +317,8 @@ export const runDeployedAcceptance = async ({
   productionConfirmation,
   safetyBounds: safetyBoundOverrides,
   fetch: fetchImplementation = globalThis.fetch,
+  sleep = (milliseconds) =>
+    new Promise((resolve) => setTimeout(resolve, milliseconds)),
 }) => {
   const approvedHosts = {
     preview: new Set(["humans-api-preview.hi-541.workers.dev"]),
@@ -381,7 +384,8 @@ export const runDeployedAcceptance = async ({
     typeof deleteMember !== "function" ||
     typeof organizationExists !== "function" ||
     typeof memberExists !== "function" ||
-    typeof fetchImplementation !== "function"
+    typeof fetchImplementation !== "function" ||
+    typeof sleep !== "function"
   ) {
     throw new Error("Acceptance fixture input is invalid");
   }
@@ -1826,6 +1830,9 @@ export const runDeployedAcceptance = async ({
         }
       }
       if (limitedHttp && limitedMcp) break;
+      if (offset + rateLimitBatchSize < maximumRateLimitProbes) {
+        await withinDeadline(() => sleep(rateLimitPropagationDelayMilliseconds));
+      }
     }
     if (!limitedHttp || !limitedMcp)
       throw new Error("The bounded rate-limit probes did not reach the limit");
