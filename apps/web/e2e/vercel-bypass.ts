@@ -87,8 +87,15 @@ export const establishVercelBypass = async (
   }
 };
 
+const maximumBypassCookieLifetimeSeconds = 8 * 24 * 60 * 60;
+
 const validCookieExpiry = (value: string, expires: number) => {
-  if (!Number.isSafeInteger(expires) || expires <= Date.now() / 1000) {
+  const now = Date.now() / 1000;
+  if (
+    !Number.isFinite(expires) ||
+    expires <= now ||
+    expires > now + maximumBypassCookieLifetimeSeconds
+  ) {
     return false;
   }
   const segments = value.split(".");
@@ -97,10 +104,9 @@ const validCookieExpiry = (value: string, expires: number) => {
     const payload = JSON.parse(
       Buffer.from(segments[1], "base64url").toString("utf8"),
     ) as unknown;
+    if (typeof payload !== "object" || payload === null) return false;
+    if (!("exp" in payload)) return true;
     return (
-      typeof payload === "object" &&
-      payload !== null &&
-      "exp" in payload &&
       Number.isSafeInteger(payload.exp) &&
       Math.abs((payload.exp as number) - expires) <= 1
     );

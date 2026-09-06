@@ -14,7 +14,7 @@ afterEach(() => {
 
 describe("establishVercelBypass", () => {
   it("retains only a new host-scoped expiring HttpOnly cookie", async () => {
-    const expires = Math.floor(Date.now() / 1000) + 3600;
+    const expires = Date.now() / 1000 + 7 * 24 * 60 * 60;
     const cookie = validCookie(expires);
     const response = responseStub();
     const get = vi.fn(async () => response);
@@ -91,6 +91,10 @@ describe("establishVercelBypass", () => {
     [{ domain: ".crafter-station.vercel.app" }, "scope is invalid"],
     [{ path: "/acceptance" }, "scope is invalid"],
     [{ expires: Math.floor(Date.now() / 1000) - 1 }, "expiry is invalid"],
+    [
+      { expires: Date.now() / 1000 + 9 * 24 * 60 * 60 },
+      "expiry is invalid",
+    ],
   ] as const)("rejects an unsafe cookie %#", async (patch, message) => {
     const cookie = validCookie();
     const context = contextStub([], [{ ...cookie, ...patch }]);
@@ -101,10 +105,14 @@ describe("establishVercelBypass", () => {
   });
 
   it("rejects a cookie whose browser expiry differs from its JWT expiry", async () => {
-    const cookie = validCookie();
+    const expires = Math.floor(Date.now() / 1000) + 3600;
+    const cookie = {
+      ...validCookie(expires),
+      value: jwt({ exp: expires - 60 }),
+    };
     const context = contextStub(
       [],
-      [{ ...cookie, expires: cookie.expires + 60 }],
+      [cookie],
     );
 
     await expect(
@@ -144,7 +152,7 @@ const validCookie = (expires = Math.floor(Date.now() / 1000) + 3600) => ({
   name: "_vercel_jwt",
   path: "/",
   secure: true,
-  value: jwt({ exp: expires }),
+  value: jwt({ aud: "vercel", bypass: true, iat: expires - 60, sub: "test" }),
 });
 
 const jwt = (payload: unknown) =>
