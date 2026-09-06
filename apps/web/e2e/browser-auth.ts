@@ -35,9 +35,30 @@ export const authenticateImpersonatedMember = async (
   expectedOrganizationId?: string,
 ) => {
   try {
+    const ticketValues = new URL(impersonationUrl).searchParams.getAll(
+      "__clerk_ticket",
+    );
+    const ticket = ticketValues[0];
+    if (ticketValues.length !== 1 || !ticket) {
+      throw new Error("ticket missing");
+    }
+    if (process.env.CLERK_FAPI && process.env.CLERK_TESTING_TOKEN) {
+      await setupClerkTestingTokenSafely(page);
+    }
     await page.goto(deploymentUrl);
-    await page.evaluate((url) => window.location.assign(url), impersonationUrl);
-    await page.waitForFunction(() => Boolean(window.Clerk?.user?.id));
+    await page.waitForFunction(() => Boolean(window.Clerk?.loaded));
+    const signedIn = await page.evaluate(async (ticket) => {
+      const signIn = await window.Clerk?.client?.signIn.create({
+        strategy: "ticket",
+        ticket,
+      });
+      if (signIn?.status !== "complete" || !signIn.createdSessionId) {
+        return false;
+      }
+      await window.Clerk?.setActive({ session: signIn.createdSessionId });
+      return true;
+    }, ticket);
+    if (!signedIn) throw new Error("ticket rejected");
     await page.goto(deploymentUrl);
     await page.waitForFunction(() => Boolean(window.Clerk?.user?.id));
     const matches = await page.evaluate(

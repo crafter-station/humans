@@ -238,10 +238,11 @@ const runCoreWorkspaceJourney = async (
         response.request().method() === "POST" &&
         new URL(response.url()).pathname === "/api/saved-lists",
     );
-    await withPrompt(
+    await withSavedListDialog(
       page,
       () => expectedResult.getByRole("button", { name: "+ Save" }).click(),
       listName,
+      "Create",
     );
     listId = parseCreatedListId(await (await createResponse).json());
     await expect(
@@ -252,14 +253,16 @@ const runCoreWorkspaceJourney = async (
     ).toBeVisible();
 
     await expectedResult.locator("td").first().getByRole("button").click();
-    const selectedExpectedProfile = await page.evaluate(
-      (profileId) =>
-        new URL(window.location.href).searchParams.get("profile") === profileId,
-      requiredUuid("HUMANS_ACCEPTANCE_PROFILE_ID"),
-    );
-    if (!selectedExpectedProfile) {
-      throw new Error("The expected Profile detail was not selected");
-    }
+    await expect
+      .poll(() =>
+        page.evaluate(
+          (profileId) =>
+            new URL(window.location.href).searchParams.get("profile") ===
+            profileId,
+          requiredUuid("HUMANS_ACCEPTANCE_PROFILE_ID"),
+        ),
+      )
+      .toBe(true);
     await page.getByLabel("Team note").fill("Browser acceptance note");
     await page.getByRole("button", { name: "Save note" }).click();
     await expect(page.getByText("Team note saved.")).toBeVisible();
@@ -279,10 +282,11 @@ const runCoreWorkspaceJourney = async (
     );
     await page.getByRole("button", { name: "Close" }).click();
 
-    await withPrompt(
+    await withSavedListDialog(
       page,
       () => page.getByRole("button", { name: "Rename" }).click(),
       renamedListName,
+      "Rename",
     );
     await expect(page.getByText("Saved List renamed.")).toBeVisible();
     await expect
@@ -449,26 +453,24 @@ const deleteSavedList = async (page: Page, listId: string) => {
     .toBe(false);
 };
 
-const withPrompt = async (
+const withSavedListDialog = async (
   page: Page,
   action: () => Promise<void>,
   answer: string,
+  submitLabel: "Create" | "Rename",
 ) => {
-  const dialogPromise = page.waitForEvent("dialog");
-  const actionPromise = action();
-  const dialog = await dialogPromise;
-  expect(dialog.type()).toBe("prompt");
-  await dialog.accept(answer);
-  await actionPromise;
+  await action();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("textbox", { name: "Name" }).fill(answer);
+  await dialog.getByRole("button", { name: submitLabel }).click();
 };
 
 const withConfirmation = async (page: Page, action: () => Promise<void>) => {
-  const dialogPromise = page.waitForEvent("dialog");
-  const actionPromise = action();
-  const dialog = await dialogPromise;
-  expect(dialog.type()).toBe("confirm");
-  await dialog.accept();
-  await actionPromise;
+  await action();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Delete Saved List" }).click();
 };
 
 const assertDeploymentHeaders = (
