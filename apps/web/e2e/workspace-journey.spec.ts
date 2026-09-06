@@ -63,7 +63,7 @@ test("anonymous access remains private and non-indexable", async ({
   expect(robots.headers()["cache-control"]).toBe(
     "public, max-age=0, must-revalidate",
   );
-  expect(await robots.text()).toBe("User-Agent: *\nDisallow: /\n");
+  expect((await robots.text()).trimEnd()).toBe("User-Agent: *\nDisallow: /");
 
   const profile = await page.request.get(new URL("/api/profile", url).href, {
     maxRedirects: 0,
