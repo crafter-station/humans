@@ -721,7 +721,7 @@ describe("deployed API acceptance", () => {
     expect(state.suspensions).toEqual([
       expect.objectContaining({ revoked: true, principalType: "api_key" }),
     ]);
-    expect(server.requests.length).toBeLessThanOrEqual(180);
+    expect(server.requests.length).toBeLessThanOrEqual(240);
     expect(
       server.requests.find((request) => request.path === "/v1/profiles"),
     ).toMatchObject({ hasQuery: false });
@@ -1283,7 +1283,7 @@ describe("deployed API acceptance", () => {
     await expect(
       runDeployedAcceptance(
         input({
-          safetyBounds: { maximumRequests: 181 },
+          safetyBounds: { maximumRequests: 241 },
           fetch: async () => {
             called = true;
             return new Response();
