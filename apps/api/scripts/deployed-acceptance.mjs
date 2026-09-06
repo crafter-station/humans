@@ -1776,23 +1776,45 @@ export const runDeployedAcceptance = async ({
 
     let limitedHttp = null;
     let limitedMcp = null;
-    for (let probe = 0; probe + 1 < maximumRateLimitProbes; probe += 2) {
-      const [http, mcp] = await Promise.all([
-        normalizeHttp(
-          keyRequest(
-            noCreditKey.secret,
-            "HTTP rate-limit probe",
-            "/v1/search/facets",
-          ),
+    const rateLimitBatchSize = 10;
+    for (
+      let offset = 0;
+      offset < maximumRateLimitProbes;
+      offset += rateLimitBatchSize
+    ) {
+      const batch = await Promise.all(
+        Array.from(
+          {
+            length: Math.min(
+              rateLimitBatchSize,
+              maximumRateLimitProbes - offset,
+            ),
+          },
+          (_, index) => {
+            const transport = (offset + index) % 2 === 0 ? "HTTP" : "MCP";
+            const outcome =
+              transport === "HTTP"
+                ? normalizeHttp(
+                    keyRequest(
+                      noCreditKey.secret,
+                      "HTTP rate-limit probe",
+                      "/v1/search/facets",
+                    ),
+                  )
+                : normalizeMcpTool(
+                    noCreditKey.secret,
+                    "list_search_facets",
+                    {},
+                  );
+            return outcome.then((result) => ({ result, transport }));
+          },
         ),
-        normalizeMcpTool(noCreditKey.secret, "list_search_facets", {}),
-      ]);
-      for (const [transport, outcome] of [
-        ["HTTP", http],
-        ["MCP", mcp],
-      ]) {
+      );
+      for (const { result: outcome, transport } of batch) {
         if (outcome.status === 429) {
           assertOutcome(outcome, 429, "rate_limited", `${transport} rate limit`);
+          if (transport === "HTTP") limitedHttp = outcome;
+          else limitedMcp = outcome;
         } else {
           assertOutcome(
             outcome,
@@ -1803,10 +1825,7 @@ export const runDeployedAcceptance = async ({
           assertFacetEnvelope(outcome.body, `${transport} rate-limit probe`);
         }
       }
-      if (http.status !== 429 || mcp.status !== 429) continue;
-      limitedHttp = http;
-      limitedMcp = mcp;
-      break;
+      if (limitedHttp && limitedMcp) break;
     }
     if (!limitedHttp || !limitedMcp)
       throw new Error("The bounded rate-limit probes did not reach the limit");
