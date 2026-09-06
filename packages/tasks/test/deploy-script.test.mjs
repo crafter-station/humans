@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 
 import { main, triggerDeployArguments } from "../scripts/deploy.mjs";
 
@@ -43,5 +44,19 @@ describe("Trigger.dev deployment command", () => {
       "--dry-run",
     ]);
     expect(arguments_).not.toContain("--force");
+  });
+
+  it("synchronizes every environment value required to import the config", () => {
+    const configuration = readFileSync(
+      new URL("../trigger.config.ts", import.meta.url),
+      "utf8",
+    );
+
+    expect(configuration).toContain(
+      '{ name: "TRIGGER_PROJECT_REF", value: project }',
+    );
+    expect(configuration).toContain(
+      '{ name: "SENTRY_RELEASE", value: sentryRelease }',
+    );
   });
 });

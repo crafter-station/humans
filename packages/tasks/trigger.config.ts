@@ -21,7 +21,10 @@ export default defineConfig({
   runtime: "node-24",
   build: {
     extensions: [
-      syncEnvVars(() => [{ name: "SENTRY_RELEASE", value: sentryRelease }]),
+      syncEnvVars(() => [
+        { name: "TRIGGER_PROJECT_REF", value: project },
+        { name: "SENTRY_RELEASE", value: sentryRelease },
+      ]),
     ],
   },
   onFailure: async ({ error, ctx }) => {
