@@ -532,18 +532,23 @@ describe("Humans API", () => {
     expect(identity.personalOrganizationsCreated).toBe(1);
   });
 
-  it("routes a past-due Pro subscription to recovery instead of another checkout", async () => {
+  it("retries Polar customer creation at checkout after workspace provisioning", async () => {
     const billingIdentity = new FakeIdentity();
     billingIdentity.sessions.set("billing_session", {
       memberId: "billing_member",
       organizationId: null,
     });
     let subscriptionStatus: "active" | "past_due" | null = "past_due";
-    const ensureCustomer = vi.fn(async (input) => ({
-      id: "22222222-2222-4222-8222-222222222222",
-      clerkOrganizationId: input.clerkOrganizationId,
-      type: "team" as const,
-    }));
+    let customerAttempts = 0;
+    const ensureCustomer = vi.fn(async (input) => {
+      customerAttempts += 1;
+      if (customerAttempts === 1) throw new Error("Polar is unavailable");
+      return {
+        id: "22222222-2222-4222-8222-222222222222",
+        clerkOrganizationId: input.clerkOrganizationId,
+        type: "team" as const,
+      };
+    });
     const checkoutSession = {
       id: "11111111-1111-4111-8111-111111111111",
       url: "https://polar.sh/checkout/test",
@@ -623,6 +628,7 @@ describe("Humans API", () => {
       headers: { authorization: "Bearer billing_session" },
     });
     expect(duplicate.status).toBe(409);
+    expect(ensureCustomer).toHaveBeenCalledTimes(2);
     await expect(duplicate.json()).resolves.toMatchObject({
       error: { code: "subscription_already_active" },
     });

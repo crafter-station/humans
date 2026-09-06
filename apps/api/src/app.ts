@@ -1586,12 +1586,17 @@ export const createApp = (
       if (
         polar.billingConfigured(context.env) &&
         isOrganizationAdminRole(workspace.role)
-      )
-        await ensureOrganizationPolarCustomer(
-          context,
-          session.memberId,
-          workspace.organizationId,
-        );
+      ) {
+        try {
+          await ensureOrganizationPolarCustomer(
+            context,
+            session.memberId,
+            workspace.organizationId,
+          );
+        } catch (error) {
+          reportUnexpected(context, error, "workspace.polar_customer");
+        }
+      }
       return context.json(workspace, 200);
     } catch (error) {
       if (tagged(error, "AbuseControlRejected"))
