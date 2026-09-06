@@ -305,6 +305,7 @@ export const runDeployedAcceptance = async ({
   profileId,
   emailObservationId,
   phoneObservationId,
+  webProxySecret,
   getAdminAuthorization,
   getOperatorAuthorization,
   getOrganizationMembershipInventory,
@@ -372,6 +373,9 @@ export const runDeployedAcceptance = async ({
     !/^[0-9a-f-]{36}$/i.test(phoneObservationId) ||
     typeof getAdminAuthorization !== "function" ||
     typeof getOperatorAuthorization !== "function" ||
+    typeof webProxySecret !== "string" ||
+    webProxySecret.length < 16 ||
+    webProxySecret.trim() !== webProxySecret ||
     typeof getOrganizationMembershipInventory !== "function" ||
     typeof deleteOrganization !== "function" ||
     typeof deleteMember !== "function" ||
@@ -536,6 +540,7 @@ export const runDeployedAcceptance = async ({
     }
     const headers = new Headers(init?.headers);
     headers.set("authorization", authorization);
+    headers.set("X-Humans-Web-Proxy", webProxySecret);
     return request(operation, path, { ...init, headers });
   };
 
@@ -2068,6 +2073,7 @@ if (
     phoneObservationId: requiredEnvironment(
       "HUMANS_ACCEPTANCE_PHONE_OBSERVATION_ID",
     ),
+    webProxySecret: requiredEnvironment("HUMANS_PROXY_SECRET"),
     getAdminAuthorization: sessionAuthorization(
       "HUMANS_ACCEPTANCE_ADMIN_SESSION_ID",
     ),

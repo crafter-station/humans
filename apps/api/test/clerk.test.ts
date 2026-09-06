@@ -147,10 +147,16 @@ describe("Clerk sessions", () => {
     const authenticateRequest = vi.fn(async () => ({ isAuthenticated: false }));
     createClerkClient.mockReturnValue({ authenticateRequest });
 
-    await clerkIdentityBoundary.authenticate(new Request("https://api.humns.co"), {
-      ...bindings,
-      SENTRY_ENVIRONMENT: "production",
-    });
+    await clerkIdentityBoundary.authenticate(
+      new Request("https://api.humns.co", {
+        headers: { "X-Humans-Web-Proxy": "wrong-secret" },
+      }),
+      {
+        ...bindings,
+        SENTRY_ENVIRONMENT: "production",
+        WEB_PROXY_SECRET: "release-proxy-secret",
+      },
+    );
 
     expect(authenticateRequest).toHaveBeenCalledWith(expect.any(Request), {
       acceptsToken: "session_token",
@@ -159,6 +165,24 @@ describe("Clerk sessions", () => {
         "https://acceptance.humns.co",
         "https://humans.crafter.run",
       ],
+    });
+  });
+
+  it("trusts session tokens forwarded by the authenticated web proxy", async () => {
+    const authenticateRequest = vi.fn(async () => ({ isAuthenticated: false }));
+    createClerkClient.mockReturnValue({ authenticateRequest });
+    const request = new Request("https://api.humns.co", {
+      headers: { "X-Humans-Web-Proxy": "release-proxy-secret" },
+    });
+
+    await clerkIdentityBoundary.authenticate(request, {
+      ...bindings,
+      SENTRY_ENVIRONMENT: "production",
+      WEB_PROXY_SECRET: "release-proxy-secret",
+    });
+
+    expect(authenticateRequest).toHaveBeenCalledWith(request, {
+      acceptsToken: "session_token",
     });
   });
 

@@ -151,9 +151,14 @@ export const clerkIdentityBoundary: IdentityBoundary = {
       publishableKey: bindings.CLERK_PUBLISHABLE_KEY,
       secretKey: bindings.CLERK_SECRET_KEY,
     });
+    const trustedWebProxy =
+      bindings.WEB_PROXY_SECRET !== undefined &&
+      request.headers.get("X-Humans-Web-Proxy") === bindings.WEB_PROXY_SECRET;
     const state = await clerk.authenticateRequest(request, {
       acceptsToken: "session_token",
-      authorizedParties: sessionAuthorizedParties(bindings),
+      ...(trustedWebProxy
+        ? {}
+        : { authorizedParties: sessionAuthorizedParties(bindings) }),
     });
     if (!state.isAuthenticated) return null;
 

@@ -15,6 +15,7 @@ const profileId = "profile_one";
 const emailObservationId = "22222222-2222-4222-8222-222222222222";
 const phoneObservationId = "33333333-3333-4333-8333-333333333333";
 const query = "Unique Release Profile";
+const webProxySecret = "preview-web-proxy-secret";
 
 const input = (overrides = {}) => {
   let organizationPresent = true;
@@ -31,6 +32,7 @@ const input = (overrides = {}) => {
     profileId,
     emailObservationId,
     phoneObservationId,
+    webProxySecret,
     getAdminAuthorization: async () => "Bearer admin_session",
     getOperatorAuthorization: async () => "Bearer operator_session",
     getOrganizationMembershipInventory: async () => ({
@@ -462,6 +464,7 @@ const makeAcceptanceServer = (options = {}) => {
       mcpMethod: body?.method ?? null,
       toolName: body?.params?.name ?? null,
       toolIdempotencyKey: body?.params?.arguments?.idempotencyKey ?? null,
+      webProxySecret: headers.get("x-humans-web-proxy"),
     });
 
     if (url.pathname === "/health")
@@ -699,6 +702,12 @@ describe("deployed API acceptance", () => {
         fixtureRequests: 4,
       },
     });
+
+    expect(
+      server.requests.find(
+        ({ path }) => path === `/v1/organizations/${organizationId}/workspace`,
+      )?.webProxySecret,
+    ).toBe(webProxySecret);
 
     const state = server.state();
     expect(state.balance).toBe(83);

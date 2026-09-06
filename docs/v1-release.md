@@ -241,9 +241,9 @@ when a refund should end access.
    `HUMANS_ACCEPTANCE_ORGANIZATION_ID`,
    `HUMANS_ACCEPTANCE_PROFILE_QUERY`, `HUMANS_ACCEPTANCE_PROFILE_ID`,
    `HUMANS_ACCEPTANCE_EMAIL_OBSERVATION_ID`,
-   `HUMANS_ACCEPTANCE_PHONE_OBSERVATION_ID`,
-   `HUMANS_ACCEPTANCE_ADMIN_SESSION_ID`,
-   `HUMANS_ACCEPTANCE_OPERATOR_SESSION_ID`, and the Preview
+    `HUMANS_ACCEPTANCE_PHONE_OBSERVATION_ID`,
+    `HUMANS_ACCEPTANCE_ADMIN_SESSION_ID`,
+    `HUMANS_ACCEPTANCE_OPERATOR_SESSION_ID`, `HUMANS_PROXY_SECRET`, and the Preview
    `CLERK_SECRET_KEY`. The script mints short-lived session tokens, creates five
    15-minute scoped Organization API keys, proves HTTP/MCP read, debit, replay,
    insufficient-Credit, Contact Reveal, suspension, revocation, and rate-limit
