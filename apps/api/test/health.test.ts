@@ -380,13 +380,6 @@ describe("Humans API", () => {
     expect(active.status).toBe(409);
 
     await postWebhook(app, {
-      id: "evt_projection_cleanup_membership_deleted",
-      sourceUpdatedAt: 21,
-      type: "membership.delete",
-      memberId,
-      organizationId,
-    });
-    await postWebhook(app, {
       id: "evt_projection_cleanup_member_deleted",
       sourceUpdatedAt: 21,
       type: "member.delete",
@@ -397,19 +390,6 @@ describe("Humans API", () => {
       sourceUpdatedAt: 21,
       type: "organization.delete",
       organizationId,
-    });
-
-    const relatedActive = await request(cleanupHeaders, {
-      memberId,
-      organizationId,
-    });
-    expect(relatedActive.status).toBe(409);
-    await postWebhook(app, {
-      id: "evt_projection_cleanup_related_membership_deleted",
-      sourceUpdatedAt: 21,
-      type: "membership.delete",
-      memberId,
-      organizationId: relatedOrganizationId,
     });
 
     const inactive = await request(cleanupHeaders, {

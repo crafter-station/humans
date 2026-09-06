@@ -50,6 +50,11 @@ export const makeClerkService = (database: DrizzleDatabase) => {
               .update(members)
               .set({ active: false, updatedAt: new Date() })
               .where(eq(members.clerkId, event.memberId));
+            await deactivateMemberships(
+              transaction,
+              { memberId: event.memberId },
+              event.sourceUpdatedAt,
+            );
           } else if (event.type === "organization.upsert") {
             await upsertOrganization(transaction, event.organization);
           } else if (event.type === "organization.delete") {
@@ -57,6 +62,11 @@ export const makeClerkService = (database: DrizzleDatabase) => {
               .update(organizations)
               .set({ active: false, updatedAt: new Date() })
               .where(eq(organizations.clerkId, event.organizationId));
+            await deactivateMemberships(
+              transaction,
+              { organizationId: event.organizationId },
+              event.sourceUpdatedAt,
+            );
           } else if (event.type === "membership.upsert") {
             await ensureMember(
               transaction,
@@ -310,6 +320,49 @@ const projectionState = (
   if (projection?.active) return "active";
   if (version?.active !== false) return "unobserved";
   return projection === undefined ? "absent" : "inactive";
+};
+
+const deactivateMemberships = async (
+  database: Transaction,
+  principal:
+    | { memberId: string; organizationId?: never }
+    | { memberId?: never; organizationId: string },
+  sourceUpdatedAt: number,
+) => {
+  const filter =
+    principal.memberId === undefined
+      ? eq(organizationMemberships.organizationId, principal.organizationId)
+      : eq(organizationMemberships.memberId, principal.memberId);
+  const related = await database
+    .select({
+      memberId: organizationMemberships.memberId,
+      organizationId: organizationMemberships.organizationId,
+    })
+    .from(organizationMemberships)
+    .where(filter);
+
+  for (const membership of related) {
+    const claimed = await claimProjectionVersion(
+      database,
+      "membership",
+      `${membership.memberId}:${membership.organizationId}`,
+      sourceUpdatedAt,
+      false,
+    );
+    if (!claimed) continue;
+    await database
+      .update(organizationMemberships)
+      .set({ active: false, updatedAt: new Date() })
+      .where(
+        and(
+          eq(organizationMemberships.memberId, membership.memberId),
+          eq(
+            organizationMemberships.organizationId,
+            membership.organizationId,
+          ),
+        ),
+      );
+  }
 };
 
 const upsertOrganization = async (

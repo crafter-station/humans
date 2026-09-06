@@ -119,9 +119,10 @@ export const verifyPersonalOrganization = async (
   if (
     !isRecord(organization) ||
     organization.id !== input.organizationId ||
-    organization.name !== "My Organization" ||
     organization.created_by !== input.memberId ||
-    organization.members_count !== 1
+    organization.members_count !== 1 ||
+    !isRecord(organization.private_metadata) ||
+    organization.private_metadata.personalOwnerMemberId !== input.memberId
   ) {
     throw new Error("The personal Organization identity is invalid");
   }

@@ -55,7 +55,8 @@ describe("Clerk browser acceptance authentication", () => {
           created_by: "user_member",
           id: "org_personal",
           members_count: 1,
-          name: "My Organization",
+          name: "Member's workspace",
+          private_metadata: { personalOwnerMemberId: "user_member" },
         }),
       )
       .mockResolvedValueOnce(
