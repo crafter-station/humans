@@ -51,8 +51,16 @@ describe("Trigger.dev deployment command", () => {
       new URL("../trigger.config.ts", import.meta.url),
       "utf8",
     );
+    const deployment = readFileSync(
+      new URL("../scripts/deploy.mjs", import.meta.url),
+      "utf8",
+    );
 
+    expect(deployment).toContain("HUMANS_TRIGGER_PROJECT_REF: target");
     expect(configuration).toContain(
+      '{ name: "HUMANS_TRIGGER_PROJECT_REF", value: project }',
+    );
+    expect(configuration).not.toContain(
       '{ name: "TRIGGER_PROJECT_REF", value: project }',
     );
     expect(configuration).toContain(

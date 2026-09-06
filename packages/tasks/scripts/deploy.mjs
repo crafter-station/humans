@@ -97,8 +97,8 @@ export const main = async (
     const providerEnvironment = withoutAutomaticGitMetadata({
       ...environmentVariables,
       GITHUB_ENV: outputPath.pathname,
+      HUMANS_TRIGGER_PROJECT_REF: target,
       SENTRY_RELEASE: release,
-      TRIGGER_PROJECT_REF: target,
     });
     const result = runDeploy(
       triggerDeployArguments({ dryRun, release, target }),
