@@ -4,9 +4,9 @@ import { createClerkClient } from "@clerk/backend";
 import { isClerkAPIResponseError } from "@clerk/backend/errors";
 
 const creditSpend = 17;
-const maximumRateLimitProbes = 120;
+const maximumRateLimitProbes = 240;
 const rateLimitPropagationDelayMilliseconds = 2_000;
-const maximumRequests = 240;
+const maximumRequests = 360;
 const runTimeoutMilliseconds = 10 * 60_000;
 const requestTimeoutMilliseconds = 20_000;
 const maximumCleanupRequests = 30;
