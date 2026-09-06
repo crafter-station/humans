@@ -1776,57 +1776,37 @@ export const runDeployedAcceptance = async ({
 
     let limitedHttp = null;
     let limitedMcp = null;
-    let pendingTerminalOutcome = null;
-    for (let probe = 0; probe < maximumRateLimitProbes; probe += 1) {
-      const transport = probe % 2 === 0 ? "http" : "mcp";
-      const outcome =
-        transport === "http"
-          ? await normalizeHttp(
-              keyRequest(
-                noCreditKey.secret,
-                "HTTP rate-limit probe",
-                "/v1/search/facets",
-              ),
-            )
-          : await normalizeMcpTool(
-              noCreditKey.secret,
-              "list_search_facets",
-              {},
-            );
-      if (outcome.status === 429) {
-        assertOutcome(
-          outcome,
-          429,
-          "rate_limited",
-          `${transport.toUpperCase()} rate limit`,
-        );
-        if (
-          pendingTerminalOutcome &&
-          pendingTerminalOutcome.transport !== transport
-        ) {
-          if (transport === "http") {
-            limitedHttp = outcome;
-            limitedMcp = pendingTerminalOutcome.outcome;
-          } else {
-            limitedHttp = pendingTerminalOutcome.outcome;
-            limitedMcp = outcome;
-          }
-          break;
+    for (let probe = 0; probe + 1 < maximumRateLimitProbes; probe += 2) {
+      const [http, mcp] = await Promise.all([
+        normalizeHttp(
+          keyRequest(
+            noCreditKey.secret,
+            "HTTP rate-limit probe",
+            "/v1/search/facets",
+          ),
+        ),
+        normalizeMcpTool(noCreditKey.secret, "list_search_facets", {}),
+      ]);
+      for (const [transport, outcome] of [
+        ["HTTP", http],
+        ["MCP", mcp],
+      ]) {
+        if (outcome.status === 429) {
+          assertOutcome(outcome, 429, "rate_limited", `${transport} rate limit`);
+        } else {
+          assertOutcome(
+            outcome,
+            200,
+            undefined,
+            `${transport} rate-limit probe`,
+          );
+          assertFacetEnvelope(outcome.body, `${transport} rate-limit probe`);
         }
-        pendingTerminalOutcome = { transport, outcome };
-      } else {
-        assertOutcome(
-          outcome,
-          200,
-          undefined,
-          `${transport.toUpperCase()} rate-limit probe`,
-        );
-        assertFacetEnvelope(
-          outcome.body,
-          `${transport.toUpperCase()} rate-limit probe`,
-        );
-        pendingTerminalOutcome = null;
       }
+      if (http.status !== 429 || mcp.status !== 429) continue;
+      limitedHttp = http;
+      limitedMcp = mcp;
+      break;
     }
     if (!limitedHttp || !limitedMcp)
       throw new Error("The bounded rate-limit probes did not reach the limit");
