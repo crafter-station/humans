@@ -23,7 +23,7 @@
     "@sentry/cloudflare": "10.73.0",
     "@scalar/hono-api-reference": "0.12.0",
     "effect": "4.0.0-rc.112",
-    "hono": "4.13.5",
+    "hono": "4.13.11",
     "standardwebhooks": "1.1.1",
     "zod": "4.5.4"
   },
